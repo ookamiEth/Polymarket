@@ -30,7 +30,7 @@ import logging
 import requests
 import polars as pl
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from collections import Counter, deque
 from typing import Optional, Dict, Any
@@ -465,8 +465,8 @@ class DataWriter:
             # Create DataFrame
             df = pl.DataFrame(self.buffer)
 
-            # Generate output path
-            dt = datetime.fromtimestamp(market['start_timestamp'])
+            # Generate output path (using UTC)
+            dt = datetime.fromtimestamp(market['start_timestamp'], tz=timezone.utc)
             year = dt.strftime("%Y")
             month = dt.strftime("%m")
             day = dt.strftime("%d")
