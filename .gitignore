@@ -67,6 +67,7 @@ Thumbs.db
 *.hdf5
 *.feather
 *.arrow
+*.pdf 
 
 # JSON files - ignore all except essential config files
 *.json
