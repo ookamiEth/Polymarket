@@ -80,7 +80,6 @@ Thumbs.db
 # Data directories - comprehensive
 data/
 checkpoints/
-research/
 logs/
 data_collectors/**/data/
 data_collectors/**/results/

@@ -1,0 +1,1442 @@
+================================================================================
+ COMPREHENSIVE LEADERBOARD ENDPOINT TEST
+================================================================================
+
+================================================================================
+ SECTION 1: TIME PERIOD PARAMETERS
+================================================================================
+
+================================================================================
+TEST: Default (no params)
+Params: {}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Period: 1 day
+Params: {
+  "period": "1d"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Period: 24 hours
+Params: {
+  "period": "24h"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Period: 7 days
+Params: {
+  "period": "7d"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Period: 1 week
+Params: {
+  "period": "1w"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Period: 30 days
+Params: {
+  "period": "30d"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Period: 1 month
+Params: {
+  "period": "1m"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Period: all time
+Params: {
+  "period": "all"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Period: all time (alt)
+Params: {
+  "period": "alltime"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Timeframe: day
+Params: {
+  "timeframe": "day"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Timeframe: week
+Params: {
+  "timeframe": "week"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Timeframe: month
+Params: {
+  "timeframe": "month"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Timeframe: all
+Params: {
+  "timeframe": "all"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Interval: 1 day
+Params: {
+  "interval": "1d"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Interval: 7 days
+Params: {
+  "interval": "7d"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Interval: 30 days
+Params: {
+  "interval": "30d"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+ SECTION 2: PAGINATION & LIMITS
+================================================================================
+
+================================================================================
+TEST: Limit: 10
+Params: {
+  "limit": 10
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 10 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "10",
+  "user_id": "0xdf2e12c6a53671d0b08f29d0391728097029ddec",
+  "user_name": "supersportsbro",
+  "vol": 120688.60371,
+  "pnl": 8890,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Limit: 25
+Params: {
+  "limit": 25
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Limit: 50
+Params: {
+  "limit": 50
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 50 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "50",
+  "user_id": "0x6c436ed71ef79cebf76683500e6804203d146ebf",
+  "user_name": "0x6C436ed71ef79CeBF76683500e6804203d146ebF-1759070358236",
+  "vol": 8459.613793,
+  "pnl": 2749,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Limit: 100
+Params: {
+  "limit": 100
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 50 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "50",
+  "user_id": "0x6c436ed71ef79cebf76683500e6804203d146ebf",
+  "user_name": "0x6C436ed71ef79CeBF76683500e6804203d146ebF-1759070358236",
+  "vol": 8459.613793,
+  "pnl": 2749,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Limit: 200
+Params: {
+  "limit": 200
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 50 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "50",
+  "user_id": "0x6c436ed71ef79cebf76683500e6804203d146ebf",
+  "user_name": "0x6C436ed71ef79CeBF76683500e6804203d146ebF-1759070358236",
+  "vol": 8459.613793,
+  "pnl": 2749,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Limit: 500
+Params: {
+  "limit": 500
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 50 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "50",
+  "user_id": "0x6c436ed71ef79cebf76683500e6804203d146ebf",
+  "user_name": "0x6C436ed71ef79CeBF76683500e6804203d146ebF-1759070358236",
+  "vol": 8459.613793,
+  "pnl": 2749,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Offset: 0, Limit: 10
+Params: {
+  "offset": 0,
+  "limit": 10
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 10 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "10",
+  "user_id": "0xdf2e12c6a53671d0b08f29d0391728097029ddec",
+  "user_name": "supersportsbro",
+  "vol": 120688.60371,
+  "pnl": 8890,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Offset: 10, Limit: 10
+Params: {
+  "offset": 10,
+  "limit": 10
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 10 results
+
+First result:
+{
+  "rank": "11",
+  "user_id": "0x000d257d2dc7616feaef4ae0f14600fdf50a758e",
+  "user_name": "scottilicious",
+  "vol": 31705.929997,
+  "pnl": 8863,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "20",
+  "user_id": "0x6bab41a0dc40d6dd4c1a915b8c01969479fd1292",
+  "user_name": "Dropper",
+  "vol": 136734.046615,
+  "pnl": 5156,
+  "profile_image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/images_0a57a0c2-437f-41be-9ab8-5376ab6f3ca7_1726693550341.jpeg"
+}
+
+================================================================================
+TEST: Offset: 50, Limit: 50
+Params: {
+  "offset": 50,
+  "limit": 50
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 50 results
+
+First result:
+{
+  "rank": "51",
+  "user_id": "0x2adf85be1f25a77ca407cf031bd00d735c05d89c",
+  "user_name": "jerk-mate",
+  "vol": 0,
+  "pnl": 2670,
+  "profile_image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/profile-image-3225140-d66315c8-b158-481d-92d0-f338d1ed44a4.jpg"
+}
+
+Last result:
+{
+  "rank": "100",
+  "user_id": "0x71a70f24538d885d1b45f9cea158a2cdf2e56fcf",
+  "user_name": "easyclap",
+  "vol": 61018.833713,
+  "pnl": 1439,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Offset: 100, Limit: 50
+Params: {
+  "offset": 100,
+  "limit": 50
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 50 results
+
+First result:
+{
+  "rank": "101",
+  "user_id": "0xdd528c7be0e1b3569ac228e5442fcae5f1130001",
+  "user_name": "satfarmer",
+  "vol": 0,
+  "pnl": 1438,
+  "profile_image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/pvf9b6b4mdz81_0dd61e5d-007e-4358-8eb9-548068648711_1741757995194.webp"
+}
+
+Last result:
+{
+  "rank": "150",
+  "user_id": "0x6e82b93eb57b01a63027bd0c6d2f3f04934a752c",
+  "user_name": "0x24357454d8d1a0cc93a6c25fd490467372bc2454",
+  "vol": 0,
+  "pnl": 915,
+  "profile_image": ""
+}
+
+================================================================================
+ SECTION 3: SORTING & ORDERING
+================================================================================
+
+================================================================================
+TEST: Sort: volume
+Params: {
+  "sort": "volume"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Sort: pnl
+Params: {
+  "sort": "pnl"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Sort: vol
+Params: {
+  "sort": "vol"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: SortBy: volume
+Params: {
+  "sortBy": "volume"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: SortBy: pnl
+Params: {
+  "sortBy": "pnl"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: SortBy: vol
+Params: {
+  "sortBy": "vol"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Order: volume
+Params: {
+  "order": "volume"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Order: pnl
+Params: {
+  "order": "pnl"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: OrderBy: volume
+Params: {
+  "orderBy": "volume"
+}
+================================================================================
+Status: 400
+✗ FAILED - 400
+Response: {"error":"invalid order by parameter"}
+
+================================================================================
+TEST: OrderBy: pnl
+Params: {
+  "orderBy": "pnl"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Ascending: true
+Params: {
+  "ascending": "true"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Ascending: false
+Params: {
+  "ascending": "false"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Desc: true
+Params: {
+  "desc": "true"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Asc: true
+Params: {
+  "asc": "true"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+ SECTION 4: FIELD SELECTION
+================================================================================
+
+================================================================================
+TEST: Fields: rank,user_id,vol
+Params: {
+  "fields": "rank,user_id,vol"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Select: rank,user_id,vol
+Params: {
+  "select": "rank,user_id,vol"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Columns: rank,user_id,vol
+Params: {
+  "columns": "rank,user_id,vol"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 25 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "25",
+  "user_id": "0x2aac99d0ee5b8d95fbd48e16ce37d90bbd7f1b36",
+  "user_name": "lijialijia2020",
+  "vol": 9413.06,
+  "pnl": 4144,
+  "profile_image": ""
+}
+
+================================================================================
+ SECTION 5: COMBINATION TESTS
+================================================================================
+
+================================================================================
+TEST: Limit 10, Period 7d
+Params: {
+  "limit": 10,
+  "period": "7d"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 10 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "10",
+  "user_id": "0xdf2e12c6a53671d0b08f29d0391728097029ddec",
+  "user_name": "supersportsbro",
+  "vol": 120688.60371,
+  "pnl": 8890,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Limit 10, Period 30d
+Params: {
+  "limit": 10,
+  "period": "30d"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 10 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "10",
+  "user_id": "0xdf2e12c6a53671d0b08f29d0391728097029ddec",
+  "user_name": "supersportsbro",
+  "vol": 120688.60371,
+  "pnl": 8890,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Limit 10, Sort volume
+Params: {
+  "limit": 10,
+  "sort": "volume"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 10 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "10",
+  "user_id": "0xdf2e12c6a53671d0b08f29d0391728097029ddec",
+  "user_name": "supersportsbro",
+  "vol": 120688.60371,
+  "pnl": 8890,
+  "profile_image": ""
+}
+
+================================================================================
+TEST: Limit 10, Period 7d, Sort volume
+Params: {
+  "limit": 10,
+  "period": "7d",
+  "sort": "volume"
+}
+================================================================================
+Status: 200
+✓ SUCCESS - 10 results
+
+First result:
+{
+  "rank": "1",
+  "user_id": "0xaefeb1f121eeccc9b3a2d2283139cc93a08a1e4a",
+  "user_name": "Jayachamarajendra",
+  "vol": 0,
+  "pnl": 30271,
+  "profile_image": ""
+}
+
+Last result:
+{
+  "rank": "10",
+  "user_id": "0xdf2e12c6a53671d0b08f29d0391728097029ddec",
+  "user_name": "supersportsbro",
+  "vol": 120688.60371,
+  "pnl": 8890,
+  "profile_image": ""
+}
+
+================================================================================
+ TEST SUMMARY
+================================================================================
+
+Successful tests that returned data:
+  ✓ Default (no params): 25 results
+  ✓ Period: 1 day: 25 results
+  ✓ Period: 24 hours: 25 results
+  ✓ Period: 7 days: 25 results
+  ✓ Period: 1 week: 25 results
+  ✓ Period: 30 days: 25 results
+  ✓ Period: 1 month: 25 results
+  ✓ Period: all time: 25 results
+  ✓ Period: all time (alt): 25 results
+  ✓ Timeframe: day: 25 results
+  ✓ Timeframe: week: 25 results
+  ✓ Timeframe: month: 25 results
+  ✓ Timeframe: all: 25 results
+  ✓ Interval: 1 day: 25 results
+  ✓ Interval: 7 days: 25 results
+  ✓ Interval: 30 days: 25 results
+  ✓ Limit: 10: 10 results
+  ✓ Limit: 25: 25 results
+  ✓ Limit: 50: 50 results
+  ✓ Limit: 100: 50 results
+  ✓ Limit: 200: 50 results
+  ✓ Limit: 500: 50 results
+  ✓ Offset: 0, Limit: 10: 10 results
+  ✓ Offset: 10, Limit: 10: 10 results
+  ✓ Offset: 50, Limit: 50: 50 results
+  ✓ Offset: 100, Limit: 50: 50 results
+  ✓ Sort: volume: 25 results
+  ✓ Sort: pnl: 25 results
+  ✓ Sort: vol: 25 results
+  ✓ SortBy: volume: 25 results
+  ✓ SortBy: pnl: 25 results
+  ✓ SortBy: vol: 25 results
+  ✓ Order: volume: 25 results
+  ✓ Order: pnl: 25 results
+  ✓ OrderBy: pnl: 25 results
+  ✓ Ascending: true: 25 results
+  ✓ Ascending: false: 25 results
+  ✓ Desc: true: 25 results
+  ✓ Asc: true: 25 results
+  ✓ Fields: rank,user_id,vol: 25 results
+  ✓ Select: rank,user_id,vol: 25 results
+  ✓ Columns: rank,user_id,vol: 25 results
+  ✓ Limit 10, Period 7d: 10 results
+  ✓ Limit 10, Period 30d: 10 results
+  ✓ Limit 10, Sort volume: 10 results
+  ✓ Limit 10, Period 7d, Sort volume: 10 results
+
+Failed or empty tests:
+  ✗ OrderBy: volume
+
+✓ Full results saved to: /Users/lgierhake/Documents/ETH/BT/top_traders/api_research/leaderboard_complete_test_results.json
+
+================================================================================
+ ANALYSIS & CONCLUSIONS
+================================================================================
+✓ Time period parameters ARE supported
+
+📊 Maximum results returned: 50
+
+🔍 Recommendation:
+  Run additional test comparing vol values across different sort params
+  to verify if sorting actually changes the order.
