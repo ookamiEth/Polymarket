@@ -1,0 +1,116 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Python testing and cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+htmlcov/
+.tox/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# UV package manager
+.uv_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files - BLANKET IGNORE (no data files uploaded)
+*.parquet
+*.csv
+*.tsv
+*.jsonl
+*.ndjson
+*.dat
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.feather
+*.arrow
+
+# JSON files - ignore all except essential config files
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!.vscode/*.json
+!.eslintrc.json
+!.prettierrc.json
+!.solhint.json
+
+# Data directories - comprehensive
+data/
+checkpoints/
+research/
+logs/
+data_collectors/**/data/
+data_collectors/**/results/
+orderbook_snapshots/data/
+orderbook_snapshots/logs/
+orderbook_snapshots/config/*.json
+orderbook_snapshots/config/*.csv
+
+# Logs
+*.log
+logs/
+test_output.*
+*.log.*
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Claude
+.claude/settings.local.json
+
+# Documentation files (except README.md)
+*.md
+!README.md
+
+# Documentation (separate Chainlink repository)
+documentation/

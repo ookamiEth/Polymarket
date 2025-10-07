@@ -1,0 +1,65 @@
+[Unit]
+Description=Polymarket Orderbook Streaming Service
+Documentation=file:///Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lgierhake
+Group=staff
+WorkingDirectory=/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots
+Environment="PATH=/Users/lgierhake/.local/bin:/usr/bin:/usr/local/bin"
+
+# Main service command
+ExecStart=/usr/bin/uv run python scripts/stream_continuous.py
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Output handling
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orderbook-streamer
+
+# Resource limits
+MemoryMax=512M
+MemoryHigh=400M
+CPUQuota=50%
+TasksMax=50
+
+# Security hardening
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/data
+ReadWritePaths=/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/logs
+
+# Graceful shutdown
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
+
+# Installation instructions:
+# 1. Copy this file to systemd directory:
+#    macOS: ~/Library/LaunchAgents/ (convert to plist format)
+#    Linux: /etc/systemd/system/
+#
+# 2. For Linux:
+#    sudo systemctl daemon-reload
+#    sudo systemctl enable orderbook-streamer
+#    sudo systemctl start orderbook-streamer
+#
+# 3. Monitor:
+#    sudo systemctl status orderbook-streamer
+#    journalctl -u orderbook-streamer -f
+#
+# Note: macOS uses launchd instead of systemd.
+# See docs/deployment.md for macOS plist configuration.
