@@ -7,16 +7,17 @@ then visualizes both cumulative PnL and per-market PnL over time.
 
 Usage:
     uv run python research/historical_trading/create_trader_pnl_timeseries.py
+    uv run python research/historical_trading/create_trader_pnl_timeseries.py --trader 0x...
 """
 
 import polars as pl
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from pathlib import Path
+import argparse
 
 TRADER_ADDRESS = '0xcc500cbcc8b7cf5bd21975ebbea34f21b5644c82'
 INPUT_FILE = 'research/historical_trading/btc_15min_trades_enriched.parquet'
-OUTPUT_FILE = f'research/historical_trading/trader_{TRADER_ADDRESS[:10]}_pnl_timeseries.pdf'
 
 
 def calculate_trader_position_pnl(trader_address: str):
@@ -120,7 +121,7 @@ def calculate_trader_position_pnl(trader_address: str):
     return positions, trader_name
 
 
-def create_visualization(positions_df: pl.DataFrame, trader_name: str, output_path: str):
+def create_visualization(positions_df: pl.DataFrame, trader_name: str, trader_address: str, output_path: str):
     """Create PDF with cumulative PnL line chart and per-market PnL bar chart"""
 
     print(f"\nCreating visualization...")
@@ -130,7 +131,7 @@ def create_visualization(positions_df: pl.DataFrame, trader_name: str, output_pa
 
     # Create figure with 2 subplots
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
-    fig.suptitle(f'Trader {trader_name} ({TRADER_ADDRESS[:10]}...) PnL Time Series\nTotal PnL: ${df_pd["cumulative_pnl"].iloc[-1]:,.2f} across {len(df_pd)} markets',
+    fig.suptitle(f'Trader {trader_name} ({trader_address[:10]}...) PnL Time Series\nTotal PnL: ${df_pd["cumulative_pnl"].iloc[-1]:,.2f} across {len(df_pd)} markets',
                  fontsize=14, fontweight='bold')
 
     # Subplot 1: Cumulative PnL (line chart)
@@ -178,15 +179,25 @@ def create_visualization(positions_df: pl.DataFrame, trader_name: str, output_pa
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Create PnL time series visualization for a trader')
+    parser.add_argument(
+        '--trader',
+        type=str,
+        default=TRADER_ADDRESS,
+        help=f'Trader address (default: {TRADER_ADDRESS[:10]}...)'
+    )
+    args = parser.parse_args()
+
     print("="*80)
     print("TRADER PNL TIME SERIES VISUALIZATION")
     print("="*80)
 
     # Step 1: Calculate position-level PnL for trader
-    positions, trader_name = calculate_trader_position_pnl(TRADER_ADDRESS)
+    positions, trader_name = calculate_trader_position_pnl(args.trader)
 
     # Step 2: Create visualization
-    create_visualization(positions, trader_name, OUTPUT_FILE)
+    output_file = f'research/historical_trading/trader_{args.trader[:10]}_pnl_timeseries.pdf'
+    create_visualization(positions, trader_name, args.trader, output_file)
 
     print("\n✓ Complete")
 
