@@ -29,6 +29,7 @@ import yaml
 import logging
 import requests
 import polars as pl
+import gc
 from pathlib import Path
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -152,6 +153,10 @@ class MarketScheduler:
         self.schedule = None
         self.current_market = None
         self.next_market = None
+
+        # HTTP session for connection reuse
+        self.session = requests.Session()
+
         self._load_schedule()
 
     def _load_schedule(self):
@@ -209,7 +214,7 @@ class MarketScheduler:
         # Query Gamma API for token IDs
         gamma_url = self.config.get('apis', 'gamma_url')
         try:
-            response = requests.get(
+            response = self.session.get(
                 f"{gamma_url}/markets",
                 params={"slug": slug},
                 timeout=10
@@ -267,7 +272,7 @@ class MarketScheduler:
         # Query API for token IDs
         gamma_url = self.config.get('apis', 'gamma_url')
         try:
-            response = requests.get(
+            response = self.session.get(
                 f"{gamma_url}/markets",
                 params={"slug": slug},
                 timeout=10
@@ -295,6 +300,11 @@ class MarketScheduler:
             self.logger.error(f"Error pre-fetching next market: {e}")
             return None
 
+    def close(self):
+        """Close HTTP session and cleanup"""
+        if hasattr(self, 'session'):
+            self.session.close()
+
 
 # ============================================================================
 # Orderbook Poller
@@ -311,6 +321,9 @@ class OrderbookPoller:
         self.retry_attempts = config.get('polling', 'retry_attempts', default=3)
         self.backoff_multiplier = config.get('polling', 'backoff_multiplier', default=2)
 
+        # HTTP session for connection reuse
+        self.session = requests.Session()
+
         # Metrics
         self.latencies = deque(maxlen=100)
         self.error_count = Counter()
@@ -322,7 +335,7 @@ class OrderbookPoller:
                 start_time = time.time()
                 capture_time_ms = int(start_time * 1000)
 
-                response = requests.get(
+                response = self.session.get(
                     f"{self.api_url}/book",
                     params={"token_id": token_id},
                     timeout=self.timeout
@@ -432,6 +445,11 @@ class OrderbookPoller:
             'error_counts': dict(self.error_count)
         }
 
+    def close(self):
+        """Close HTTP session and cleanup"""
+        if hasattr(self, 'session'):
+            self.session.close()
+
 
 # ============================================================================
 # Data Writer
@@ -488,8 +506,9 @@ class DataWriter:
                 f"Wrote {len(df)} snapshots to {output_file} ({file_size_kb:.1f}KB)"
             )
 
-            # Clear buffer
+            # Clear buffer and force garbage collection
             self.buffer = []
+            gc.collect()
 
         except Exception as e:
             self.logger.error(f"Error writing Parquet: {e}")
@@ -582,6 +601,13 @@ class OrderbookStreamer:
             self.logger.info("Flushing buffer for current market...")
             self.writer.flush(self.current_market)
 
+            # Reset HTTP sessions to prevent connection accumulation
+            self.logger.debug("Resetting HTTP sessions...")
+            self.poller.close()
+            self.scheduler.close()
+            self.poller.session = requests.Session()
+            self.scheduler.session = requests.Session()
+
             # Switch to next market
             if self.next_market:
                 self.current_market = self.next_market
@@ -610,6 +636,7 @@ class OrderbookStreamer:
             self.logger.info("=" * 80)
 
             last_status_log = time.time()
+            last_gc = time.time()
             last_transition_check = time.time()
 
             while not self.shutdown_flag:
@@ -656,6 +683,12 @@ class OrderbookStreamer:
                         f"avg latency: {metrics.get('avg_latency_ms', 0):.0f}ms"
                     )
                     last_status_log = time.time()
+
+                # Periodic garbage collection every 5 minutes
+                if time.time() - last_gc >= 300:
+                    collected = gc.collect()
+                    self.logger.debug(f"Garbage collection: {collected} objects collected")
+                    last_gc = time.time()
 
                 # Sleep to maintain interval
                 loop_elapsed = time.time() - loop_start
