@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Production Orderbook Streaming Service
+Production Orderbook Streaming Service - BTC Hourly
 
-Continuously captures orderbook snapshots from Polymarket BTC 15-minute markets.
-Automatically switches markets every 15 minutes and stores data in Parquet format.
+Continuously captures orderbook snapshots from Polymarket BTC hourly markets.
+Automatically switches markets every hour and stores data in Parquet format.
 
 Features:
 - 24/7 continuous operation
@@ -15,10 +15,10 @@ Features:
 
 Usage:
     cd /orderbook_snapshots
-    uv run python scripts/stream_continuous.py
+    uv run python scripts/stream_continuous_btc_hourly.py
 
     # Or as a service:
-    launchctl load ~/Library/LaunchAgents/com.orderbook.streamer.plist
+    launchctl load ~/Library/LaunchAgents/com.polymarket.orderbook-streamer-btc-hourly.plist
 """
 
 import signal
@@ -29,8 +29,9 @@ import yaml
 import logging
 import requests
 import polars as pl
+import gc
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from collections import Counter, deque
 from typing import Optional, Dict, Any
@@ -42,7 +43,7 @@ from typing import Optional, Dict, Any
 class ConfigLoader:
     """Load and validate configuration from YAML file"""
 
-    def __init__(self, config_path: str = "config/streamer_config.yaml"):
+    def __init__(self, config_path: str = "config/streamer_config_btc_hourly.yaml"):
         self.config_path = Path(config_path)
         self.config = self._load_config()
 
@@ -152,12 +153,15 @@ class MarketScheduler:
         self.schedule = None
         self.current_market = None
         self.next_market = None
+
+        # HTTP session for connection reuse
+        self.session = requests.Session()
+
         self._load_schedule()
 
     def _load_schedule(self):
         """Load market schedule from Parquet file"""
         schedule_file = Path(self.config.get('schedule', 'file'))
-
         if not schedule_file.exists():
             raise FileNotFoundError(f"Schedule file not found: {schedule_file}")
 
@@ -209,7 +213,7 @@ class MarketScheduler:
         # Query Gamma API for token IDs
         gamma_url = self.config.get('apis', 'gamma_url')
         try:
-            response = requests.get(
+            response = self.session.get(
                 f"{gamma_url}/markets",
                 params={"slug": slug},
                 timeout=10
@@ -267,7 +271,7 @@ class MarketScheduler:
         # Query API for token IDs
         gamma_url = self.config.get('apis', 'gamma_url')
         try:
-            response = requests.get(
+            response = self.session.get(
                 f"{gamma_url}/markets",
                 params={"slug": slug},
                 timeout=10
@@ -295,6 +299,11 @@ class MarketScheduler:
             self.logger.error(f"Error pre-fetching next market: {e}")
             return None
 
+    def close(self):
+        """Close HTTP session and cleanup"""
+        if hasattr(self, 'session'):
+            self.session.close()
+
 
 # ============================================================================
 # Orderbook Poller
@@ -311,6 +320,9 @@ class OrderbookPoller:
         self.retry_attempts = config.get('polling', 'retry_attempts', default=3)
         self.backoff_multiplier = config.get('polling', 'backoff_multiplier', default=2)
 
+        # HTTP session for connection reuse
+        self.session = requests.Session()
+
         # Metrics
         self.latencies = deque(maxlen=100)
         self.error_count = Counter()
@@ -322,7 +334,7 @@ class OrderbookPoller:
                 start_time = time.time()
                 capture_time_ms = int(start_time * 1000)
 
-                response = requests.get(
+                response = self.session.get(
                     f"{self.api_url}/book",
                     params={"token_id": token_id},
                     timeout=self.timeout
@@ -432,6 +444,11 @@ class OrderbookPoller:
             'error_counts': dict(self.error_count)
         }
 
+    def close(self):
+        """Close HTTP session and cleanup"""
+        if hasattr(self, 'session'):
+            self.session.close()
+
 
 # ============================================================================
 # Data Writer
@@ -462,15 +479,37 @@ class DataWriter:
             return
 
         try:
-            # Create DataFrame
-            df = pl.DataFrame(self.buffer)
+            # Define explicit schema to handle None values correctly
+            schema = {
+                'timestamp_ms': pl.Int64,
+                'market_timestamp_ms': pl.Int64,
+                'condition_id': pl.Utf8,
+                'asset_id': pl.Utf8,
+                'bid_price_3': pl.Float64,
+                'bid_size_3': pl.Float64,
+                'bid_price_2': pl.Float64,
+                'bid_size_2': pl.Float64,
+                'bid_price_1': pl.Float64,
+                'bid_size_1': pl.Float64,
+                'spread': pl.Float64,
+                'mid_price': pl.Float64,
+                'ask_price_1': pl.Float64,
+                'ask_size_1': pl.Float64,
+                'ask_price_2': pl.Float64,
+                'ask_size_2': pl.Float64,
+                'ask_price_3': pl.Float64,
+                'ask_size_3': pl.Float64,
+            }
 
-            # Generate output path (using UTC)
-            dt = datetime.fromtimestamp(market['start_timestamp'], tz=timezone.utc)
+            # Create DataFrame with explicit schema
+            df = pl.DataFrame(self.buffer, schema=schema)
+
+            # Generate output path
+            dt = datetime.fromtimestamp(market['start_timestamp'])
             year = dt.strftime("%Y")
             month = dt.strftime("%m")
             day = dt.strftime("%d")
-            filename = f"orderbook_{dt.strftime('%Y%m%d_%H%M')}.parquet"
+            filename = f"orderbook_btc_hourly_{dt.strftime('%Y%m%d_%H%M')}.parquet"
 
             output_dir = self.base_dir / year / month / day
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -488,8 +527,9 @@ class DataWriter:
                 f"Wrote {len(df)} snapshots to {output_file} ({file_size_kb:.1f}KB)"
             )
 
-            # Clear buffer
+            # Clear buffer and force garbage collection
             self.buffer = []
+            gc.collect()
 
         except Exception as e:
             self.logger.error(f"Error writing Parquet: {e}")
@@ -582,6 +622,13 @@ class OrderbookStreamer:
             self.logger.info("Flushing buffer for current market...")
             self.writer.flush(self.current_market)
 
+            # Reset HTTP sessions to prevent connection accumulation
+            self.logger.debug("Resetting HTTP sessions...")
+            self.poller.close()
+            self.scheduler.close()
+            self.poller.session = requests.Session()
+            self.scheduler.session = requests.Session()
+
             # Switch to next market
             if self.next_market:
                 self.current_market = self.next_market
@@ -610,6 +657,7 @@ class OrderbookStreamer:
             self.logger.info("=" * 80)
 
             last_status_log = time.time()
+            last_gc = time.time()
             last_transition_check = time.time()
 
             while not self.shutdown_flag:
@@ -656,6 +704,12 @@ class OrderbookStreamer:
                         f"avg latency: {metrics.get('avg_latency_ms', 0):.0f}ms"
                     )
                     last_status_log = time.time()
+
+                # Periodic garbage collection every 5 minutes
+                if time.time() - last_gc >= 300:
+                    collected = gc.collect()
+                    self.logger.debug(f"Garbage collection: {collected} objects collected")
+                    last_gc = time.time()
 
                 # Sleep to maintain interval
                 loop_elapsed = time.time() - loop_start

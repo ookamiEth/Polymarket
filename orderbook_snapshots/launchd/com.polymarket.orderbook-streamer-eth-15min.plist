@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Service Identification -->
+    <key>Label</key>
+    <string>com.polymarket.orderbook-streamer-eth-15min</string>
+
+    <!-- Program Configuration -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/lgierhake/.local/bin/uv</string>
+        <string>run</string>
+        <string>python</string>
+        <string>scripts/stream_continuous_eth_15min.py</string>
+    </array>
+
+    <!-- Working Directory -->
+    <key>WorkingDirectory</key>
+    <string>/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots</string>
+
+    <!-- Auto-start and Keep Alive -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- Restart Configuration -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/logs/launchd_stdout_eth_15min.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/logs/launchd_stderr_eth_15min.log</string>
+
+    <!-- Environment Variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/lgierhake/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/lgierhake</string>
+        <key>UV_CACHE_DIR</key>
+        <string>/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/.uv_cache</string>
+    </dict>
+
+    <!-- Resource Limits -->
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>MemoryLimit</key>
+        <integer>419430400</integer> <!-- 400MB in bytes -->
+    </dict>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>MemoryLimit</key>
+        <integer>314572800</integer> <!-- 300MB in bytes -->
+    </dict>
+
+    <!-- Process Priority -->
+    <key>Nice</key>
+    <integer>0</integer>
+
+    <!-- User Context (runs as your user) -->
+    <key>UserName</key>
+    <string>lgierhake</string>
+</dict>
+</plist>

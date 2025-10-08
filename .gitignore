@@ -67,7 +67,21 @@ Thumbs.db
 *.hdf5
 *.feather
 *.arrow
-*.pdf 
+*.pdf
+
+# Compressed data files
+*.gz
+*.zip
+*.bz2
+*.xz
+*.tar
+*.tar.gz
+*.tgz
+
+# Download temporary files
+*.unconfirmed
+*.download
+*.tmp.*
 
 # JSON files - ignore all except essential config files
 *.json
@@ -89,6 +103,10 @@ orderbook_snapshots/data/
 orderbook_snapshots/logs/
 orderbook_snapshots/config/*.json
 orderbook_snapshots/config/*.csv
+
+# Research data directories
+research/tardis/datasets_*/
+research/tardis/tardis-python/
 
 # Logs
 *.log

@@ -4,7 +4,7 @@
 <dict>
     <!-- Service Identification -->
     <key>Label</key>
-    <string>com.polymarket.orderbook-streamer</string>
+    <string>com.polymarket.orderbook-streamer-eth-hourly</string>
 
     <!-- Program Configuration -->
     <key>ProgramArguments</key>
@@ -12,7 +12,7 @@
         <string>/Users/lgierhake/.local/bin/uv</string>
         <string>run</string>
         <string>python</string>
-        <string>scripts/stream_continuous.py</string>
+        <string>scripts/stream_continuous_eth_hourly.py</string>
     </array>
 
     <!-- Working Directory -->
@@ -37,10 +37,10 @@
 
     <!-- Logging -->
     <key>StandardOutPath</key>
-    <string>/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/logs/launchd_stdout.log</string>
+    <string>/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/logs/launchd_stdout_eth_hourly.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/logs/launchd_stderr.log</string>
+    <string>/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/logs/launchd_stderr_eth_hourly.log</string>
 
     <!-- Environment Variables -->
     <key>EnvironmentVariables</key>
@@ -57,13 +57,13 @@
     <key>HardResourceLimits</key>
     <dict>
         <key>MemoryLimit</key>
-        <integer>536870912</integer> <!-- 512MB in bytes -->
+        <integer>419430400</integer> <!-- 400MB in bytes -->
     </dict>
 
     <key>SoftResourceLimits</key>
     <dict>
         <key>MemoryLimit</key>
-        <integer>419430400</integer> <!-- 400MB in bytes -->
+        <integer>314572800</integer> <!-- 300MB in bytes -->
     </dict>
 
     <!-- Process Priority -->

@@ -1,5 +1,5 @@
 [Unit]
-Description=Polymarket Orderbook Streaming Service
+Description=Polymarket Orderbook Streaming Service - BTC 15min
 Documentation=file:///Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/README.md
 After=network-online.target
 Wants=network-online.target
@@ -12,7 +12,7 @@ WorkingDirectory=/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots
 Environment="PATH=/Users/lgierhake/.local/bin:/usr/bin:/usr/local/bin"
 
 # Main service command
-ExecStart=/usr/bin/uv run python scripts/stream_continuous.py
+ExecStart=/usr/bin/uv run python scripts/stream_continuous_btc_15min.py
 
 # Restart policy
 Restart=always
@@ -23,7 +23,7 @@ StartLimitIntervalSec=300
 # Output handling
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=orderbook-streamer
+SyslogIdentifier=orderbook-streamer-btc-15min
 
 # Resource limits
 MemoryMax=512M

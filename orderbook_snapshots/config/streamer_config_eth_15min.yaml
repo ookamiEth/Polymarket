@@ -1,0 +1,62 @@
+# Orderbook Streaming Service Configuration - ETH 15min
+# Version: 1.0.0
+
+service:
+  name: orderbook-streamer-eth-15min
+  version: 1.0.0
+  description: "Polymarket ETH 15-min orderbook streaming service"
+
+# Polling configuration
+polling:
+  interval_seconds: 1.0       # Snapshot every 1 second
+  retry_attempts: 3           # Number of retries on API error
+  timeout_seconds: 5          # Request timeout
+  backoff_multiplier: 2       # Exponential backoff: 1s, 2s, 4s
+
+# Schedule configuration
+schedule:
+  file: config/eth_updown_schedule_1year.parquet
+  refresh_threshold_days: 30  # Regenerate schedule when <30 days remaining
+  preload_next_market_seconds: 60  # Fetch next market 60s before transition
+
+# Storage configuration
+storage:
+  raw_data_dir: data/raw/eth_15min      # Production data directory
+  test_data_dir: data/test              # Test outputs directory
+  compression: snappy                   # Parquet compression codec
+  buffer_size: 1000                     # Snapshots to buffer before write
+
+  # File naming: orderbook_eth_15min_YYYYMMDD_HHMM.parquet
+  # Path structure: data/raw/eth_15min/YYYY/MM/DD/orderbook_eth_15min_YYYYMMDD_HHMM.parquet
+
+# Logging configuration
+logging:
+  level: INFO                           # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  file: logs/streamer_eth_15min.log
+  max_bytes: 104857600                  # 100MB
+  backup_count: 5                       # Keep 5 backup log files
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# API endpoints
+apis:
+  gamma_url: https://gamma-api.polymarket.com
+  clob_url: https://clob.polymarket.com
+
+# Market configuration
+market:
+  series: eth-up-or-down      # Market series to track
+  interval_minutes: 15        # Market duration in minutes
+  token_selection: UP         # Which token to track (UP | DOWN | BOTH)
+
+# Monitoring thresholds
+monitoring:
+  api_latency_warning_ms: 5000   # Warn if API response >5s
+  success_rate_threshold: 0.90   # Warn if success rate <90%
+  memory_limit_mb: 400           # Warn if memory usage >400MB
+  disk_free_warning_gb: 1        # Warn if disk space <1GB
+
+# Rate limiting (Polymarket CLOB limits)
+rate_limits:
+  clob_book_limit: 200        # 200 requests per 10 seconds
+  clob_book_window_seconds: 10
+  safety_margin: 0.5          # Use 50% of limit for safety

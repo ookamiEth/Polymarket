@@ -1,0 +1,56 @@
+[Unit]
+Description=Polymarket Orderbook Streaming Service - ETH 15min
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/Polymarket/orderbook_snapshots
+Environment="PATH=/home/ec2-user/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="UV_CACHE_DIR=/home/ec2-user/Polymarket/orderbook_snapshots/.uv_cache"
+Environment="UV_PROJECT_ENVIRONMENT=/home/ec2-user/Polymarket/orderbook_snapshots/.venv"
+
+# Main service command
+ExecStart=/home/ec2-user/.local/bin/uv run python scripts/stream_continuous_eth_15min.py
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitBurst=5
+
+# Output handling
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orderbook-streamer-eth-15min
+
+# Resource limits
+MemoryMax=400M
+MemoryHigh=300M
+CPUQuota=50%
+TasksMax=50
+
+# Security hardening (relaxed for UV compatibility)
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Graceful shutdown
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
+
+# Installation instructions:
+# 1. Copy this file to /etc/systemd/system/
+#
+# 2. Enable and start:
+#    sudo systemctl daemon-reload
+#    sudo systemctl enable orderbook-streamer-eth-15min
+#    sudo systemctl start orderbook-streamer-eth-15min
+#
+# 3. Monitor:
+#    sudo systemctl status orderbook-streamer-eth-15min
+#    journalctl -u orderbook-streamer-eth-15min -f

@@ -44,13 +44,21 @@ uv run python scripts/test_snapshot.py
 - Polls orderbook every 1 second for 60 seconds
 - Saves to `data/test/orderbook_test_YYYYMMDD_HHMMSS.parquet`
 
-### 3. Run Production Service (Future)
+### 3. Run Production Services
 
 ```bash
-uv run python scripts/stream_continuous.py
-```
+# BTC 15-minute markets
+uv run python scripts/stream_continuous_btc_15min.py
 
-*Note: Production streaming service is not yet implemented. See [docs/prd.md](docs/prd.md) for specifications.*
+# ETH 15-minute markets
+uv run python scripts/stream_continuous_eth_15min.py
+
+# BTC Hourly markets
+uv run python scripts/stream_continuous_btc_hourly.py
+
+# ETH Hourly markets
+uv run python scripts/stream_continuous_eth_hourly.py
+```
 
 ---
 
@@ -60,26 +68,54 @@ uv run python scripts/stream_continuous.py
 orderbook_snapshots/
 ├── README.md                   # This file
 ├── config/
-│   ├── btc_updown_schedule_1year.parquet  # 1-year market schedule
-│   └── streamer_config.yaml              # Service configuration
+│   ├── btc_updown_schedule_1year.parquet      # BTC 15min schedule
+│   ├── eth_updown_schedule_1year.parquet      # ETH 15min schedule
+│   ├── btc_hourly_schedule_1year.parquet      # BTC hourly schedule
+│   ├── eth_hourly_schedule_1year.parquet      # ETH hourly schedule
+│   ├── streamer_config_btc_15min.yaml         # BTC 15min service config
+│   ├── streamer_config_eth_15min.yaml         # ETH 15min service config
+│   ├── streamer_config_btc_hourly.yaml        # BTC hourly service config
+│   └── streamer_config_eth_hourly.yaml        # ETH hourly service config
 ├── scripts/
-│   ├── generate_schedule.py    # Schedule generator
-│   ├── test_snapshot.py        # 60-second test script
-│   └── stream_continuous.py    # Production streamer (TODO)
+│   ├── generate_schedule_eth_15min.py         # ETH 15min schedule generator
+│   ├── generate_schedule_btc_hourly.py        # BTC hourly schedule generator
+│   ├── generate_schedule_eth_hourly.py        # ETH hourly schedule generator
+│   ├── stream_continuous_btc_15min.py         # BTC 15min production streamer
+│   ├── stream_continuous_eth_15min.py         # ETH 15min production streamer
+│   ├── stream_continuous_btc_hourly.py        # BTC hourly production streamer
+│   ├── stream_continuous_eth_hourly.py        # ETH hourly production streamer
+│   └── test_snapshot.py                        # 60-second test script
 ├── data/
-│   ├── raw/                    # Production data (organized by date)
-│   │   └── 2025/10/06/
-│   │       ├── orderbook_20251006_1130.parquet
-│   │       └── orderbook_20251006_1145.parquet
+│   ├── raw/                    # Production data (organized by service)
+│   │   ├── btc_15min/2025/10/06/
+│   │   │   ├── orderbook_btc_15min_20251006_1130.parquet
+│   │   │   └── orderbook_btc_15min_20251006_1145.parquet
+│   │   ├── eth_15min/2025/10/06/
+│   │   │   └── orderbook_eth_15min_20251006_1130.parquet
+│   │   ├── btc_hourly/2025/10/06/
+│   │   │   └── orderbook_btc_hourly_20251006_0100.parquet
+│   │   └── eth_hourly/2025/10/06/
+│   │       └── orderbook_eth_hourly_20251006_0100.parquet
 │   └── test/                   # Test outputs
 │       └── orderbook_test_*.parquet
 ├── logs/
-│   └── streamer.log            # Service logs
+│   ├── streamer_btc_15min.log      # BTC 15min service logs
+│   ├── streamer_eth_15min.log      # ETH 15min service logs
+│   ├── streamer_btc_hourly.log     # BTC hourly service logs
+│   └── streamer_eth_hourly.log     # ETH hourly service logs
 ├── systemd/
-│   └── orderbook-streamer.service  # systemd service file
+│   ├── orderbook-streamer.service             # BTC 15min systemd service
+│   ├── orderbook-streamer-eth-15min.service   # ETH 15min systemd service
+│   ├── orderbook-streamer-btc-hourly.service  # BTC hourly systemd service
+│   └── orderbook-streamer-eth-hourly.service  # ETH hourly systemd service
+├── launchd/
+│   ├── com.polymarket.orderbook-streamer.plist              # BTC 15min launchd
+│   ├── com.polymarket.orderbook-streamer-eth-15min.plist   # ETH 15min launchd
+│   ├── com.polymarket.orderbook-streamer-btc-hourly.plist  # BTC hourly launchd
+│   └── com.polymarket.orderbook-streamer-eth-hourly.plist  # ETH hourly launchd
 └── docs/
     ├── prd.md                  # Product Requirements Document
-    └── api_references.md       # Polymarket API documentation (TODO)
+    └── deployment_macos.md     # macOS deployment guide
 ```
 
 ---
@@ -114,11 +150,13 @@ Each market period generates one Parquet file with ~900 snapshots (15 min × 60 
 ### File Naming Convention
 
 ```
-orderbook_YYYYMMDD_HHMM.parquet
+orderbook_{service}_{YYYYMMDD_HHMM}.parquet
 
 Examples:
-- orderbook_20251006_1130.parquet  # Oct 6, 2025, 11:30-11:45
-- orderbook_20251006_1145.parquet  # Oct 6, 2025, 11:45-12:00
+- orderbook_btc_15min_20251006_1130.parquet   # BTC 15min: Oct 6, 2025, 11:30-11:45
+- orderbook_eth_15min_20251006_1145.parquet   # ETH 15min: Oct 6, 2025, 11:45-12:00
+- orderbook_btc_hourly_20251006_0100.parquet  # BTC hourly: Oct 6, 2025, 01:00-02:00
+- orderbook_eth_hourly_20251006_0200.parquet  # ETH hourly: Oct 6, 2025, 02:00-03:00
 ```
 
 ---
@@ -142,14 +180,14 @@ max_bid = df['bid_size_1'].max()
 print(f"Max bid size: {max_bid}")
 ```
 
-### Load Entire Day (96 Periods)
+### Load Entire Day for a Service
 
 ```python
 import polars as pl
 from pathlib import Path
 
-# Get all files for Oct 6, 2025
-files = Path('data/raw/2025/10/06').glob('*.parquet')
+# Get all BTC 15min files for Oct 6, 2025
+files = Path('data/raw/btc_15min/2025/10/06').glob('*.parquet')
 df = pl.concat([pl.read_parquet(f) for f in files])
 
 print(f"Total snapshots: {len(df):,}")
@@ -180,7 +218,7 @@ print(rolling_mid.select(['datetime', 'mid_price', 'mid_10s_avg']))
 
 ## Configuration
 
-Edit `config/streamer_config.yaml` to customize:
+Edit service-specific config files (e.g., `config/streamer_config_btc_15min.yaml`) to customize:
 
 - **Polling interval:** Default 1.0 second
 - **Buffer size:** Snapshots to accumulate before writing
