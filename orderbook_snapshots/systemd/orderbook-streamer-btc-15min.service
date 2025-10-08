@@ -1,24 +1,24 @@
 [Unit]
 Description=Polymarket Orderbook Streaming Service - BTC 15min
-Documentation=file:///Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/README.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=lgierhake
-Group=staff
-WorkingDirectory=/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots
-Environment="PATH=/Users/lgierhake/.local/bin:/usr/bin:/usr/local/bin"
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/Polymarket/orderbook_snapshots
+Environment="PATH=/home/ec2-user/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="UV_CACHE_DIR=/home/ec2-user/Polymarket/orderbook_snapshots/.uv_cache"
+Environment="UV_PROJECT_ENVIRONMENT=/home/ec2-user/Polymarket/orderbook_snapshots/.venv"
 
 # Main service command
-ExecStart=/usr/bin/uv run python scripts/stream_continuous_btc_15min.py
+ExecStart=/home/ec2-user/.local/bin/uv run python scripts/stream_continuous_btc_15min.py
 
 # Restart policy
 Restart=always
 RestartSec=10
 StartLimitBurst=5
-StartLimitIntervalSec=300
 
 # Output handling
 StandardOutput=journal
@@ -26,18 +26,14 @@ StandardError=journal
 SyslogIdentifier=orderbook-streamer-btc-15min
 
 # Resource limits
-MemoryMax=512M
-MemoryHigh=400M
+MemoryMax=400M
+MemoryHigh=300M
 CPUQuota=50%
 TasksMax=50
 
-# Security hardening
+# Security hardening (relaxed for UV compatibility)
 PrivateTmp=true
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/data
-ReadWritePaths=/Users/lgierhake/Documents/ETH/BT/orderbook_snapshots/logs
 
 # Graceful shutdown
 TimeoutStopSec=30
