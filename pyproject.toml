@@ -36,3 +36,59 @@ dev-dependencies = [
     "matplotlib>=3.7.0",
     "seaborn>=0.12.0",
 ]
+
+# Ruff configuration - Fast linting and formatting
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+# Enable these rule sets
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort (import sorting)
+    "N",   # pep8-naming
+    "W",   # pycodestyle warnings
+    "UP",  # pyupgrade (modernize Python syntax)
+    "B",   # flake8-bugbear (detect likely bugs)
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+
+ignore = [
+    "E501",  # Line too long (handled by formatter)
+]
+
+# Exclude certain directories
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # Allow unused imports in __init__.py
+
+# Pyright configuration - Static type checking
+[tool.pyright]
+typeCheckingMode = "basic"  # Use "strict" for maximum type safety
+pythonVersion = "3.9"
+pythonPlatform = "Darwin"
+
+include = [
+    "data_collectors",
+    "orderbook_snapshots/scripts",
+    "scripts",
+    "research",
+]
+
+exclude = [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.venv",
+    "data",
+    "logs",
+    "checkpoints",
+]
+
+# Report settings
+reportMissingImports = true
+reportMissingTypeStubs = false
+reportUnusedImport = "warning"
+reportUnusedVariable = "warning"
+reportDuplicateImport = "error"

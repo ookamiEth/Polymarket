@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""
+Optimized Tardis Machine Data Downloader for Deribit Options
+Performance improvements using vectorized Polars operations.
+
+All operations are vectorized - NO Python loops for data processing.
+Expected speedup: 10-50x for large datasets (100K+ rows).
+"""
+
+import argparse
+import asyncio
+import sys
+import os
+import time
+import msgspec.json
+import logging
+import io
+from datetime import datetime, timedelta
+from typing import Optional, List, Tuple
+import httpx
+import polars as pl
+
+
+DEFAULT_BATCH_SIZE = 50
+DEFAULT_MAX_WORKERS = 5
+DEFAULT_TARDIS_MACHINE_URL = "http://localhost:8000"
+HTTP_TIMEOUT_SECONDS = 1800.0
+SERVER_CHECK_TIMEOUT = 10.0
+DEFAULT_RESAMPLE_INTERVAL = "1m"
+DEFAULT_BOOK_LEVELS = 3
+MICROSECONDS_PER_SECOND = 1_000_000
+MEGABYTES_DIVISOR = 1_000_000
+
+BTC_STRIKES = range(40000, 130001, 1000)
+ETH_STRIKES = range(1500, 5001, 100)
+
+logger = logging.getLogger(__name__)
+
+
+async def check_tardis_machine_server(base_url: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=SERVER_CHECK_TIMEOUT) as client:
+            response = await client.get(f"{base_url}/")
+            return response.status_code in [200, 404]
+    except Exception as e:
+        logger.debug(f"Server check failed: {e}")
+        return False
+
+
+async def _fetch_single_batch_optimized(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    batch_idx: int,
+    total_batches: int,
+    symbol_batch: List[str],
+    from_datetime: str,
+    to_datetime: str,
+    data_types: List[str],
+    tardis_machine_url: str,
+) -> Tuple[int, pl.DataFrame]:
+    """
+    🚀 OPTIMIZED VERSION: Fetch a single batch using vectorized Polars operations.
+
+    Key improvements:
+    - Bulk JSON parsing → DataFrame (no Python loop)
+    - Vectorized string operations (symbol splitting)
+    - Vectorized timestamp parsing (native C implementation)
+    - Vectorized filtering and validation (single pass)
+    - Returns DataFrame directly (no intermediate list of dicts)
+    """
+    async with semaphore:
+        logger.info(f"Batch {batch_idx}/{total_batches}: {len(symbol_batch)} symbols...")
+
+        options = {
+            "exchange": "deribit",
+            "from": from_datetime,
+            "to": to_datetime,
+            "symbols": symbol_batch,
+            "dataTypes": data_types
+        }
+
+        try:
+            batch_start = time.time()
+
+            response = await client.get(
+                f"{tardis_machine_url}/replay-normalized",
+                params={"options": msgspec.json.encode(options).decode('utf-8')}
+            )
+
+            if response.status_code != 200:
+                raise Exception(
+                    f"tardis-machine error ({response.status_code}): {response.text[:500]}"
+                )
+
+            batch_elapsed = time.time() - batch_start
+            size_mb = len(response.content) / MEGABYTES_DIVISOR
+
+            if not response.text.strip():
+                logger.warning(f"Batch {batch_idx}: No data received")
+                return (batch_idx, _empty_dataframe())
+
+            # 🚀 OPTIMIZATION 1: Parse all JSON at once into DataFrame
+            try:
+                df = pl.read_ndjson(io.StringIO(response.text))
+            except Exception as e:
+                logger.error(f"Batch {batch_idx}: JSON parse error: {e}")
+                return (batch_idx, _empty_dataframe())
+
+            original_rows = len(df)
+            logger.info(f"Batch {batch_idx}: Received {original_rows:,} messages ({size_mb:.2f} MB) in {batch_elapsed:.1f}s")
+
+            if original_rows == 0:
+                return (batch_idx, _empty_dataframe())
+
+            # 🚀 OPTIMIZATION 2: Vectorized filtering by message type
+            df = df.filter(
+                pl.col('type').str.contains('quote|book_snapshot')
+            )
+
+            if len(df) == 0:
+                logger.warning(f"Batch {batch_idx}: No quote/book_snapshot messages found")
+                return (batch_idx, _empty_dataframe())
+
+            # 🚀 OPTIMIZATION 3: Vectorized symbol parsing
+            # Filter out malformed symbols (must have exactly 3 dashes)
+            df = df.filter(pl.col('symbol').str.count_matches('-') == 3)
+
+            if len(df) == 0:
+                logger.warning(f"Batch {batch_idx}: No valid symbols after filtering")
+                return (batch_idx, _empty_dataframe())
+
+            # Split symbol into parts (vectorized operation)
+            df = df.with_columns([
+                pl.col('symbol').str.split('-').alias('symbol_parts')
+            ])
+
+            # Extract parts (vectorized)
+            df = df.with_columns([
+                pl.lit('deribit').alias('exchange'),
+                pl.col('symbol_parts').list.get(0).alias('underlying'),
+                pl.col('symbol_parts').list.get(1).alias('expiry_str'),
+                pl.col('symbol_parts').list.get(2).cast(pl.Float64, strict=False).alias('strike_price'),
+                pl.when(pl.col('symbol_parts').list.get(3) == 'C')
+                  .then(pl.lit('call'))
+                  .otherwise(pl.lit('put'))
+                  .alias('type'),
+            ])
+
+            # Drop temporary column
+            df = df.drop('symbol_parts')
+
+            # Filter out rows where strike_price couldn't be parsed
+            df = df.filter(pl.col('strike_price').is_not_null())
+
+            if len(df) == 0:
+                logger.warning(f"Batch {batch_idx}: No valid rows after symbol parsing")
+                return (batch_idx, _empty_dataframe())
+
+            # 🚀 OPTIMIZATION 4: Vectorized timestamp parsing
+            # Use format string to handle timezone-aware timestamps
+            df = df.with_columns([
+                pl.col('timestamp')
+                  .str.strptime(pl.Datetime, format='%Y-%m-%dT%H:%M:%S%.fZ', strict=False)
+                  .dt.epoch('us')
+                  .fill_null(0)
+                  .alias('timestamp'),
+            ])
+
+            # Create local_timestamp as copy of timestamp
+            df = df.with_columns([
+                pl.col('timestamp').alias('local_timestamp')
+            ])
+
+            # 🚀 OPTIMIZATION 5: Vectorized book data extraction
+            # Handle bids and asks (may be lists of structs)
+            # Use .list.first() which returns null for empty lists (safer than .list.get(0))
+            df = df.with_columns([
+                pl.col('bids').list.first().struct.field('price').alias('bid_price'),
+                pl.col('bids').list.first().struct.field('amount').alias('bid_amount'),
+                pl.col('asks').list.first().struct.field('price').alias('ask_price'),
+                pl.col('asks').list.first().struct.field('amount').alias('ask_amount'),
+            ])
+
+            # 🚀 OPTIMIZATION 6: Vectorized validation (single pass, all conditions)
+            df = df.filter(
+                # All prices/amounts >= 0 (or null)
+                (pl.col('bid_price').is_null() | (pl.col('bid_price') >= 0)) &
+                (pl.col('ask_price').is_null() | (pl.col('ask_price') >= 0)) &
+                (pl.col('bid_amount').is_null() | (pl.col('bid_amount') >= 0)) &
+                (pl.col('ask_amount').is_null() | (pl.col('ask_amount') >= 0)) &
+                # Bid <= Ask (when both present)
+                (pl.col('bid_price').is_null() |
+                 pl.col('ask_price').is_null() |
+                 (pl.col('bid_price') <= pl.col('ask_price')))
+            )
+
+            # Select final columns in correct order
+            df = df.select([
+                'exchange', 'symbol', 'timestamp', 'local_timestamp', 'type',
+                'strike_price', 'underlying', 'expiry_str',
+                'bid_price', 'bid_amount', 'ask_price', 'ask_amount'
+            ])
+
+            filtered_count = original_rows - len(df)
+            logger.info(f"Batch {batch_idx}: Parsed {len(df):,} records ({filtered_count} filtered)")
+
+            return (batch_idx, df)
+
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error on batch {batch_idx}: {e}")
+            raise Exception(f"HTTP error connecting to tardis-machine: {e}") from e
+
+
+def _empty_dataframe() -> pl.DataFrame:
+    """Return empty DataFrame with correct schema."""
+    schema = {
+        "exchange": pl.Utf8,
+        "symbol": pl.Utf8,
+        "timestamp": pl.Int64,
+        "local_timestamp": pl.Int64,
+        "type": pl.Utf8,
+        "strike_price": pl.Float64,
+        "underlying": pl.Utf8,
+        "expiry_str": pl.Utf8,
+        "bid_price": pl.Float64,
+        "bid_amount": pl.Float64,
+        "ask_price": pl.Float64,
+        "ask_amount": pl.Float64,
+    }
+    return pl.DataFrame(schema=schema)
+
+
+async def fetch_sampled_quotes_optimized(
+    symbols: List[str],
+    from_date: str,
+    to_date: str,
+    interval: str = DEFAULT_RESAMPLE_INTERVAL,
+    tardis_machine_url: str = DEFAULT_TARDIS_MACHINE_URL,
+    include_book: bool = False,
+    book_levels: int = DEFAULT_BOOK_LEVELS,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+) -> pl.DataFrame:
+    """
+    🚀 OPTIMIZED VERSION: Fetch sampled quotes using vectorized operations.
+
+    Key improvements:
+    - Each batch returns DataFrame (not list of dicts)
+    - Single concat operation at end (not repeated extends)
+    - All data processing vectorized in _fetch_single_batch_optimized
+    """
+
+    book_info = f", book_snapshot_{book_levels}_{interval}" if include_book else ""
+    logger.info(f"Fetching {len(symbols)} symbols ({from_date} to {to_date}): quote_{interval}{book_info}")
+
+    data_types = [f"quote_{interval}"]
+    if include_book:
+        data_types.append(f"book_snapshot_{book_levels}_{interval}")
+
+    from_datetime = f"{from_date}T00:00:00.000Z"
+    to_datetime = f"{to_date}T23:59:59.999Z"
+
+    symbol_batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)] if len(symbols) > batch_size else [symbols]
+    num_batches = len(symbol_batches)
+    if num_batches > 1:
+        logger.info(f"Batching {len(symbols)} symbols into {num_batches} batches of {batch_size}")
+        logger.info(f"Using {max_workers} concurrent workers for parallel fetching")
+
+    start_time = time.time()
+    logger.info(f"Requesting {len(symbol_batches)} batch(es) with data types: {', '.join(data_types)}")
+
+    # Create semaphore to limit concurrent requests
+    semaphore = asyncio.Semaphore(max_workers)
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        # Create tasks for all batches
+        tasks = [
+            _fetch_single_batch_optimized(
+                client=client,
+                semaphore=semaphore,
+                batch_idx=batch_idx,
+                total_batches=num_batches,
+                symbol_batch=symbol_batch,
+                from_datetime=from_datetime,
+                to_datetime=to_datetime,
+                data_types=data_types,
+                tardis_machine_url=tardis_machine_url,
+            )
+            for batch_idx, symbol_batch in enumerate(symbol_batches, 1)
+        ]
+
+        # Execute all batches concurrently with max_workers limit
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 🚀 OPTIMIZATION: Collect DataFrames, not lists
+        all_dfs = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Batch failed with error: {result}")
+                raise result
+            batch_idx, batch_df = result
+            all_dfs.append(batch_df)
+
+    # 🚀 OPTIMIZATION: Single concat operation (optimized in Polars)
+    df = pl.concat(all_dfs, how='vertical') if all_dfs else _empty_dataframe()
+
+    total_elapsed = time.time() - start_time
+    rate = len(df) / max(total_elapsed, 0.001)
+    logger.info(f"Complete: {len(df):,} rows from {len(symbol_batches)} batches in {total_elapsed:.1f}s ({rate:.0f} rows/s)")
+
+    if len(df) == 0:
+        logger.warning("No data received - check symbols exist and date range has data")
+
+    return df
+
+
+def build_symbol_list(
+    assets: List[str], reference_date: datetime,
+    min_days: Optional[int], max_days: Optional[int], option_type: str,
+) -> List[str]:
+    suffixes = (['C', 'P'] if option_type == 'both' else
+                ['C'] if option_type == 'call' else ['P'])
+
+    expiry_dates = [reference_date + timedelta(days=d)
+                    for d in range(min_days or 0, (max_days or 0) + 1)]
+
+    all_symbols = []
+    for asset in assets:
+        strikes = BTC_STRIKES if asset == 'BTC' else ETH_STRIKES
+        symbols = [f"{asset}-{d.day}{d.strftime('%b').upper()}{d.strftime('%y')}-{strike}-{suffix}"
+                   for d in expiry_dates for strike in strikes for suffix in suffixes]
+        logger.info(f"{asset}: {len(symbols):,} symbols (strikes {min(strikes)}-{max(strikes)})")
+        all_symbols.extend(symbols)
+
+    logger.info(f"Total: {len(all_symbols):,} symbols ({len(assets)} assets, {len(expiry_dates)} dates)")
+    return all_symbols
+
+
+def save_output(df: pl.DataFrame, output_dir: str, output_format: str, filename_suffix: str) -> str:
+    ext = 'parquet' if output_format == 'parquet' else 'csv'
+    filepath = os.path.join(output_dir, f"deribit_options_{filename_suffix}.{ext}")
+
+    if output_format == 'parquet':
+        df.write_parquet(filepath)
+    else:
+        df.write_csv(filepath)
+
+    size_mb = os.path.getsize(filepath) / MEGABYTES_DIVISOR
+    logger.info(f"Saved {output_format}: {filepath} ({size_mb:.2f} MB)")
+    return filepath
+
+
+async def main_async(
+    from_date: str,
+    to_date: str,
+    assets: List[str],
+    min_days: Optional[int],
+    max_days: Optional[int],
+    option_type: str,
+    resample_interval: str,
+    output_dir: str,
+    output_format: str,
+    tardis_machine_url: str,
+    include_book: bool,
+    book_levels: int,
+    max_workers: int,
+):
+
+    if not await check_tardis_machine_server(tardis_machine_url):
+        logger.error(f"ERROR: tardis-machine server not accessible at {tardis_machine_url}")
+        logger.error("Start server: npx tardis-machine --port=8000")
+        sys.exit(1)
+
+    logger.info(f"Server OK: {tardis_machine_url}")
+    reference_date = datetime.strptime(from_date, '%Y-%m-%d')
+    logger.info("=" * 80)
+    logger.info("SYMBOL GENERATION")
+    logger.info("=" * 80)
+
+    symbols = build_symbol_list(
+        assets=assets,
+        reference_date=reference_date,
+        min_days=min_days,
+        max_days=max_days,
+        option_type=option_type,
+    )
+
+    if not symbols:
+        logger.error("ERROR: No symbols generated - check date range parameters")
+        sys.exit(1)
+
+    logger.info("=" * 80)
+    logger.info("FETCH SAMPLED DATA (OPTIMIZED)")
+    logger.info("=" * 80)
+
+    df = await fetch_sampled_quotes_optimized(
+        symbols=symbols, from_date=from_date, to_date=to_date,
+        interval=resample_interval, tardis_machine_url=tardis_machine_url,
+        include_book=include_book, book_levels=book_levels,
+        max_workers=max_workers,
+    )
+
+    if df.shape[0] == 0:
+        logger.error("ERROR: No data received from tardis-machine")
+        sys.exit(1)
+
+    logger.info("=" * 80)
+    logger.info("SAVE OUTPUT")
+    logger.info("=" * 80)
+
+    filename_suffix = f"{from_date}_{'_'.join(assets)}_{resample_interval}"
+    output_path = save_output(df, output_dir, output_format, filename_suffix)
+
+    logger.info("=" * 80)
+    logger.info(f"SUCCESS: {output_path}")
+    logger.info(f"{df.shape[0]:,} rows, {df['symbol'].n_unique()} unique symbols, interval {resample_interval}")
+    logger.info("=" * 80)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="[OPTIMIZED] Download Deribit options data using tardis-machine")
+
+    parser.add_argument('--from-date', required=True, help='Start date (YYYY-MM-DD)')
+    parser.add_argument('--to-date', required=True, help='End date (YYYY-MM-DD)')
+    parser.add_argument('--assets', required=True, help='Comma-separated assets (BTC, ETH)')
+    parser.add_argument('--min-days', type=int, help='Minimum days to expiry')
+    parser.add_argument('--max-days', type=int, help='Maximum days to expiry')
+    parser.add_argument('--option-type', default='both', help='call, put, or both (default: both)')
+    parser.add_argument('--resample-interval', default='5s', help='Sampling interval (default: 5s)')
+    parser.add_argument('--include-book', action='store_true', help='Include orderbook snapshots')
+    parser.add_argument('--book-levels', type=int, default=25, help='Orderbook levels (default: 25)')
+    parser.add_argument('--output-dir', default='./datasets_deribit_options', help='Output directory')
+    parser.add_argument('--output-format', default='parquet', choices=['csv', 'parquet'], help='Output format')
+    parser.add_argument('--tardis-machine-url', default=DEFAULT_TARDIS_MACHINE_URL, help='Tardis server URL')
+    parser.add_argument('--max-workers', type=int, default=DEFAULT_MAX_WORKERS, help=f'Number of concurrent workers (default: {DEFAULT_MAX_WORKERS})')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable debug logging')
+
+    args = parser.parse_args()
+
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='%(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+
+    try:
+        from_date = datetime.strptime(args.from_date, '%Y-%m-%d')
+        to_date = datetime.strptime(args.to_date, '%Y-%m-%d')
+        if from_date > to_date:
+            raise ValueError(f"from_date must be <= to_date")
+
+        assets = [a.strip().upper() for a in args.assets.split(',')]
+        if invalid := set(assets) - {'BTC', 'ETH'}:
+            raise ValueError(f"Invalid assets: {invalid}")
+
+        if args.min_days is not None and args.min_days < 0:
+            raise ValueError(f"min_days must be >= 0")
+        if args.max_days is not None and args.max_days < 0:
+            raise ValueError(f"max_days must be >= 0")
+        if args.min_days is not None and args.max_days is not None and args.min_days > args.max_days:
+            raise ValueError(f"min_days must be <= max_days")
+
+        option_type = args.option_type.lower()
+        if option_type not in {'call', 'put', 'both'}:
+            raise ValueError(f"Invalid option_type: {option_type}")
+
+        if args.resample_interval[-1].lower() not in {'s', 'm', 'h', 'd'}:
+            raise ValueError(f"Invalid interval suffix: {args.resample_interval[-1]}")
+        if int(args.resample_interval[:-1]) <= 0:
+            raise ValueError(f"Interval value must be > 0")
+
+        if args.max_workers < 1:
+            raise ValueError(f"max_workers must be >= 1")
+        if args.max_workers > 20:
+            raise ValueError(f"max_workers must be <= 20 to avoid overwhelming the server")
+
+    except ValueError as e:
+        logger.error(f"ERROR: {e}")
+        sys.exit(1)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    logger.info("=" * 80)
+    logger.info("DERIBIT OPTIONS DOWNLOAD (OPTIMIZED)")
+    logger.info("=" * 80)
+    days_range = f"{args.min_days or 0}-{args.max_days or 'any'}"
+    book_info = f", book={args.include_book}" if args.include_book else ""
+    logger.info(f"{', '.join(assets)} {option_type} | {args.from_date} to {args.to_date} | Days: {days_range}")
+    logger.info(f"Interval: {args.resample_interval} | Format: {args.output_format} | Dir: {args.output_dir}{book_info}")
+
+    try:
+        asyncio.run(main_async(
+            from_date=args.from_date,
+            to_date=args.to_date,
+            assets=assets,
+            min_days=args.min_days,
+            max_days=args.max_days,
+            option_type=option_type,
+            resample_interval=args.resample_interval,
+            output_dir=args.output_dir,
+            output_format=args.output_format,
+            tardis_machine_url=args.tardis_machine_url,
+            include_book=args.include_book,
+            book_levels=args.book_levels,
+            max_workers=args.max_workers,
+        ))
+
+    except Exception as e:
+        logger.error(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

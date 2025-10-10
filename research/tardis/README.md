@@ -12,6 +12,69 @@ A Python script for downloading historical Deribit options market data using the
 - Outputs data in Parquet (recommended) or CSV format
 - Handles batching for large symbol sets to avoid timeouts
 
+## Code Quality Tools
+
+This project uses three tools to ensure code quality and type safety:
+
+### Running Code Quality Checks
+
+```bash
+# Check a specific file
+../../check_code.sh tardis_download.py
+
+# Check with auto-fix
+../../check_code.sh tardis_download.py --fix
+
+# Check all Python files in tardis directory
+cd /Users/lgierhake/Documents/ETH/BT && ./check_code.sh research/tardis/*.py
+```
+
+### Tools Overview
+
+1. **Ruff** - Fast linter and formatter (10-100x faster than traditional Python tools)
+   - Linting: Catches common errors, enforces PEP8, detects bugs
+   - Formatting: Ensures consistent code style (Black-compatible)
+   - Auto-fix: Automatically fixes many issues with `--fix` flag
+
+2. **Pyright** - Static type checker
+   - Validates type hints at development time (not runtime)
+   - Catches type errors before they cause runtime failures
+   - Best support for modern Python type features and Polars
+
+3. **Pydantic** - Runtime data validation
+   - Validates API responses and data structures
+   - See `models.py` for type-safe data models
+   - Ensures data conforms to expected schemas
+
+### Using Pydantic Models
+
+The `models.py` file provides validated data structures:
+
+```python
+from models import ParsedSymbol, QuoteMessage, TardisFetchConfig
+
+# Parse and validate a Deribit symbol
+symbol = ParsedSymbol.from_symbol("BTC-31DEC24-100000-C")
+print(f"Underlying: {symbol.underlying}")  # BTC
+print(f"Strike: {symbol.strike_price}")     # 100000.0
+print(f"Type: {symbol.option_type.value}")  # call
+
+# Convert back to symbol string
+assert symbol.to_symbol() == "BTC-31DEC24-100000-C"
+
+# Validate fetch configuration
+config = TardisFetchConfig(
+    symbols=["BTC-31DEC24-100000-C"],
+    from_datetime="2024-12-31T00:00:00.000Z",
+    to_datetime="2024-12-31T23:59:59.999Z",
+)
+```
+
+**Benefits:**
+- Automatic validation prevents invalid data from propagating
+- Clear error messages when data doesn't match expected format
+- Self-documenting code with explicit data structures
+
 ## Prerequisites
 
 ### 1. Tardis Machine Server
@@ -41,32 +104,6 @@ uv pip install polars httpx
 - `polars` - Fast DataFrame library for data processing
 - `httpx` - Async HTTP client for API requests
 - Python 3.8+ (for asyncio support)
-
-## Installation on a New Device
-
-```bash
-# 1. Clone the repository
-git clone <your-repo-url>
-cd BT/research/tardis
-
-# 2. Install Python dependencies
-uv pip install polars httpx
-
-# 3. Install tardis-machine (one-time setup)
-npm install -g tardis-machine
-
-# 4. Start tardis-machine server (in a separate terminal)
-npx tardis-machine --port=8000
-
-# 5. Verify setup - run a minimal test
-uv run python tardis_download.py \
-  --from-date 2024-01-01 \
-  --to-date 2024-01-01 \
-  --assets BTC \
-  --min-days 0 \
-  --max-days 0 \
-  --output-dir ./test_output
-```
 
 ## Quick Start
 
@@ -106,7 +143,6 @@ uv run python tardis_download.py \
 | `--output-dir` | `./datasets_deribit_options` | Directory for output files |
 | `--output-format` | `parquet` | Output format: `parquet` or `csv` |
 | `--tardis-machine-url` | `http://localhost:8000` | Tardis-machine server URL |
-| `--max-workers` | 10 | Number of concurrent workers (1-20) |
 | `--verbose` `-v` | False | Enable debug logging |
 
 ## Usage Examples
@@ -184,24 +220,6 @@ uv run python tardis_download.py \
   --max-days 7 \
   --tardis-machine-url http://192.168.1.100:8000
 ```
-
-### Example 6: High-Performance Parallel Download
-
-Download large dataset with increased parallelism for faster processing:
-
-```bash
-uv run python tardis_download.py \
-  --from-date 2024-01-01 \
-  --to-date 2024-01-07 \
-  --assets BTC,ETH \
-  --min-days 0 \
-  --max-days 30 \
-  --resample-interval 1s \
-  --max-workers 15 \
-  --verbose
-```
-
-**Note:** Higher `--max-workers` values (up to 20) can significantly speed up large downloads but may increase server load. Start with default (10) and increase if needed.
 
 ## Symbol Generation Logic
 
@@ -287,20 +305,17 @@ df_with_spread = df.with_columns(
 
 ### Batching
 
-The script automatically batches symbol requests and processes them concurrently for optimal performance:
+The script automatically batches symbol requests to avoid HTTP timeouts:
 
 - **Default batch size:** 50 symbols per request
-- **Concurrent processing:** Up to 10 batches fetched in parallel (configurable with `--max-workers`)
 - Large symbol sets (1000+) are split into multiple batches
-- Uses semaphore-based concurrency control to prevent server overload
-- Real-time progress logging for each batch
+- Each batch is processed sequentially with progress logging
 
 ### Timeouts
 
-- **HTTP timeout:** 1800 seconds (30 minutes) per batch
+- **HTTP timeout:** 300 seconds (5 minutes) per batch
 - **Server check timeout:** 10 seconds
-- Increase `HTTP_TIMEOUT_SECONDS` in code if needed for extremely large batches
-- Reduce `--max-workers` if experiencing timeout issues
+- Increase `HTTP_TIMEOUT_SECONDS` in code for very large batches
 
 ### Data Volume Estimates
 
@@ -347,14 +362,13 @@ npx tardis-machine --port=8000
 
 ### Error: "HTTP timeout"
 
-**Cause:** Batch is too large, network is slow, or too many concurrent requests
+**Cause:** Batch is too large or network is slow
 
 **Solutions:**
-1. Reduce `--max-workers` to decrease concurrent load (try 5 or 3)
-2. Reduce date range (`--from-date` to `--to-date`)
-3. Reduce expiry range (`--min-days` to `--max-days`)
-4. Use faster network connection
-5. Modify `HTTP_TIMEOUT_SECONDS` in code (default: 1800s/30min)
+1. Reduce date range (`--from-date` to `--to-date`)
+2. Reduce expiry range (`--min-days` to `--max-days`)
+3. Use faster network connection
+4. Modify `HTTP_TIMEOUT_SECONDS` in code
 
 ### Parse Errors or Validation Failures
 
@@ -384,32 +398,6 @@ Adjust `DEFAULT_BATCH_SIZE` (line 16) for your network:
 DEFAULT_BATCH_SIZE = 100  # Larger batches (may timeout)
 DEFAULT_BATCH_SIZE = 20   # Smaller batches (slower but safer)
 ```
-
-### Tuning Concurrent Workers
-
-The `--max-workers` parameter controls how many batches are fetched in parallel:
-
-```bash
-# Conservative (slow network or limited server capacity)
---max-workers 3
-
-# Default (balanced performance)
---max-workers 10
-
-# Aggressive (fast network, powerful server, large datasets)
---max-workers 20
-```
-
-**Performance Guidelines:**
-- **Small datasets (< 500 symbols):** Use default (10) or lower (5)
-- **Large datasets (2000+ symbols):** Increase to 15-20 for faster downloads
-- **Experiencing timeouts:** Reduce to 3-5 to lower concurrent load
-- **Server limitations:** Monitor tardis-machine logs; reduce if errors occur
-
-**Trade-offs:**
-- Higher workers = Faster downloads but more server load and memory usage
-- Lower workers = Slower but more stable, less likely to timeout
-- Maximum allowed: 20 (enforced to prevent overwhelming the server)
 
 ### Resample Intervals
 
