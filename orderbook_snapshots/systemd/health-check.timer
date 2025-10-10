@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily Health Check Timer for Orderbook Services
+Requires=health-check.service
+
+[Timer]
+# Run daily at 9:00 AM UTC
+OnCalendar=*-*-* 09:00:00
+# If system was off, run 10 min after boot
+OnBootSec=10min
+# Ensure timer persists across reboots
+Persistent=true
+
+[Install]
+WantedBy=timers.target

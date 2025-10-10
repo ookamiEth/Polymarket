@@ -1,0 +1,44 @@
+[Unit]
+Description=Telegram Service Monitor for Orderbook Services
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/Polymarket/orderbook_snapshots
+Environment="PATH=/home/ec2-user/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="UV_CACHE_DIR=/home/ec2-user/Polymarket/orderbook_snapshots/.uv_cache"
+Environment="UV_PROJECT_ENVIRONMENT=/home/ec2-user/Polymarket/orderbook_snapshots/.venv"
+
+# Main service command
+ExecStart=/home/ec2-user/.local/bin/uv run python scripts/service_monitor.py
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitBurst=5
+
+# Output handling
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telegram-monitor
+
+# Resource limits
+MemoryMax=200M
+MemoryHigh=150M
+CPUQuota=25%
+TasksMax=20
+
+# Security hardening
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Graceful shutdown
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,64 @@
+# Telegram Bot Configuration
+
+# Services to monitor
+services:
+  - orderbook-streamer-btc-15min
+  - orderbook-streamer-eth-15min
+  - orderbook-streamer-btc-hourly
+  - orderbook-streamer-eth-hourly
+
+# Data directories to check (relative to project root)
+data_directories:
+  btc_15min: "data/raw/btc_15min"
+  eth_15min: "data/raw/eth_15min"
+  btc_hourly: "data/raw/btc_hourly"
+  eth_hourly: "data/raw/eth_hourly"
+
+# Health check settings
+health_check:
+  # Expected number of files per service in 24 hours
+  expected_files_per_day:
+    btc_15min: 96    # 15-min intervals = 4 per hour * 24
+    eth_15min: 96
+    btc_hourly: 24   # 1 per hour * 24
+    eth_hourly: 24
+
+  # Minimum file size in KB (to detect truncated files)
+  min_file_size_kb:
+    btc_15min: 10
+    eth_15min: 10
+    btc_hourly: 5
+    eth_hourly: 5
+
+  # Tolerance (percentage) - allow 10% variance
+  tolerance_percent: 10
+
+# Monitoring settings
+monitor:
+  # How often to check service status (seconds)
+  check_interval: 30
+
+  # Debounce time to avoid duplicate alerts (seconds)
+  debounce_time: 60
+
+# Daily health check time (UTC)
+daily_check:
+  hour: 9
+  minute: 0
+
+# Alert settings
+alerts:
+  # Enable different alert types
+  crash_alerts: true
+  restart_alerts: true
+  daily_health_check: true
+
+  # Emoji indicators
+  emoji:
+    success: "✅"
+    warning: "⚠️"
+    error: "🚨"
+    restart: "🔄"
+    info: "ℹ️"
+    data: "📊"
+    time: "⏱️"

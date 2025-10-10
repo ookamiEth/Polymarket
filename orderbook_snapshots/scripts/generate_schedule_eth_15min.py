@@ -65,7 +65,7 @@ def generate_eth_updown_schedule(
         "end_timestamp": [ts + interval_seconds for ts in timestamps],
         "start_datetime": [datetime.fromtimestamp(ts) for ts in timestamps],
         "end_datetime": [datetime.fromtimestamp(ts + interval_seconds) for ts in timestamps],
-        "slug": [f"eth-up-or-down-15m-{ts}" for ts in timestamps],
+        "slug": [f"eth-updown-15m-{ts}" for ts in timestamps],
     })
 
     print("Adding human-readable columns...")
