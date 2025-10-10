@@ -106,6 +106,7 @@ uv run python tardis_download.py \
 | `--output-dir` | `./datasets_deribit_options` | Directory for output files |
 | `--output-format` | `parquet` | Output format: `parquet` or `csv` |
 | `--tardis-machine-url` | `http://localhost:8000` | Tardis-machine server URL |
+| `--max-workers` | 10 | Number of concurrent workers (1-20) |
 | `--verbose` `-v` | False | Enable debug logging |
 
 ## Usage Examples
@@ -183,6 +184,24 @@ uv run python tardis_download.py \
   --max-days 7 \
   --tardis-machine-url http://192.168.1.100:8000
 ```
+
+### Example 6: High-Performance Parallel Download
+
+Download large dataset with increased parallelism for faster processing:
+
+```bash
+uv run python tardis_download.py \
+  --from-date 2024-01-01 \
+  --to-date 2024-01-07 \
+  --assets BTC,ETH \
+  --min-days 0 \
+  --max-days 30 \
+  --resample-interval 1s \
+  --max-workers 15 \
+  --verbose
+```
+
+**Note:** Higher `--max-workers` values (up to 20) can significantly speed up large downloads but may increase server load. Start with default (10) and increase if needed.
 
 ## Symbol Generation Logic
 
@@ -268,17 +287,20 @@ df_with_spread = df.with_columns(
 
 ### Batching
 
-The script automatically batches symbol requests to avoid HTTP timeouts:
+The script automatically batches symbol requests and processes them concurrently for optimal performance:
 
 - **Default batch size:** 50 symbols per request
+- **Concurrent processing:** Up to 10 batches fetched in parallel (configurable with `--max-workers`)
 - Large symbol sets (1000+) are split into multiple batches
-- Each batch is processed sequentially with progress logging
+- Uses semaphore-based concurrency control to prevent server overload
+- Real-time progress logging for each batch
 
 ### Timeouts
 
-- **HTTP timeout:** 300 seconds (5 minutes) per batch
+- **HTTP timeout:** 1800 seconds (30 minutes) per batch
 - **Server check timeout:** 10 seconds
-- Increase `HTTP_TIMEOUT_SECONDS` in code for very large batches
+- Increase `HTTP_TIMEOUT_SECONDS` in code if needed for extremely large batches
+- Reduce `--max-workers` if experiencing timeout issues
 
 ### Data Volume Estimates
 
@@ -325,13 +347,14 @@ npx tardis-machine --port=8000
 
 ### Error: "HTTP timeout"
 
-**Cause:** Batch is too large or network is slow
+**Cause:** Batch is too large, network is slow, or too many concurrent requests
 
 **Solutions:**
-1. Reduce date range (`--from-date` to `--to-date`)
-2. Reduce expiry range (`--min-days` to `--max-days`)
-3. Use faster network connection
-4. Modify `HTTP_TIMEOUT_SECONDS` in code
+1. Reduce `--max-workers` to decrease concurrent load (try 5 or 3)
+2. Reduce date range (`--from-date` to `--to-date`)
+3. Reduce expiry range (`--min-days` to `--max-days`)
+4. Use faster network connection
+5. Modify `HTTP_TIMEOUT_SECONDS` in code (default: 1800s/30min)
 
 ### Parse Errors or Validation Failures
 
@@ -361,6 +384,32 @@ Adjust `DEFAULT_BATCH_SIZE` (line 16) for your network:
 DEFAULT_BATCH_SIZE = 100  # Larger batches (may timeout)
 DEFAULT_BATCH_SIZE = 20   # Smaller batches (slower but safer)
 ```
+
+### Tuning Concurrent Workers
+
+The `--max-workers` parameter controls how many batches are fetched in parallel:
+
+```bash
+# Conservative (slow network or limited server capacity)
+--max-workers 3
+
+# Default (balanced performance)
+--max-workers 10
+
+# Aggressive (fast network, powerful server, large datasets)
+--max-workers 20
+```
+
+**Performance Guidelines:**
+- **Small datasets (< 500 symbols):** Use default (10) or lower (5)
+- **Large datasets (2000+ symbols):** Increase to 15-20 for faster downloads
+- **Experiencing timeouts:** Reduce to 3-5 to lower concurrent load
+- **Server limitations:** Monitor tardis-machine logs; reduce if errors occur
+
+**Trade-offs:**
+- Higher workers = Faster downloads but more server load and memory usage
+- Lower workers = Slower but more stable, less likely to timeout
+- Maximum allowed: 20 (enforced to prevent overwhelming the server)
 
 ### Resample Intervals
 

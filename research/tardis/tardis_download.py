@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
+"""
+Tardis Machine Data Downloader for Deribit Options
+
+VALID SAMPLING INTERVALS (--resample-interval):
+  Format: <positive_integer><suffix>
+  Valid suffixes:
+    s = seconds   (e.g., 1s, 5s, 30s)
+    m = minutes   (e.g., 1m, 5m, 15m)
+    h = hours     (e.g., 1h, 4h, 24h)
+    d = days      (e.g., 1d, 7d)
+
+  Examples: 1s, 5s, 30s, 1m, 5m, 15m, 1h, 4h, 1d
+"""
 
 import argparse
 import asyncio
 import sys
 import os
 import time
-import json
+import msgspec.json
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Tuple, TypedDict
@@ -14,15 +27,17 @@ import polars as pl
 
 
 DEFAULT_BATCH_SIZE = 50
-HTTP_TIMEOUT_SECONDS = 300.0
+DEFAULT_MAX_WORKERS = 5
+DEFAULT_TARDIS_MACHINE_URL = "http://localhost:8000"
+HTTP_TIMEOUT_SECONDS = 1800.0
 SERVER_CHECK_TIMEOUT = 10.0
-DEFAULT_RESAMPLE_INTERVAL = "5s"
-DEFAULT_BOOK_LEVELS = 25
+DEFAULT_RESAMPLE_INTERVAL = "1m"
+DEFAULT_BOOK_LEVELS = 3
 MICROSECONDS_PER_SECOND = 1_000_000
 MEGABYTES_DIVISOR = 1_000_000
 
-BTC_STRIKES = range(2000, 200001, 1000)
-ETH_STRIKES = range(200, 20001, 100)
+BTC_STRIKES = range(40000, 130001, 1000)
+ETH_STRIKES = range(1500, 5001, 100)
 
 
 class QuoteData(TypedDict):
@@ -69,15 +84,89 @@ async def check_tardis_machine_server(base_url: str) -> bool:
         return False
 
 
+async def _fetch_single_batch(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    batch_idx: int,
+    total_batches: int,
+    symbol_batch: List[str],
+    from_datetime: str,
+    to_datetime: str,
+    data_types: List[str],
+    tardis_machine_url: str,
+) -> Tuple[int, List[QuoteData]]:
+    """Fetch a single batch of symbols with semaphore-based concurrency control."""
+    async with semaphore:
+        logger.info(f"Batch {batch_idx}/{total_batches}: {len(symbol_batch)} symbols...")
+
+        options = {
+            "exchange": "deribit",
+            "from": from_datetime,
+            "to": to_datetime,
+            "symbols": symbol_batch,
+            "dataTypes": data_types
+        }
+
+        try:
+            batch_start = time.time()
+
+            response = await client.get(
+                f"{tardis_machine_url}/replay-normalized",
+                params={"options": msgspec.json.encode(options).decode('utf-8')}
+            )
+
+            if response.status_code != 200:
+                raise Exception(
+                    f"tardis-machine error ({response.status_code}): {response.text[:500]}"
+                )
+
+            lines = response.text.strip().split('\n') if response.text.strip() else []
+            batch_elapsed = time.time() - batch_start
+            size_mb = len(response.content) / MEGABYTES_DIVISOR
+
+            if not lines:
+                logger.warning(f"Batch {batch_idx}: No data received")
+                return (batch_idx, [])
+
+            logger.info(f"Batch {batch_idx}: Received {len(lines):,} messages ({size_mb:.2f} MB) in {batch_elapsed:.1f}s")
+
+            batch_rows = []
+            parse_errors = validation_failures = 0
+
+            for line in lines:
+                try:
+                    msg = msgspec.json.decode(line)
+                    if 'quote' in msg.get('type', '') or 'book_snapshot' in msg.get('type', ''):
+                        quote_row = _parse_quote_message(msg)
+                        if quote_row and _validate_quote_data(quote_row):
+                            batch_rows.append(quote_row)
+                        elif quote_row:
+                            validation_failures += 1
+                except msgspec.DecodeError:
+                    parse_errors += 1
+                except Exception:
+                    parse_errors += 1
+
+            errors_msg = f" ({parse_errors} parse errors, {validation_failures} validation failures)" if parse_errors or validation_failures else ""
+            logger.info(f"Batch {batch_idx}: Parsed {len(batch_rows):,} records{errors_msg}")
+
+            return (batch_idx, batch_rows)
+
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error on batch {batch_idx}: {e}")
+            raise Exception(f"HTTP error connecting to tardis-machine: {e}") from e
+
+
 async def fetch_sampled_quotes(
     symbols: List[str],
     from_date: str,
     to_date: str,
     interval: str = DEFAULT_RESAMPLE_INTERVAL,
-    tardis_machine_url: str = "http://localhost:8000",
+    tardis_machine_url: str = DEFAULT_TARDIS_MACHINE_URL,
     include_book: bool = False,
     book_levels: int = DEFAULT_BOOK_LEVELS,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> pl.DataFrame:
 
     book_info = f", book_snapshot_{book_levels}_{interval}" if include_book else ""
@@ -94,70 +183,42 @@ async def fetch_sampled_quotes(
     num_batches = len(symbol_batches)
     if num_batches > 1:
         logger.info(f"Batching {len(symbols)} symbols into {num_batches} batches of {batch_size}")
+        logger.info(f"Using {max_workers} concurrent workers for parallel fetching")
 
-    all_rows = []
     start_time = time.time()
     logger.info(f"Requesting {len(symbol_batches)} batch(es) with data types: {', '.join(data_types)}")
 
+    # Create semaphore to limit concurrent requests
+    semaphore = asyncio.Semaphore(max_workers)
+
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
-        for batch_idx, symbol_batch in enumerate(symbol_batches, 1):
-            logger.info(f"Batch {batch_idx}/{len(symbol_batches)}: {len(symbol_batch)} symbols...")
+        # Create tasks for all batches
+        tasks = [
+            _fetch_single_batch(
+                client=client,
+                semaphore=semaphore,
+                batch_idx=batch_idx,
+                total_batches=num_batches,
+                symbol_batch=symbol_batch,
+                from_datetime=from_datetime,
+                to_datetime=to_datetime,
+                data_types=data_types,
+                tardis_machine_url=tardis_machine_url,
+            )
+            for batch_idx, symbol_batch in enumerate(symbol_batches, 1)
+        ]
 
-            options = {
-                "exchange": "deribit",
-                "from": from_datetime,
-                "to": to_datetime,
-                "symbols": symbol_batch,
-                "dataTypes": data_types
-            }
+        # Execute all batches concurrently with max_workers limit
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            try:
-                batch_start = time.time()
-
-                response = await client.get(
-                    f"{tardis_machine_url}/replay-normalized",
-                    params={"options": json.dumps(options)}
-                )
-
-                if response.status_code != 200:
-                    raise Exception(
-                        f"tardis-machine error ({response.status_code}): {response.text[:500]}"
-                    )
-
-                lines = response.text.strip().split('\n') if response.text.strip() else []
-                batch_elapsed = time.time() - batch_start
-                size_mb = len(response.content) / MEGABYTES_DIVISOR
-
-                if not lines:
-                    logger.warning(f"Batch {batch_idx}: No data received")
-                    continue
-
-                logger.info(f"Batch {batch_idx}: Received {len(lines):,} messages ({size_mb:.2f} MB) in {batch_elapsed:.1f}s")
-
-                batch_rows = []
-                parse_errors = validation_failures = 0
-
-                for line in lines:
-                    try:
-                        msg = json.loads(line)
-                        if 'quote' in msg.get('type', '') or 'book_snapshot' in msg.get('type', ''):
-                            quote_row = _parse_quote_message(msg)
-                            if quote_row and _validate_quote_data(quote_row):
-                                batch_rows.append(quote_row)
-                            elif quote_row:
-                                validation_failures += 1
-                    except json.JSONDecodeError:
-                        parse_errors += 1
-                    except Exception:
-                        parse_errors += 1
-
-                errors_msg = f" ({parse_errors} parse errors, {validation_failures} validation failures)" if parse_errors or validation_failures else ""
-                logger.info(f"Batch {batch_idx}: Parsed {len(batch_rows):,} records{errors_msg}")
-                all_rows.extend(batch_rows)
-
-            except httpx.HTTPError as e:
-                logger.error(f"HTTP error on batch {batch_idx}: {e}")
-                raise Exception(f"HTTP error connecting to tardis-machine: {e}") from e
+        # Process results
+        all_rows = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Batch failed with error: {result}")
+                raise result
+            batch_idx, batch_rows = result
+            all_rows.extend(batch_rows)
 
     total_elapsed = time.time() - start_time
     rate = len(all_rows) / max(total_elapsed, 0.001)
@@ -248,6 +309,7 @@ async def main_async(
     tardis_machine_url: str,
     include_book: bool,
     book_levels: int,
+    max_workers: int,
 ):
 
     if not await check_tardis_machine_server(tardis_machine_url):
@@ -281,6 +343,7 @@ async def main_async(
         symbols=symbols, from_date=from_date, to_date=to_date,
         interval=resample_interval, tardis_machine_url=tardis_machine_url,
         include_book=include_book, book_levels=book_levels,
+        max_workers=max_workers,
     )
 
     if df.shape[0] == 0:
@@ -314,7 +377,8 @@ def main():
     parser.add_argument('--book-levels', type=int, default=25, help='Orderbook levels (default: 25)')
     parser.add_argument('--output-dir', default='./datasets_deribit_options', help='Output directory')
     parser.add_argument('--output-format', default='parquet', choices=['csv', 'parquet'], help='Output format')
-    parser.add_argument('--tardis-machine-url', default='http://localhost:8000', help='Tardis server URL')
+    parser.add_argument('--tardis-machine-url', default=DEFAULT_TARDIS_MACHINE_URL, help='Tardis server URL')
+    parser.add_argument('--max-workers', type=int, default=DEFAULT_MAX_WORKERS, help=f'Number of concurrent workers (default: {DEFAULT_MAX_WORKERS})')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable debug logging')
 
     args = parser.parse_args()
@@ -352,6 +416,11 @@ def main():
         if int(args.resample_interval[:-1]) <= 0:
             raise ValueError(f"Interval value must be > 0")
 
+        if args.max_workers < 1:
+            raise ValueError(f"max_workers must be >= 1")
+        if args.max_workers > 20:
+            raise ValueError(f"max_workers must be <= 20 to avoid overwhelming the server")
+
     except ValueError as e:
         logger.error(f"ERROR: {e}")
         sys.exit(1)
@@ -380,6 +449,7 @@ def main():
             tardis_machine_url=args.tardis_machine_url,
             include_book=args.include_book,
             book_levels=args.book_levels,
+            max_workers=args.max_workers,
         ))
 
     except Exception as e:
