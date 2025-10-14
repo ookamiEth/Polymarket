@@ -87,8 +87,18 @@ def parse_quotes_csv(
     """
     logger.debug(f"Parsing quotes from: {quotes_file}")
 
+    # Schema overrides to handle Tardis data type inconsistencies
+    # Sometimes amounts/prices are whole numbers (inferred as int), sometimes floats
+    schema_overrides = {
+        "strike_price": pl.Float64,
+        "bid_price": pl.Float64,
+        "bid_amount": pl.Float64,
+        "ask_price": pl.Float64,
+        "ask_amount": pl.Float64,
+    }
+
     try:
-        df = pl.read_csv(quotes_file)
+        df = pl.read_csv(quotes_file, schema_overrides=schema_overrides)
         original_count = len(df)
         logger.debug(f"Read {original_count:,} quote records")
     except Exception as e:
