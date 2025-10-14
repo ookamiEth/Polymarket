@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -181,6 +182,33 @@ def process_day(
         return (0, 0)
 
 
+def _process_day_worker(args: tuple[str, str, str, str, str, float]) -> tuple[int, int]:
+    """Worker function for multiprocessing that loads perp_ref from disk.
+
+    Each worker process loads the perp reference once to avoid pickling large DataFrames.
+    """
+    date_str, perp_file, output_dir, base_temp_dir, api_key, atm_tolerance = args
+
+    # Create worker-specific temp directory to avoid file collisions
+    worker_temp_dir = os.path.join(base_temp_dir, f"worker_{os.getpid()}")
+    os.makedirs(worker_temp_dir, exist_ok=True)
+
+    # Load perp reference in worker process (cached for this worker's lifetime)
+    perp_ref = load_perp_reference(perp_file)
+
+    # Process the day
+    result = process_day(
+        date_str=date_str,
+        perp_ref=perp_ref,
+        output_dir=output_dir,
+        temp_dir=worker_temp_dir,
+        api_key=api_key,
+        atm_tolerance=atm_tolerance,
+    )
+
+    return result
+
+
 def main():
     load_dotenv()
     tardis_api_key = os.getenv("TARDIS_API_KEY")
@@ -210,6 +238,12 @@ def main():
         default=0.03,
         help="ATM tolerance (default: 0.03 for ±3%%)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=5,
+        help="Number of parallel workers (default: 5, use 1 for sequential)",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
@@ -219,6 +253,14 @@ def main():
 
     if not tardis_api_key:
         logger.error("ERROR: TARDIS_API_KEY not found in .env")
+        sys.exit(1)
+
+    # Validate workers
+    if args.workers < 1:
+        logger.error("ERROR: --workers must be >= 1")
+        sys.exit(1)
+    if args.workers > 10:
+        logger.error("ERROR: --workers must be <= 10 to avoid overwhelming Tardis API")
         sys.exit(1)
 
     # Create directories
@@ -233,11 +275,8 @@ def main():
     logger.info(f"Output directory: {args.output_dir}")
     logger.info("=" * 80)
 
-    # Load perp reference
-    start_time = time.time()
-    perp_ref = load_perp_reference(args.perp_reference)
-
     # Generate date range
+    start_time = time.time()
     from_date = datetime.strptime(args.from_date, "%Y-%m-%d")
     to_date = datetime.strptime(args.to_date, "%Y-%m-%d")
     date_range = []
@@ -246,27 +285,56 @@ def main():
         date_range.append(current_date.strftime("%Y-%m-%d"))
         current_date += timedelta(days=1)
 
-    logger.info(f"Processing {len(date_range)} days...")
+    logger.info(f"Processing {len(date_range)} days with {args.workers} worker(s)...")
     logger.info("=" * 80)
 
     # Process each day
     total_original = 0
     total_filtered = 0
 
-    for i, date_str in enumerate(date_range, 1):
-        logger.info(f"[{i}/{len(date_range)}] Processing {date_str}...")
+    if args.workers == 1:
+        # Sequential mode (original behavior)
+        perp_ref = load_perp_reference(args.perp_reference)
 
-        original, filtered = process_day(
-            date_str=date_str,
-            perp_ref=perp_ref,
-            output_dir=args.output_dir,
-            temp_dir=args.temp_dir,
-            api_key=tardis_api_key,
-            atm_tolerance=args.atm_tolerance,
-        )
+        for i, date_str in enumerate(date_range, 1):
+            logger.info(f"[{i}/{len(date_range)}] Processing {date_str}...")
 
-        total_original += original
-        total_filtered += filtered
+            original, filtered = process_day(
+                date_str=date_str,
+                perp_ref=perp_ref,
+                output_dir=args.output_dir,
+                temp_dir=args.temp_dir,
+                api_key=tardis_api_key,
+                atm_tolerance=args.atm_tolerance,
+            )
+
+            total_original += original
+            total_filtered += filtered
+    else:
+        # Parallel mode with multiprocessing
+        worker_args = [
+            (date_str, args.perp_reference, args.output_dir, args.temp_dir, tardis_api_key, args.atm_tolerance)
+            for date_str in date_range
+        ]
+
+        completed_count = 0
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            # Submit all tasks
+            future_to_date = {executor.submit(_process_day_worker, args): args[0] for args in worker_args}
+
+            # Process results as they complete
+            for future in as_completed(future_to_date):
+                date_str = future_to_date[future]
+                completed_count += 1
+
+                try:
+                    original, filtered = future.result()
+                    total_original += original
+                    total_filtered += filtered
+
+                    logger.info(f"[{completed_count}/{len(date_range)}] Completed {date_str}")
+                except Exception as e:
+                    logger.error(f"✗ {date_str}: Worker failed - {e}")
 
     # Summary
     elapsed = time.time() - start_time
