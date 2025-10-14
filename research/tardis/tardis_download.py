@@ -5,6 +5,7 @@ import asyncio
 import io
 import logging
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
@@ -13,6 +14,7 @@ from typing import Optional
 import httpx
 import msgspec.json
 import polars as pl
+from dotenv import load_dotenv
 
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_WORKERS = 5
@@ -43,6 +45,29 @@ def _empty_dataframe() -> pl.DataFrame:
         "ask_amount": pl.Float64,
     }
     return pl.DataFrame(schema=schema)
+
+
+def start_tardis_machine(api_key: str, port: int = 8000) -> subprocess.Popen:
+    """Start tardis-machine server as background process."""
+    logger.info(f"Starting tardis-machine server on port {port}...")
+
+    cmd = ["npx", "tardis-machine", f"--port={port}", f"--api-key={api_key}"]
+
+    try:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError as e:
+        raise Exception("npx not found. Install Node.js first: https://nodejs.org/") from e
+
+    # Give server time to start
+    time.sleep(3)
+
+    if process.poll() is not None:
+        # Process died
+        stderr = process.stderr.read() if process.stderr else ""
+        raise Exception(f"tardis-machine failed to start: {stderr}")
+
+    logger.info("tardis-machine server started successfully")
+    return process
 
 
 async def check_tardis_machine_server(base_url: str) -> bool:
@@ -335,62 +360,99 @@ async def main_async(
     tardis_machine_url: str,
     include_book: bool,
     max_workers: int,
+    tardis_api_key: Optional[str] = None,
 ):
-    if not await check_tardis_machine_server(tardis_machine_url):
-        logger.error(f"ERROR: tardis-machine server not accessible at {tardis_machine_url}")
-        logger.error("Start server: npx tardis-machine --port=8000")
-        sys.exit(1)
+    tardis_process = None
 
-    logger.info(f"Server OK: {tardis_machine_url}")
-    reference_date = datetime.strptime(from_date, "%Y-%m-%d")
-    logger.info("=" * 80)
-    logger.info("SYMBOL GENERATION")
-    logger.info("=" * 80)
+    try:
+        # Check if server is already running
+        if not await check_tardis_machine_server(tardis_machine_url):
+            if not tardis_api_key:
+                logger.error(f"ERROR: tardis-machine server not accessible at {tardis_machine_url}")
+                logger.error("Either:")
+                logger.error("  1. Set TARDIS_API_KEY in .env file, OR")
+                logger.error("  2. Start server manually: npx tardis-machine --port=8000 --api-key=YOUR_KEY")
+                sys.exit(1)
 
-    symbols = build_symbol_list(
-        assets=assets,
-        reference_date=reference_date,
-        min_days=min_days,
-        max_days=max_days,
-        option_type=option_type,
-    )
+            # Auto-start tardis-machine
+            tardis_process = start_tardis_machine(tardis_api_key, port=8000)
 
-    if not symbols:
-        logger.error("ERROR: No symbols generated - check date range parameters")
-        sys.exit(1)
+            # Wait for server to be ready (up to 30 seconds)
+            for _i in range(30):
+                await asyncio.sleep(1)
+                if await check_tardis_machine_server(tardis_machine_url):
+                    break
+            else:
+                if tardis_process:
+                    tardis_process.terminate()
+                raise Exception("tardis-machine server did not become ready in 30 seconds")
 
-    logger.info("=" * 80)
-    logger.info("FETCH SAMPLED DATA")
-    logger.info("=" * 80)
+        logger.info(f"Server OK: {tardis_machine_url}")
 
-    df = await fetch_sampled_quotes(
-        symbols=symbols,
-        from_date=from_date,
-        to_date=to_date,
-        interval=resample_interval,
-        tardis_machine_url=tardis_machine_url,
-        include_book=include_book,
-        max_workers=max_workers,
-    )
+        reference_date = datetime.strptime(from_date, "%Y-%m-%d")
+        logger.info("=" * 80)
+        logger.info("SYMBOL GENERATION")
+        logger.info("=" * 80)
 
-    if df.shape[0] == 0:
-        logger.error("ERROR: No data received from tardis-machine")
-        sys.exit(1)
+        symbols = build_symbol_list(
+            assets=assets,
+            reference_date=reference_date,
+            min_days=min_days,
+            max_days=max_days,
+            option_type=option_type,
+        )
 
-    logger.info("=" * 80)
-    logger.info("SAVE OUTPUT")
-    logger.info("=" * 80)
+        if not symbols:
+            logger.error("ERROR: No symbols generated - check date range parameters")
+            sys.exit(1)
 
-    filename_suffix = f"{from_date}_{'_'.join(assets)}_{resample_interval}"
-    output_path = save_output(df, output_dir, output_format, filename_suffix)
+        logger.info("=" * 80)
+        logger.info("FETCH SAMPLED DATA")
+        logger.info("=" * 80)
 
-    logger.info("=" * 80)
-    logger.info(f"SUCCESS: {output_path}")
-    logger.info(f"{df.shape[0]:,} rows, {df['symbol'].n_unique()} unique symbols, interval {resample_interval}")
-    logger.info("=" * 80)
+        df = await fetch_sampled_quotes(
+            symbols=symbols,
+            from_date=from_date,
+            to_date=to_date,
+            interval=resample_interval,
+            tardis_machine_url=tardis_machine_url,
+            include_book=include_book,
+            max_workers=max_workers,
+        )
+
+        if df.shape[0] == 0:
+            logger.error("ERROR: No data received from tardis-machine")
+            sys.exit(1)
+
+        logger.info("=" * 80)
+        logger.info("SAVE OUTPUT")
+        logger.info("=" * 80)
+
+        filename_suffix = f"{from_date}_{'_'.join(assets)}_{resample_interval}"
+        output_path = save_output(df, output_dir, output_format, filename_suffix)
+
+        logger.info("=" * 80)
+        logger.info(f"SUCCESS: {output_path}")
+        logger.info(f"{df.shape[0]:,} rows, {df['symbol'].n_unique()} unique symbols, interval {resample_interval}")
+        logger.info("=" * 80)
+
+    finally:
+        # Cleanup: stop tardis-machine if we started it
+        if tardis_process:
+            logger.info("Stopping tardis-machine server...")
+            tardis_process.terminate()
+            try:
+                tardis_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning("tardis-machine did not stop gracefully, killing...")
+                tardis_process.kill()
 
 
 def main():
+    # Load environment variables from .env
+    load_dotenv()
+    tardis_api_key = os.getenv("TARDIS_API_KEY")
+
     parser = argparse.ArgumentParser(description="Download Deribit options data using tardis-machine")
 
     parser.add_argument("--from-date", required=True, help="Start date (YYYY-MM-DD)")
@@ -483,6 +545,7 @@ def main():
                 tardis_machine_url=args.tardis_machine_url,
                 include_book=args.include_book,
                 max_workers=args.max_workers,
+                tardis_api_key=tardis_api_key,
             )
         )
 

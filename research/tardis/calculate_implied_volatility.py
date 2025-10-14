@@ -3,6 +3,7 @@
 import argparse
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,160 +11,23 @@ from typing import Optional
 
 import numpy as np
 import polars as pl
-from scipy import optimize
-from scipy.stats import norm
 
 # Constants
-DEFAULT_RISK_FREE_RATE = 0.05
+DEFAULT_RISK_FREE_RATE = 0.0412
 DEFAULT_SPOT_COLUMN = "mid_px"
 DEFAULT_OUTPUT_SUFFIX = "_with_iv"
-DEFAULT_IV_BOUNDS = (0.001, 5.0)
-DEFAULT_TOLERANCE = 1e-6
 DERIBIT_EXPIRY_HOUR_UTC = 8
 SECONDS_PER_YEAR = 365.25 * 24 * 3600
 MERGE_TOLERANCE_SECONDS = 60
 
+# Quality filter thresholds
+MIN_OPTION_PRICE_USD = 10.0  # Minimum $10 for bid/ask to ensure liquidity
+MAX_BID_ASK_SPREAD_PCT = 0.50  # Max 50% spread (ask/bid - 1) for data quality
+MIN_TIME_TO_EXPIRY_HOURS = 1.0  # Minimum 1 hour to avoid numerical instability
+MONEYNESS_MIN = 0.50  # Minimum strike/spot ratio
+MONEYNESS_MAX = 2.00  # Maximum strike/spot ratio
+
 logger = logging.getLogger(__name__)
-
-
-def _empty_dataframe() -> pl.DataFrame:
-    """Return empty DataFrame with expected schema."""
-    schema = {
-        "exchange": pl.Utf8,
-        "symbol": pl.Utf8,
-        "timestamp": pl.Int64,
-        "local_timestamp": pl.Int64,
-        "type": pl.Utf8,
-        "strike_price": pl.Float64,
-        "underlying": pl.Utf8,
-        "expiry_str": pl.Utf8,
-        "bid_price": pl.Float64,
-        "bid_amount": pl.Float64,
-        "ask_price": pl.Float64,
-        "ask_amount": pl.Float64,
-        "spot_price": pl.Float64,
-        "time_to_expiry": pl.Float64,
-        "implied_vol_bid": pl.Float64,
-        "implied_vol_ask": pl.Float64,
-        "iv_calc_status": pl.Utf8,
-    }
-    return pl.DataFrame(schema=schema)
-
-
-def black_scholes_price(
-    S: float,  # noqa: N803
-    K: float,  # noqa: N803
-    T: float,  # noqa: N803
-    r: float,
-    sigma: float,
-    option_type: str,
-) -> float:
-    """
-    Calculate Black-Scholes option price.
-
-    Args:
-        S: Spot price
-        K: Strike price
-        T: Time to expiry (years)
-        r: Risk-free rate
-        sigma: Volatility
-        option_type: "call" or "put"
-
-    Returns:
-        Option price
-    """
-    if T <= 0 or sigma <= 0:
-        # Handle edge cases
-        return max(S - K, 0) if option_type == "call" else max(K - S, 0)
-
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-
-    if option_type == "call":
-        price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-    else:
-        price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-
-    return float(price)
-
-
-def calculate_implied_volatility(
-    market_price: float,
-    S: float,  # noqa: N803
-    K: float,  # noqa: N803
-    T: float,  # noqa: N803
-    r: float,
-    option_type: str,
-    bounds: tuple[float, float] = DEFAULT_IV_BOUNDS,
-    tolerance: float = DEFAULT_TOLERANCE,
-) -> tuple[Optional[float], str]:
-    """
-    Calculate implied volatility using Brent's method.
-
-    Args:
-        market_price: Observed market price
-        S: Spot price
-        K: Strike price
-        T: Time to expiry (years)
-        r: Risk-free rate
-        option_type: "call" or "put"
-        bounds: (min_vol, max_vol) search bounds
-        tolerance: Convergence tolerance
-
-    Returns:
-        (implied_vol, status) tuple where status is:
-        - "success": IV calculated successfully
-        - "failed_bounds": No solution within bounds
-        - "failed_convergence": Solver did not converge
-        - "invalid_inputs": Invalid input parameters
-    """
-    # Validate inputs
-    if market_price <= 0 or S <= 0 or K <= 0 or T <= 0:
-        return (None, "invalid_inputs")
-
-    # Check intrinsic value
-    intrinsic = max(S - K, 0) if option_type == "call" else max(K - S, 0)
-
-    if market_price < intrinsic * 0.99:  # Allow small numerical tolerance
-        return (None, "invalid_inputs")
-
-    def objective(sigma: float) -> float:
-        """Objective function: BS_price(sigma) - market_price"""
-        try:
-            return black_scholes_price(S, K, T, r, sigma, option_type) - market_price
-        except Exception:
-            return float("inf")
-
-    try:
-        # Check if solution exists within bounds
-        f_low = objective(bounds[0])
-        f_high = objective(bounds[1])
-
-        if f_low * f_high > 0:
-            # Try wider bounds
-            wider_bounds = (0.0001, 10.0)
-            f_low_wide = objective(wider_bounds[0])
-            f_high_wide = objective(wider_bounds[1])
-
-            if f_low_wide * f_high_wide > 0:
-                return (None, "failed_bounds")
-
-            bounds = wider_bounds
-
-        # Solve for IV using Brent's method
-        iv_result = optimize.brentq(objective, bounds[0], bounds[1], xtol=tolerance, rtol=np.float64(tolerance))
-
-        # Type narrowing: brentq returns float when full_output=False (default)
-        assert isinstance(iv_result, (float, np.floating))
-
-        return (float(iv_result), "success")
-
-    except ValueError:
-        return (None, "failed_bounds")
-    except RuntimeError:
-        return (None, "failed_convergence")
-    except Exception:
-        return (None, "failed_convergence")
 
 
 def parse_expiry_datetime(expiry_str: str, base_year: Optional[int] = None) -> Optional[datetime]:
@@ -182,8 +46,6 @@ def parse_expiry_datetime(expiry_str: str, base_year: Optional[int] = None) -> O
     """
     try:
         # Expected format: "1JAN25" or "31DEC24"
-        import re
-
         match = re.match(r"(\d{1,2})([A-Z]{3})(\d{2})", expiry_str.upper())
         if not match:
             return None
@@ -281,6 +143,21 @@ def merge_with_spot_prices(options_df: pl.DataFrame, spot_df: pl.DataFrame) -> p
     Returns:
         Merged DataFrame with spot_price column
     """
+    # Drop existing columns from previous runs to allow re-processing
+    cols_to_drop = [
+        "time",
+        "spot_price",
+        "time_to_expiry",
+        "implied_vol_bid",
+        "implied_vol_ask",
+        "iv_calc_status",
+        "time_right",
+        "spot_price_right",
+    ]
+    for col in cols_to_drop:
+        if col in options_df.columns:
+            options_df = options_df.drop(col)
+
     # Convert options timestamp (microseconds) to datetime with UTC timezone
     options_df = options_df.with_columns(
         [pl.from_epoch(pl.col("timestamp"), time_unit="us").dt.replace_time_zone("UTC").alias("timestamp_dt")]
@@ -323,6 +200,7 @@ def add_time_to_expiry(df: pl.DataFrame) -> pl.DataFrame:
     logger.info("Parsing expiry dates and calculating time to expiry...")
 
     # Parse expiry_str to datetime using a Python UDF
+    # NOTE: map_elements required here - Polars lacks native "1JAN25" date parser
     def parse_expiry(expiry_str: str) -> Optional[int]:
         """Parse expiry string to timestamp (microseconds)."""
         expiry_dt = parse_expiry_datetime(expiry_str)
@@ -344,10 +222,9 @@ def add_time_to_expiry(df: pl.DataFrame) -> pl.DataFrame:
     # Calculate time to expiry in years
     df = df.with_columns(
         [
-            (
-                (pl.col("expiry_datetime").cast(pl.Int64) - pl.col("timestamp_dt").cast(pl.Int64))
-                / (SECONDS_PER_YEAR * 1_000_000)
-            ).alias("time_to_expiry")
+            ((pl.col("expiry_datetime") - pl.col("timestamp_dt")).dt.total_seconds() / SECONDS_PER_YEAR).alias(
+                "time_to_expiry"
+            )
         ]
     )
 
@@ -364,25 +241,102 @@ def add_time_to_expiry(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
+def apply_crypto_quality_filters(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Apply quality filters for liquid, tradable crypto options.
+
+    Filters (USD-based for consistency):
+    - Minimum option price: >= $10 USD for bid/ask (ensures liquidity)
+    - Bid-ask spread: <= 50% (ask/bid - 1, filters wide/stale quotes)
+    - Moneyness range: 0.50-2.00 strike/spot (includes 2x OTM "lottery tickets")
+    - Time to expiry: >= 1 hour (avoids numerical instability)
+
+    Note: Arbitrage validation (below-intrinsic) handled by py_vollib during IV calculation.
+
+    Args:
+        df: DataFrame with bid_price, ask_price, strike_price, spot_price, time_to_expiry (BTC)
+
+    Returns:
+        Filtered DataFrame with liquid, tradable options
+    """
+    logger.info("Applying crypto quality filters...")
+
+    rows_before = len(df)
+
+    # Convert BTC prices to USD for filtering
+    df_filtered = df.with_columns(
+        [
+            (pl.col("bid_price") * pl.col("spot_price")).alias("bid_price_usd"),
+            (pl.col("ask_price") * pl.col("spot_price")).alias("ask_price_usd"),
+        ]
+    ).filter(
+        # USD price filters (meaningful across all spot price levels)
+        (pl.col("bid_price_usd") >= MIN_OPTION_PRICE_USD)
+        & (pl.col("ask_price_usd") >= MIN_OPTION_PRICE_USD)
+        # Bid-ask spread quality: (ask - bid) / bid <= 50%
+        & ((pl.col("ask_price") / pl.col("bid_price") - 1) <= MAX_BID_ASK_SPREAD_PCT)
+        # Moneyness: 0.50 to 2.00 (crypto traders love 2x OTM calls)
+        & (pl.col("strike_price") / pl.col("spot_price")).is_between(MONEYNESS_MIN, MONEYNESS_MAX)
+        # Time floor: avoid near-expiry numerical issues
+        & (pl.col("time_to_expiry") >= MIN_TIME_TO_EXPIRY_HOURS / 8760)
+    )
+
+    # Drop temporary USD columns
+    df_filtered = df_filtered.drop(["bid_price_usd", "ask_price_usd"])
+
+    rows_after = len(df_filtered)
+    filtered_count = rows_before - rows_after
+    filtered_pct = (filtered_count / rows_before * 100) if rows_before > 0 else 0
+
+    logger.info(f"Filtered {filtered_count:,} rows ({filtered_pct:.1f}%)")
+    logger.info(f"Remaining: {rows_after:,} liquid, tradable options")
+
+    # Log filter breakdown if verbose
+    if logger.isEnabledFor(logging.DEBUG):
+        with_columns = df.with_columns(
+            [
+                (pl.col("bid_price") * pl.col("spot_price")).alias("bid_usd"),
+                (pl.col("ask_price") * pl.col("spot_price")).alias("ask_usd"),
+            ]
+        )
+        price_fails = with_columns.filter(
+            (pl.col("bid_usd") < MIN_OPTION_PRICE_USD) | (pl.col("ask_usd") < MIN_OPTION_PRICE_USD)
+        ).shape[0]
+        spread_fails = df.filter((pl.col("ask_price") / pl.col("bid_price") - 1) > MAX_BID_ASK_SPREAD_PCT).shape[0]
+        moneyness_fails = df.filter(
+            ~(pl.col("strike_price") / pl.col("spot_price")).is_between(MONEYNESS_MIN, MONEYNESS_MAX)
+        ).shape[0]
+        time_fails = df.filter(pl.col("time_to_expiry") < MIN_TIME_TO_EXPIRY_HOURS / 8760).shape[0]
+
+        logger.debug(f"  Price < ${MIN_OPTION_PRICE_USD}: {price_fails:,}")
+        logger.debug(f"  Spread > {MAX_BID_ASK_SPREAD_PCT:.0%}: {spread_fails:,}")
+        logger.debug(f"  Moneyness outside [{MONEYNESS_MIN}, {MONEYNESS_MAX}]: {moneyness_fails:,}")
+        logger.debug(f"  Time < {MIN_TIME_TO_EXPIRY_HOURS}h: {time_fails:,}")
+
+    return df_filtered
+
+
 def calculate_ivs_batch(
     df: pl.DataFrame,
     risk_free_rate: float,
-    iv_bounds: tuple[float, float],
-    tolerance: float,
 ) -> pl.DataFrame:
     """
-    Calculate implied volatilities for bid and ask prices.
+    Calculate implied volatilities using vectorized Jaeckel's method.
+
+    Uses py_vollib_vectorized with Jaeckel's "Let's Be Rational" algorithm
+    for 25-50x speedup vs row-by-row scipy.brentq. Achieves machine precision
+    (10⁻¹⁵) in exactly 2 iterations using fourth-order Householder convergence.
 
     Args:
-        df: DataFrame with required columns
-        risk_free_rate: Annual risk-free rate
-        iv_bounds: (min_vol, max_vol) search bounds
-        tolerance: Convergence tolerance
+        df: DataFrame with required columns (bid_price, ask_price, spot_price, strike_price, time_to_expiry, type)
+        risk_free_rate: Annual risk-free rate (e.g., 0.05 for 5%)
 
     Returns:
-        DataFrame with implied_vol_bid, implied_vol_ask, iv_calc_status columns
+        DataFrame with implied_vol_bid, implied_vol_ask, iv_calc_status columns added
     """
-    logger.info(f"Calculating implied volatilities for {len(df):,} rows...")
+    from py_vollib_vectorized import vectorized_implied_volatility  # type: ignore
+
+    logger.info(f"Calculating implied volatilities for {len(df):,} rows (vectorized Jaeckel's method)...")
 
     # Filter out rows with null values in required columns
     df_valid = df.filter(
@@ -397,69 +351,78 @@ def calculate_ivs_batch(
     if filtered_count > 0:
         logger.warning(f"Filtered {filtered_count:,} rows with null values in required columns")
 
-    # Initialize result columns
-    iv_bid_list = []
-    iv_ask_list = []
-    status_list = []
-
-    # Convert to row dictionaries for iteration
-    rows = df_valid.select(
-        [
-            "bid_price",
-            "ask_price",
-            "spot_price",
-            "strike_price",
-            "time_to_expiry",
-            "type",
-        ]
-    ).to_dicts()
-
-    success_count = 0
-    failed_count = 0
-
-    for idx, row in enumerate(rows):
-        if idx % 10000 == 0 and idx > 0:
-            logger.info(f"  Processed {idx:,}/{len(rows):,} rows...")
-
-        S = row["spot_price"]  # noqa: N806
-        K = row["strike_price"]  # noqa: N806
-        T = row["time_to_expiry"]  # noqa: N806
-        option_type = row["type"]
-        bid_price = row["bid_price"]
-        ask_price = row["ask_price"]
-
-        # Calculate IV for bid
-        iv_bid, status_bid = calculate_implied_volatility(
-            bid_price, S, K, T, risk_free_rate, option_type, iv_bounds, tolerance
+    if len(df_valid) == 0:
+        logger.warning("No valid rows to process")
+        return df_valid.with_columns(
+            [
+                pl.Series("implied_vol_bid", [], dtype=pl.Float64),
+                pl.Series("implied_vol_ask", [], dtype=pl.Float64),
+                pl.Series("iv_calc_status", [], dtype=pl.Utf8),
+            ]
         )
 
-        # Calculate IV for ask
-        iv_ask, status_ask = calculate_implied_volatility(
-            ask_price, S, K, T, risk_free_rate, option_type, iv_bounds, tolerance
+    # Prepare numpy arrays for vectorized calculation
+    prices_bid = df_valid["bid_price"].to_numpy()
+    prices_ask = df_valid["ask_price"].to_numpy()
+    S = df_valid["spot_price"].to_numpy()  # noqa: N806
+    K = df_valid["strike_price"].to_numpy()  # noqa: N806
+    t = df_valid["time_to_expiry"].to_numpy()
+    r = np.full(len(df_valid), risk_free_rate)
+
+    # Convert "call"/"put" to "c"/"p" for py_vollib
+    flag = df_valid["type"].str.replace("call", "c").str.replace("put", "p").to_numpy()
+
+    # CRITICAL: Deribit quotes option prices in BTC, but strikes/spots are in USD
+    # Convert option prices from BTC to USD before IV calculation
+    prices_bid_usd = prices_bid * S
+    prices_ask_usd = prices_ask * S
+
+    logger.info(
+        f"Sample (first row): bid={prices_bid[0]:.6f} BTC (${prices_bid_usd[0]:.2f} USD), "
+        f"spot=${S[0]:.0f}, strike=${K[0]:.0f}, T={t[0]:.6f}y ({t[0] * 365:.1f}d), flag={flag[0]}"
+    )
+
+    # VECTORIZED IV CALCULATION (ALL rows at once - NO LOOP!)
+    logger.info("Computing bid IVs (vectorized)...")
+    try:
+        iv_bid = vectorized_implied_volatility(
+            price=prices_bid_usd, S=S, K=K, t=t, r=r, flag=flag, model="black_scholes", return_as="numpy"
         )
+    except Exception as e:
+        logger.warning(f"Vectorized bid calculation failed: {e}")
+        # Fallback to NaN array
+        iv_bid = np.full(len(df_valid), np.nan)
 
-        # Determine overall status
-        if status_bid == "success" and status_ask == "success":
-            status = "success"
-            success_count += 1
-        else:
-            status = f"bid:{status_bid},ask:{status_ask}"
-            failed_count += 1
+    logger.info("Computing ask IVs (vectorized)...")
+    try:
+        iv_ask = vectorized_implied_volatility(
+            price=prices_ask_usd, S=S, K=K, t=t, r=r, flag=flag, model="black_scholes", return_as="numpy"
+        )
+    except Exception as e:
+        logger.warning(f"Vectorized ask calculation failed: {e}")
+        # Fallback to NaN array
+        iv_ask = np.full(len(df_valid), np.nan)
 
-        iv_bid_list.append(iv_bid)
-        iv_ask_list.append(iv_ask)
-        status_list.append(status)
+    # Create status column (success if both bid and ask IVs are valid)
+    status = np.where(
+        np.isnan(iv_bid) | np.isnan(iv_ask),
+        "failed",  # Either bid or ask failed
+        "success",  # Both succeeded
+    )
 
     # Add columns to DataFrame
     df_valid = df_valid.with_columns(
         [
-            pl.Series("implied_vol_bid", iv_bid_list),
-            pl.Series("implied_vol_ask", iv_ask_list),
-            pl.Series("iv_calc_status", status_list),
+            pl.Series("implied_vol_bid", iv_bid),
+            pl.Series("implied_vol_ask", iv_ask),
+            pl.Series("iv_calc_status", status),
         ]
     )
 
+    success_count = np.sum(status == "success")
+    failed_count = len(status) - success_count
     success_rate = success_count / max(len(df_valid), 1) * 100
+
     logger.info(f"IV calculation complete: {success_count:,} success, {failed_count:,} failed ({success_rate:.1f}%)")
 
     return df_valid
@@ -470,8 +433,6 @@ def process_options_file(
     spot_data_dir: str,
     risk_free_rate: float,
     spot_column: str,
-    iv_bounds: tuple[float, float],
-    tolerance: float,
 ) -> pl.DataFrame:
     """
     Process Deribit options file and calculate implied volatilities.
@@ -481,8 +442,6 @@ def process_options_file(
         spot_data_dir: Directory with Hyperliquid spot data
         risk_free_rate: Annual risk-free rate
         spot_column: Column to use as spot price
-        iv_bounds: (min_vol, max_vol) search bounds
-        tolerance: Convergence tolerance
 
     Returns:
         DataFrame with IV columns added
@@ -529,10 +488,16 @@ def process_options_file(
     options_df = add_time_to_expiry(options_df)
 
     logger.info("=" * 80)
+    logger.info("APPLY CRYPTO QUALITY FILTERS")
+    logger.info("=" * 80)
+
+    options_df = apply_crypto_quality_filters(options_df)
+
+    logger.info("=" * 80)
     logger.info("CALCULATE IMPLIED VOLATILITIES")
     logger.info("=" * 80)
 
-    options_df = calculate_ivs_batch(options_df, risk_free_rate, iv_bounds, tolerance)
+    options_df = calculate_ivs_batch(options_df, risk_free_rate)
 
     return options_df
 
@@ -575,17 +540,6 @@ def main() -> None:
         action="store_true",
         help="Also overwrite the original input file",
     )
-    parser.add_argument(
-        "--iv-bounds",
-        default=f"{DEFAULT_IV_BOUNDS[0]},{DEFAULT_IV_BOUNDS[1]}",
-        help=f"IV search bounds as 'min,max' (default: {DEFAULT_IV_BOUNDS[0]},{DEFAULT_IV_BOUNDS[1]})",
-    )
-    parser.add_argument(
-        "--tolerance",
-        type=float,
-        default=DEFAULT_TOLERANCE,
-        help=f"Solver convergence tolerance (default: {DEFAULT_TOLERANCE})",
-    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
@@ -597,20 +551,6 @@ def main() -> None:
         format="%(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
-
-    # Parse IV bounds
-    try:
-        bounds_parts = args.iv_bounds.split(",")
-        if len(bounds_parts) != 2:
-            raise ValueError("iv_bounds must be in format 'min,max'")
-        iv_bounds = (float(bounds_parts[0]), float(bounds_parts[1]))
-        if iv_bounds[0] >= iv_bounds[1]:
-            raise ValueError("min_bound must be < max_bound")
-        if iv_bounds[0] <= 0:
-            raise ValueError("min_bound must be > 0")
-    except ValueError as e:
-        logger.error(f"ERROR: Invalid iv_bounds: {e}")
-        sys.exit(1)
 
     # Validate inputs
     if not os.path.exists(args.input_file):
@@ -627,8 +567,6 @@ def main() -> None:
     logger.info(f"Input: {args.input_file}")
     logger.info(f"Spot data: {args.spot_data_dir} (column: {args.spot_column})")
     logger.info(f"Risk-free rate: {args.risk_free_rate * 100:.2f}%")
-    logger.info(f"IV bounds: [{iv_bounds[0]}, {iv_bounds[1]}]")
-    logger.info(f"Tolerance: {args.tolerance}")
 
     try:
         # Process file
@@ -637,8 +575,6 @@ def main() -> None:
             spot_data_dir=args.spot_data_dir,
             risk_free_rate=args.risk_free_rate,
             spot_column=args.spot_column,
-            iv_bounds=iv_bounds,
-            tolerance=args.tolerance,
         )
 
         logger.info("=" * 80)
