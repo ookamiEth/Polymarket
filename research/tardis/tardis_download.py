@@ -181,14 +181,50 @@ async def _fetch_single_batch(
 
             df = df.with_columns([pl.col("timestamp").alias("local_timestamp")])
 
+            # Extract bid/ask prices and amounts
+            # Filter to only rows with non-empty bids AND asks
+            df = df.filter((pl.col("bids").list.len() > 0) & (pl.col("asks").list.len() > 0))
+
+            if len(df) == 0:
+                logger.warning(f"Batch {batch_idx}: No rows with both bids and asks")
+                return (batch_idx, _empty_dataframe())
+
+            # Extract first bid/ask - bids/asks are List[Struct[2 fields]]
             df = df.with_columns(
                 [
-                    pl.col("bids").list.first().struct.field("price").alias("bid_price"),
-                    pl.col("bids").list.first().struct.field("amount").alias("bid_amount"),
-                    pl.col("asks").list.first().struct.field("price").alias("ask_price"),
-                    pl.col("asks").list.first().struct.field("amount").alias("ask_amount"),
+                    pl.col("bids").list.first().alias("best_bid"),
+                    pl.col("asks").list.first().alias("best_ask"),
                 ]
             )
+
+            # Drop the original bids/asks columns to avoid column name conflicts
+            df = df.drop(["bids", "asks"])
+
+            # Unnest best_bid struct
+            cols_before = set(df.columns)
+            df = df.unnest("best_bid")
+            cols_after = set(df.columns)
+            new_bid_cols = sorted(list(cols_after - cols_before))  # Get the 2 new columns
+
+            # Rename them to bid_price and bid_amount (first field is price, second is amount)
+            if len(new_bid_cols) == 2:
+                df = df.rename({new_bid_cols[0]: "bid_price", new_bid_cols[1]: "bid_amount"})
+            else:
+                logger.error(f"Batch {batch_idx}: Expected 2 bid columns, got {new_bid_cols}")
+                return (batch_idx, _empty_dataframe())
+
+            # Unnest best_ask struct
+            cols_before = set(df.columns)
+            df = df.unnest("best_ask")
+            cols_after = set(df.columns)
+            new_ask_cols = sorted(list(cols_after - cols_before))
+
+            # Rename to ask_price and ask_amount
+            if len(new_ask_cols) == 2:
+                df = df.rename({new_ask_cols[0]: "ask_price", new_ask_cols[1]: "ask_amount"})
+            else:
+                logger.error(f"Batch {batch_idx}: Expected 2 ask columns, got {new_ask_cols}")
+                return (batch_idx, _empty_dataframe())
 
             df = df.filter(
                 (pl.col("bid_price").is_null() | (pl.col("bid_price") >= 0))

@@ -95,24 +95,32 @@ def load_spot_data(
     spot_data_dir: str, underlying: str, date: str, spot_column: str = DEFAULT_SPOT_COLUMN
 ) -> pl.DataFrame:
     """
-    Load Hyperliquid spot price data for given date and underlying.
+    Load spot price data for given date and underlying.
+
+    Supports both Hyperliquid format and Deribit perpetual format:
+    - Hyperliquid: time (Datetime), mid_px (Float64)
+    - Deribit: timestamp (Int64 microseconds), price (Float64)
 
     Args:
-        spot_data_dir: Base directory with Hyperliquid data
+        spot_data_dir: Base directory or direct file path
         underlying: Asset symbol (BTC, ETH)
         date: Date string (YYYY-MM-DD)
-        spot_column: Column to use as spot price
+        spot_column: Column to use as spot price (default: mid_px)
 
     Returns:
         DataFrame with columns: time (Datetime), spot_price (Float64)
     """
-    # Path format: {spot_data_dir}/YYYY/MM/YYYYMMDD_{UNDERLYING}.parquet
-    dt = datetime.strptime(date, "%Y-%m-%d")
-    year = dt.strftime("%Y")
-    month = dt.strftime("%m")
-    filename = f"{dt.strftime('%Y%m%d')}_{underlying}.parquet"
-
-    spot_file_path = os.path.join(spot_data_dir, year, month, filename)
+    # Check if spot_data_dir is a direct file path
+    if os.path.isfile(spot_data_dir):
+        spot_file_path = spot_data_dir
+        logger.info(f"Using direct file path: {spot_file_path}")
+    else:
+        # Path format: {spot_data_dir}/YYYY/MM/YYYYMMDD_{UNDERLYING}.parquet
+        dt = datetime.strptime(date, "%Y-%m-%d")
+        year = dt.strftime("%Y")
+        month = dt.strftime("%m")
+        filename = f"{dt.strftime('%Y%m%d')}_{underlying}.parquet"
+        spot_file_path = os.path.join(spot_data_dir, year, month, filename)
 
     if not os.path.exists(spot_file_path):
         raise FileNotFoundError(f"Spot data not found: {spot_file_path}")
@@ -121,8 +129,23 @@ def load_spot_data(
 
     df = pl.read_parquet(spot_file_path)
 
+    # Handle different formats
+    # Check if we have 'time' column (Hyperliquid) or 'timestamp' column (Deribit)
+    if "time" not in df.columns and "timestamp" in df.columns:
+        logger.info("Converting 'timestamp' (microseconds) to 'time' (Datetime with UTC)")
+        df = df.with_columns([pl.from_epoch(pl.col("timestamp"), time_unit="us").dt.replace_time_zone("UTC").alias("time")])
+
+    if "time" not in df.columns:
+        raise ValueError(f"Neither 'time' nor 'timestamp' column found. Available: {df.columns}")
+
+    # Handle spot price column with fallback
     if spot_column not in df.columns:
-        raise ValueError(f"Spot column '{spot_column}' not found. Available: {df.columns}")
+        # Try fallback to 'price' if mid_px not found
+        if spot_column == "mid_px" and "price" in df.columns:
+            logger.warning(f"Column '{spot_column}' not found, using 'price' as fallback")
+            spot_column = "price"
+        else:
+            raise ValueError(f"Spot column '{spot_column}' not found. Available: {df.columns}")
 
     # Select and rename
     df = df.select([pl.col("time"), pl.col(spot_column).alias("spot_price")])
@@ -557,8 +580,9 @@ def main() -> None:
         logger.error(f"ERROR: Input file not found: {args.input_file}")
         sys.exit(1)
 
-    if not os.path.isdir(args.spot_data_dir):
-        logger.error(f"ERROR: Spot data directory not found: {args.spot_data_dir}")
+    # Spot data can be either a directory or a direct file path
+    if not os.path.exists(args.spot_data_dir):
+        logger.error(f"ERROR: Spot data path not found: {args.spot_data_dir}")
         sys.exit(1)
 
     logger.info("=" * 80)
