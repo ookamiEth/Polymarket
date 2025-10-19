@@ -1,442 +1,164 @@
-# Tardis Download - Deribit Options Data Downloader
+# Tardis - Deribit Options Market Data Pipeline
 
-A Python script for downloading historical Deribit options market data using the tardis-machine server.
+A comprehensive data collection and analysis pipeline for Deribit options market data, using Tardis.dev API for historical data retrieval.
 
-## Overview
+## 📊 Overview
 
-`tardis_download.py` downloads resampled quote and orderbook data for Deribit BTC and ETH options. It:
+This project collects, processes, and analyzes options and perpetual futures data from Deribit exchange, focusing on:
+- ATM (at-the-money) options filtering
+- Implied volatility calculation
+- Quote consolidation and resampling
+- Market microstructure analysis
 
-- Generates option symbols based on asset, expiry date range, and strike prices
-- Fetches sampled quote data (bid/ask prices and amounts) at configurable intervals
-- Optionally includes orderbook snapshots at specified depth
-- Outputs data in Parquet (recommended) or CSV format
-- Handles batching for large symbol sets to avoid timeouts
+## 🗂 Directory Structure
 
-## Code Quality Tools
+```
+tardis/
+├── scripts/                    # Production pipeline scripts
+│   ├── 01_download/           # Data collection from Tardis API
+│   ├── 02_process/            # Data processing and filtering
+│   ├── 03_analyze/            # Analysis and IV calculation
+│   ├── utils/                 # Utility functions and models
+│   └── examples/              # Example scripts
+│
+├── data/                      # All data files (60GB+)
+│   ├── raw/                   # Original downloads
+│   │   ├── options_initial/   # Initial options collection (6.5GB)
+│   │   └── perpetual/         # Perpetual futures data (800MB)
+│   ├── processed/             # Filtered and enriched data
+│   │   ├── options_atm3pct/   # ATM ±3% filtered (22GB)
+│   │   └── quotes_atm3pct/    # Quote data with spot prices (31GB)
+│   ├── consolidated/          # Final outputs
+│   │   ├── quotes_1s_merged.parquet            # Main dataset (8GB)
+│   │   └── quotes_1s_atm_short_dated_optimized.parquet # Filtered (4.6GB)
+│   └── test/                  # Test datasets
+│
+├── tests/                     # Test scripts and benchmarks
+├── docs/                      # Documentation
+│   ├── api/                   # API reference documentation
+│   └── reports/               # Analysis reports and findings
+├── logs/                      # Execution logs
+├── checkpoints/               # Collection progress tracking
+└── requirements.txt           # Python dependencies
+```
 
-This project uses three tools to ensure code quality and type safety:
+## 🚀 Quick Start
 
-### Running Code Quality Checks
+### Prerequisites
+- Python 3.8+
+- uv package manager
+- 100GB+ free disk space
 
+### Installation
 ```bash
-# Check a specific file
-../../check_code.sh tardis_download.py
-
-# Check with auto-fix
-../../check_code.sh tardis_download.py --fix
-
-# Check all Python files in tardis directory
-cd /Users/lgierhake/Documents/ETH/BT && ./check_code.sh research/tardis/*.py
+# Install dependencies
+uv pip install -r requirements.txt
 ```
 
-### Tools Overview
+### Data Pipeline
 
-1. **Ruff** - Fast linter and formatter (10-100x faster than traditional Python tools)
-   - Linting: Catches common errors, enforces PEP8, detects bugs
-   - Formatting: Ensures consistent code style (Black-compatible)
-   - Auto-fix: Automatically fixes many issues with `--fix` flag
+The pipeline consists of three main stages:
 
-2. **Pyright** - Static type checker
-   - Validates type hints at development time (not runtime)
-   - Catches type errors before they cause runtime failures
-   - Best support for modern Python type features and Polars
-
-3. **Pydantic** - Runtime data validation
-   - Validates API responses and data structures
-   - See `models.py` for type-safe data models
-   - Ensures data conforms to expected schemas
-
-### Using Pydantic Models
-
-The `models.py` file provides validated data structures:
-
-```python
-from models import ParsedSymbol, QuoteMessage, TardisFetchConfig
-
-# Parse and validate a Deribit symbol
-symbol = ParsedSymbol.from_symbol("BTC-31DEC24-100000-C")
-print(f"Underlying: {symbol.underlying}")  # BTC
-print(f"Strike: {symbol.strike_price}")     # 100000.0
-print(f"Type: {symbol.option_type.value}")  # call
-
-# Convert back to symbol string
-assert symbol.to_symbol() == "BTC-31DEC24-100000-C"
-
-# Validate fetch configuration
-config = TardisFetchConfig(
-    symbols=["BTC-31DEC24-100000-C"],
-    from_datetime="2024-12-31T00:00:00.000Z",
-    to_datetime="2024-12-31T23:59:59.999Z",
-)
-```
-
-**Benefits:**
-- Automatic validation prevents invalid data from propagating
-- Clear error messages when data doesn't match expected format
-- Self-documenting code with explicit data structures
-
-## Prerequisites
-
-### 1. Tardis Machine Server
-
-The script requires a running [tardis-machine](https://github.com/tardis-dev/tardis-machine) server:
-
+#### 1. Download Data
 ```bash
-# Install globally with npm
-npm install -g tardis-machine
+# Download options data
+uv run python scripts/01_download/download_options.py \
+    --start-date 2024-01-01 \
+    --end-date 2024-01-31 \
+    --output-dir data/raw/options_initial
 
-# Start the server (default port 8000)
-npx tardis-machine --port=8000
+# Download perpetual futures for reference prices
+uv run python scripts/01_download/download_perpetual.py
 ```
 
-The server must be running before you execute the download script. By default, it expects the server at `http://localhost:8000`.
-
-### 2. Python Dependencies
-
-This project uses **uv** for environment management. Install dependencies:
-
+#### 2. Process & Filter
 ```bash
-# Install required packages
-uv pip install polars httpx
+# Consolidate quotes and resample to 1-second intervals
+uv run python scripts/02_process/consolidate_quotes.py \
+    --input-dir data/processed/quotes_atm3pct \
+    --output data/consolidated/quotes_1s_merged.parquet
+
+# Filter for ATM short-dated options
+uv run python scripts/02_process/filter_atm_options.py \
+    --input data/consolidated/quotes_1s_merged.parquet \
+    --output data/consolidated/quotes_1s_atm_short_dated_optimized.parquet
 ```
 
-**Required packages:**
-- `polars` - Fast DataFrame library for data processing
-- `httpx` - Async HTTP client for API requests
-- Python 3.8+ (for asyncio support)
-
-## Quick Start
-
-Download BTC call and put options for January 1, 2024 with 0-7 days to expiry:
-
+#### 3. Analyze
 ```bash
-uv run python tardis_download.py \
-  --from-date 2024-01-01 \
-  --to-date 2024-01-01 \
-  --assets BTC \
-  --min-days 0 \
-  --max-days 7 \
-  --resample-interval 5s \
-  --output-dir ./datasets_deribit_options
+# Calculate implied volatility
+uv run python scripts/03_analyze/calculate_implied_volatility.py
+
+# Generate trading insights
+uv run python scripts/03_analyze/analyze_trading_insights.py
 ```
 
-## Command-Line Arguments
-
-### Required Arguments
-
-| Argument | Description | Example |
-|----------|-------------|---------|
-| `--from-date` | Start date for data download (YYYY-MM-DD) | `2024-01-01` |
-| `--to-date` | End date for data download (YYYY-MM-DD) | `2024-01-31` |
-| `--assets` | Comma-separated list of assets (BTC, ETH) | `BTC,ETH` |
-
-### Optional Arguments
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--min-days` | None | Minimum days to expiry from reference date |
-| `--max-days` | None | Maximum days to expiry from reference date |
-| `--option-type` | `both` | Option type: `call`, `put`, or `both` |
-| `--resample-interval` | `5s` | Sampling interval (e.g., `1s`, `5s`, `1m`, `1h`) |
-| `--include-book` | False | Include orderbook snapshots |
-| `--book-levels` | 25 | Number of orderbook levels (1-100) |
-| `--output-dir` | `./datasets_deribit_options` | Directory for output files |
-| `--output-format` | `parquet` | Output format: `parquet` or `csv` |
-| `--tardis-machine-url` | `http://localhost:8000` | Tardis-machine server URL |
-| `--verbose` `-v` | False | Enable debug logging |
+## 📈 Data Description
 
-## Usage Examples
-
-### Example 1: Single Day, BTC Only, Short-Dated Options
+### Raw Data
+- **options_initial/**: Raw options chain data from Tardis API
+- **perpetual/**: BTC perpetual futures data for spot price reference
 
-Download BTC options expiring within 3 days for a single date:
-
-```bash
-uv run python tardis_download.py \
-  --from-date 2024-03-15 \
-  --to-date 2024-03-15 \
-  --assets BTC \
-  --min-days 0 \
-  --max-days 3 \
-  --resample-interval 10s
-```
+### Processed Data
+- **options_atm3pct/**: Options filtered to ±3% moneyness from ATM
+- **quotes_atm3pct/**: Bid/ask quotes enriched with spot prices
 
-### Example 2: Multi-Day Range, BTC + ETH, All Expiries
+### Consolidated Data
+- **quotes_1s_merged.parquet**: All quotes resampled to 1-second intervals
+- **quotes_1s_atm_short_dated_optimized.parquet**: Final dataset with:
+  - Moneyness: 0.97-1.03 (ATM ±3%)
+  - Time to expiry: ≤7 days
+  - Optimized for analysis with spot prices and Greeks
 
-Download both assets for a week, all available expiries:
+## 🔧 Key Scripts
 
-```bash
-uv run python tardis_download.py \
-  --from-date 2024-03-01 \
-  --to-date 2024-03-07 \
-  --assets BTC,ETH \
-  --resample-interval 1m
-```
+### Download Scripts
+- `download_options.py`: Main options data downloader with parallel workers
+- `download_perpetual.py`: Perpetual futures downloader for spot prices
+- `download_options_atm.py`: Direct ATM-filtered download
+- `download_options_quotes.py`: Quote-specific downloader with spot enrichment
 
-**Note:** Omitting `--min-days` and `--max-days` fetches all available expiries.
-
-### Example 3: Call Options Only with Orderbook Data
-
-Download only call options with 25-level orderbook snapshots:
-
-```bash
-uv run python tardis_download.py \
-  --from-date 2024-06-01 \
-  --to-date 2024-06-01 \
-  --assets ETH \
-  --min-days 7 \
-  --max-days 30 \
-  --option-type call \
-  --include-book \
-  --book-levels 25 \
-  --resample-interval 30s
-```
-
-### Example 4: High-Frequency Data with Verbose Logging
-
-Download 1-second interval data with debug output:
+### Processing Scripts
+- `consolidate_quotes.py`: Streaming consolidation of quote data
+- `filter_atm_options.py`: Optimized ATM filtering with chunked processing
+- `resample_to_1s.py`: Resample data to 1-second intervals
 
-```bash
-uv run python tardis_download.py \
-  --from-date 2024-12-01 \
-  --to-date 2024-12-01 \
-  --assets BTC \
-  --min-days 0 \
-  --max-days 1 \
-  --resample-interval 1s \
-  --verbose
-```
+### Analysis Scripts
+- `calculate_implied_volatility.py`: IV calculation using Black-Scholes
+- `analyze_trading_insights.py`: Market microstructure analysis
+- `compare_exchange_ivs.py`: Cross-exchange IV comparison
+- `analyze_gaps.py`: Gap analysis in quote data
 
-### Example 5: Remote Tardis-Machine Server
+## 📊 Performance Considerations
 
-Use a tardis-machine server running on another machine:
+- Uses Polars for efficient data processing (5-10x faster than Pandas)
+- Streaming processing for large datasets (>100M rows)
+- Chunked processing to handle billion-row datasets
+- Optimized vectorized operations throughout
 
-```bash
-uv run python tardis_download.py \
-  --from-date 2024-01-01 \
-  --to-date 2024-01-01 \
-  --assets BTC \
-  --min-days 0 \
-  --max-days 7 \
-  --tardis-machine-url http://192.168.1.100:8000
-```
+## 🐛 Known Issues
 
-## Symbol Generation Logic
+- Tardis API data can have duplicates - always deduplicate by timestamp
+- Compression of parquet files yields minimal savings (already compressed)
+- Memory usage can spike with large datasets - use streaming mode
 
-The script automatically generates Deribit option symbols based on your parameters.
+## 📚 Documentation
 
-### Strike Price Ranges
+- `docs/api/`: Deribit and Tardis API documentation
+- `docs/reports/`: Analysis reports and optimization findings
+- See individual script docstrings for detailed usage
 
-- **BTC:** 2,000 to 200,000 in 1,000 increments (199 strikes)
-- **ETH:** 200 to 20,000 in 100 increments (199 strikes)
+## 🔗 Resources
 
-### Symbol Format
+- [Tardis.dev API](https://docs.tardis.dev/)
+- [Deribit API](https://docs.deribit.com/)
+- [Polars Documentation](https://pola-rs.github.io/polars/py-polars/html/)
 
-Deribit options follow the format: `{ASSET}-{EXPIRY}-{STRIKE}-{TYPE}`
+## 📝 License
 
-**Example:** `BTC-1MAR24-50000-C`
-- Asset: BTC
-- Expiry: March 1, 2024
-- Strike: $50,000
-- Type: Call
+[Your License Here]
 
-### Expiry Date Calculation
+---
 
-Expiry dates are calculated relative to `--from-date`:
-
-- `--min-days 0 --max-days 7` → Options expiring 0-7 days after from-date
-- No min/max specified → All strikes for from-date itself
-
-**Total Symbols Example:**
-- BTC, 1 asset, 7 expiry dates, 199 strikes, both calls/puts = **2,786 symbols**
-- BTC + ETH, 2 assets, 30 days, both = **23,880 symbols**
-
-## Output Format
-
-### File Naming
-
-Output files use the format: `deribit_options_{from-date}_{assets}_{interval}.{ext}`
-
-**Examples:**
-- `deribit_options_2024-01-01_BTC_5s.parquet`
-- `deribit_options_2024-03-15_BTC_ETH_1m.csv`
-
-### Parquet Schema
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `exchange` | string | Always "deribit" |
-| `symbol` | string | Option symbol (e.g., BTC-1MAR24-50000-C) |
-| `timestamp` | int64 | Exchange timestamp (microseconds since epoch) |
-| `local_timestamp` | int64 | Local timestamp (microseconds since epoch) |
-| `type` | string | "call" or "put" |
-| `strike_price` | float64 | Strike price in USD |
-| `underlying` | string | "BTC" or "ETH" |
-| `expiry_str` | string | Expiry date string (e.g., "1MAR24") |
-| `bid_price` | float64 | Best bid price (null if no bid) |
-| `bid_amount` | float64 | Best bid quantity (null if no bid) |
-| `ask_price` | float64 | Best ask price (null if no ask) |
-| `ask_amount` | float64 | Best ask quantity (null if no ask) |
-
-### Reading Output Data
-
-```python
-import polars as pl
-
-# Read the Parquet file
-df = pl.read_parquet("deribit_options_2024-01-01_BTC_5s.parquet")
-
-# Quick exploration
-print(df.head())
-print(f"Rows: {df.shape[0]:,}")
-print(f"Unique symbols: {df['symbol'].n_unique()}")
-print(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
-
-# Filter for specific strikes
-btc_50k = df.filter(pl.col('strike_price') == 50000)
-
-# Calculate bid-ask spread
-df_with_spread = df.with_columns(
-    (pl.col('ask_price') - pl.col('bid_price')).alias('spread')
-)
-```
-
-## Performance Considerations
-
-### Batching
-
-The script automatically batches symbol requests to avoid HTTP timeouts:
-
-- **Default batch size:** 50 symbols per request
-- Large symbol sets (1000+) are split into multiple batches
-- Each batch is processed sequentially with progress logging
-
-### Timeouts
-
-- **HTTP timeout:** 300 seconds (5 minutes) per batch
-- **Server check timeout:** 10 seconds
-- Increase `HTTP_TIMEOUT_SECONDS` in code for very large batches
-
-### Data Volume Estimates
-
-Approximate output sizes (Parquet format, 5s interval, 24h):
-
-| Configuration | Symbols | Rows | File Size |
-|---------------|---------|------|-----------|
-| BTC, 1 day expiry, both | ~400 | ~700K | ~15 MB |
-| BTC, 7 days expiry, both | ~2,800 | ~5M | ~100 MB |
-| BTC+ETH, 30 days, both | ~24K | ~40M | ~800 MB |
-
-**Tip:** Use Parquet format (default) for 5-10x better compression than CSV.
-
-## Troubleshooting
-
-### Error: "tardis-machine server not accessible"
-
-**Cause:** Tardis-machine server is not running or wrong URL
-
-**Solution:**
-```bash
-# Start server in a separate terminal
-npx tardis-machine --port=8000
-
-# Or specify custom URL
---tardis-machine-url http://localhost:8080
-```
-
-### Error: "No data received - check symbols exist"
-
-**Cause:** Symbols don't exist for the specified date/expiry range
-
-**Solutions:**
-1. Check that options existed on Deribit for that date (markets launched ~2016)
-2. Verify expiry dates align with actual Deribit expiries (daily, weekly, monthly)
-3. Try a different date range or reduce `--max-days`
-4. Use `--verbose` to see detailed API responses
-
-### Warning: "Batch X: No data received"
-
-**Cause:** Some symbol batches have no trading activity
-
-**Solution:** This is normal for illiquid options (far out-of-the-money strikes). The script continues and collects data from other batches.
-
-### Error: "HTTP timeout"
-
-**Cause:** Batch is too large or network is slow
-
-**Solutions:**
-1. Reduce date range (`--from-date` to `--to-date`)
-2. Reduce expiry range (`--min-days` to `--max-days`)
-3. Use faster network connection
-4. Modify `HTTP_TIMEOUT_SECONDS` in code
-
-### Parse Errors or Validation Failures
-
-**Cause:** Malformed data from tardis-machine
-
-**Solution:**
-- Check tardis-machine version (update with `npm install -g tardis-machine`)
-- Review error counts in logs (small numbers are acceptable)
-- Use `--verbose` to inspect raw API responses
-
-## Advanced Usage
-
-### Custom Strike Ranges
-
-Modify `BTC_STRIKES` and `ETH_STRIKES` in code (lines 24-25):
-
-```python
-# Example: Only round strikes for BTC
-BTC_STRIKES = range(10000, 100001, 5000)  # 10K, 15K, 20K, ...
-```
-
-### Custom Batch Size
-
-Adjust `DEFAULT_BATCH_SIZE` (line 16) for your network:
-
-```python
-DEFAULT_BATCH_SIZE = 100  # Larger batches (may timeout)
-DEFAULT_BATCH_SIZE = 20   # Smaller batches (slower but safer)
-```
-
-### Resample Intervals
-
-Valid interval formats:
-- Seconds: `1s`, `5s`, `10s`, `30s`
-- Minutes: `1m`, `5m`, `15m`, `30m`
-- Hours: `1h`, `4h`, `12h`
-- Days: `1d`
-
-**Note:** Smaller intervals = more data = larger files and longer processing time.
-
-### Running on a Remote Server
-
-If running on a headless server:
-
-```bash
-# 1. Start tardis-machine in background
-nohup npx tardis-machine --port=8000 > tardis.log 2>&1 &
-
-# 2. Run download script
-uv run python tardis_download.py \
-  --from-date 2024-01-01 \
-  --to-date 2024-12-31 \
-  --assets BTC,ETH \
-  --min-days 0 \
-  --max-days 90 \
-  --output-dir /mnt/data/deribit \
-  > download.log 2>&1
-
-# 3. Monitor progress
-tail -f download.log
-```
-
-## License
-
-This script is part of the BT research project. Tardis-machine has its own licensing terms.
-
-## Support
-
-For tardis-machine issues, see: https://github.com/tardis-dev/tardis-machine
-
-For script issues, check the main project repository.
+Last updated: October 2024
+Total data size: ~88GB (after cleanup: ~76GB)
