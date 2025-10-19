@@ -7,16 +7,111 @@ Optimized for systems with limited disk space.
 """
 
 import argparse
+import heapq
 import logging
 import os
 import sys
 import time
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import polars as pl
+import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(order=True)
+class HeapEntry:
+    """Entry for k-way merge heap, ordered by (timestamp_seconds, symbol)."""
+
+    timestamp_seconds: int
+    symbol: str = field(compare=True)
+    row_data: dict[str, Any] = field(compare=False, repr=False)
+    batch_idx: int = field(compare=False, repr=False)
+    reader: Any = field(compare=False, repr=False)
+
+
+class ParquetBatchReader:
+    """Memory-efficient iterator over Parquet file in batches."""
+
+    def __init__(self, file_path: Path, chunk_size: int = 10_000):
+        """Initialize batch reader for Parquet file.
+
+        Args:
+            file_path: Path to Parquet file
+            chunk_size: Number of rows to read per batch (default: 10,000)
+        """
+        self.file_path = file_path
+        self.chunk_size = chunk_size
+        self.current_chunk: list[dict[str, Any]] = []
+        self.chunk_idx = 0
+        self.total_rows_read = 0
+        self.exhausted = False
+
+        # Read schema to know column names
+        schema_df = pl.read_parquet(file_path, n_rows=1)
+        self.columns = schema_df.columns
+
+    def __iter__(self) -> Iterator[tuple[int, str, dict[str, Any]]]:
+        """Iterate over rows in file.
+
+        Yields:
+            Tuple of (timestamp_seconds, symbol, row_dict)
+        """
+        return self
+
+    def __next__(self) -> tuple[int, str, dict[str, Any]]:
+        """Get next row from file.
+
+        Returns:
+            Tuple of (timestamp_seconds, symbol, row_dict)
+
+        Raises:
+            StopIteration: When file is exhausted
+        """
+        # Load next chunk if current is exhausted
+        if self.chunk_idx >= len(self.current_chunk):
+            if self.exhausted:
+                raise StopIteration
+
+            self._load_next_chunk()
+
+            if len(self.current_chunk) == 0:
+                self.exhausted = True
+                raise StopIteration
+
+        # Get row from current chunk
+        row_dict = self.current_chunk[self.chunk_idx]
+        self.chunk_idx += 1
+
+        timestamp_seconds = row_dict["timestamp_seconds"]
+        symbol = row_dict["symbol"]
+
+        return (timestamp_seconds, symbol, row_dict)
+
+    def _load_next_chunk(self) -> None:
+        """Load next chunk of rows from Parquet file."""
+        try:
+            # Use lazy scan with slice to efficiently read chunk
+            df_chunk = pl.scan_parquet(self.file_path).slice(self.total_rows_read, self.chunk_size).collect()
+
+            if len(df_chunk) == 0:
+                self.current_chunk = []
+                self.exhausted = True
+                return
+
+            # Convert to list of dicts
+            self.current_chunk = df_chunk.to_dicts()
+            self.chunk_idx = 0
+            self.total_rows_read += len(self.current_chunk)
+
+        except Exception as e:
+            logger.warning(f"Error loading chunk from {self.file_path.name}: {e}")
+            self.current_chunk = []
+            self.exhausted = True
 
 
 def sample_batch_to_1s(df: pl.DataFrame) -> pl.DataFrame:
@@ -53,11 +148,160 @@ def sample_batch_to_1s(df: pl.DataFrame) -> pl.DataFrame:
     return df_1s
 
 
+def kway_merge_batches_streaming(
+    batch_files: list[Path],
+    output_path: Path,
+    chunk_size: int = 100_000,
+    reader_chunk_size: int = 10_000,
+) -> int:
+    """Merge k sorted Parquet files using heap-based streaming merge with deduplication.
+
+    Args:
+        batch_files: List of sorted Parquet batch files to merge
+        output_path: Path for merged output Parquet file
+        chunk_size: Number of rows to buffer before writing (default: 100,000)
+        reader_chunk_size: Chunk size for reading each batch file (default: 10,000)
+
+    Returns:
+        Total number of rows written to output file
+    """
+    logger.info(f"Initializing k-way merge for {len(batch_files)} batch files...")
+    logger.info(f"Reader chunk size: {reader_chunk_size:,} rows")
+    logger.info(f"Output buffer size: {chunk_size:,} rows")
+
+    # Initialize readers for all batch files
+    readers: list[ParquetBatchReader] = []
+    for batch_file in batch_files:
+        try:
+            reader = ParquetBatchReader(batch_file, chunk_size=reader_chunk_size)
+            readers.append(reader)
+        except Exception as e:
+            logger.warning(f"Failed to open {batch_file.name}: {e}")
+
+    if len(readers) == 0:
+        logger.error("No valid batch files to merge")
+        raise ValueError("No valid batch files found")
+
+    logger.info(f"Successfully opened {len(readers)} batch files")
+
+    # Build initial heap with first row from each reader
+    heap: list[HeapEntry] = []
+    for idx, reader in enumerate(readers):
+        try:
+            timestamp_seconds, symbol, row_data = next(reader)
+            entry = HeapEntry(
+                timestamp_seconds=timestamp_seconds,
+                symbol=symbol,
+                row_data=row_data,
+                batch_idx=idx,
+                reader=reader,
+            )
+            heapq.heappush(heap, entry)
+        except StopIteration:
+            # Empty batch file
+            logger.warning(f"Batch file {batch_files[idx].name} is empty")
+            continue
+
+    logger.info(f"Initial heap size: {len(heap)} entries")
+
+    # Initialize PyArrow streaming writer
+    # We'll create the schema from the first row
+    first_entry = heap[0] if heap else None
+    if first_entry is None:
+        raise ValueError("No data to merge")
+
+    # Create PyArrow schema from first row
+    first_df = pl.DataFrame([first_entry.row_data])
+    schema = first_df.to_arrow().schema
+
+    # Open PyArrow Parquet writer for streaming writes
+    writer = pq.ParquetWriter(str(output_path), schema, compression="snappy")
+
+    # Main merge loop
+    output_buffer: list[dict[str, Any]] = []
+    prev_key: Optional[tuple[int, str]] = None
+    total_rows_written = 0
+    duplicates_skipped = 0
+    rows_processed = 0
+
+    merge_start = time.time()
+
+    while heap:
+        # Pop minimum entry
+        entry = heapq.heappop(heap)
+        current_key = (entry.timestamp_seconds, entry.symbol)
+        rows_processed += 1
+
+        # Deduplication: skip if same key as previous
+        if current_key == prev_key:
+            duplicates_skipped += 1
+        else:
+            output_buffer.append(entry.row_data)
+            prev_key = current_key
+
+        # Write buffer to disk when full
+        if len(output_buffer) >= chunk_size:
+            df_chunk = pl.DataFrame(output_buffer)
+            table_chunk = df_chunk.to_arrow()
+            writer.write_table(table_chunk)
+            total_rows_written += len(output_buffer)
+            output_buffer = []
+
+            # Progress logging every 10M rows
+            if total_rows_written % 10_000_000 == 0:
+                elapsed = time.time() - merge_start
+                throughput = total_rows_written / elapsed
+                logger.info(
+                    f"Progress: {total_rows_written:,} rows written, "
+                    f"{duplicates_skipped:,} duplicates skipped, "
+                    f"{throughput:,.0f} rows/sec"
+                )
+
+        # Refill heap from same reader
+        try:
+            timestamp_seconds, symbol, row_data = next(entry.reader)
+            new_entry = HeapEntry(
+                timestamp_seconds=timestamp_seconds,
+                symbol=symbol,
+                row_data=row_data,
+                batch_idx=entry.batch_idx,
+                reader=entry.reader,
+            )
+            heapq.heappush(heap, new_entry)
+        except StopIteration:
+            # This reader is exhausted
+            pass
+
+    # Write final buffer to disk
+    if output_buffer:
+        df_chunk = pl.DataFrame(output_buffer)
+        table_chunk = df_chunk.to_arrow()
+        writer.write_table(table_chunk)
+        total_rows_written += len(output_buffer)
+
+    # Close writer
+    writer.close()
+
+    merge_elapsed = time.time() - merge_start
+    throughput = total_rows_written / merge_elapsed if merge_elapsed > 0 else 0
+
+    logger.info("=" * 80)
+    logger.info("K-way merge complete:")
+    logger.info(f"  Total rows processed: {rows_processed:,}")
+    logger.info(f"  Total rows written: {total_rows_written:,}")
+    logger.info(f"  Duplicates removed: {duplicates_skipped:,}")
+    logger.info(f"  Merge time: {merge_elapsed:.1f}s")
+    logger.info(f"  Average throughput: {throughput:,.0f} rows/sec")
+    logger.info("=" * 80)
+
+    return total_rows_written
+
+
 def consolidate_and_sample_batched(
     input_dir: str,
     batch_size: int = 30,
     checkpoint_dir: str = "checkpoints_1s_sampled",
-) -> pl.DataFrame:
+) -> Path:
     """Consolidate CSV.gz files and sample to 1-second, using batch processing.
 
     Args:
@@ -66,7 +310,7 @@ def consolidate_and_sample_batched(
         checkpoint_dir: Directory for intermediate 1s-sampled batch files
 
     Returns:
-        Consolidated 1-second sampled DataFrame
+        Path to the consolidated 1-second sampled Parquet file
     """
     logger.info("=" * 80)
     logger.info("STAGE 1: BATCH PROCESSING & SAMPLING TO 1-SECOND")
@@ -185,56 +429,34 @@ def consolidate_and_sample_batched(
     else:
         logger.info("  Overall reduction: (all batches cached)")
 
-    # Merge sampled batches using streaming approach
+    # Merge sampled batches using k-way merge
     logger.info("=" * 80)
-    logger.info("STAGE 2: MERGING 1S-SAMPLED BATCHES (STREAMING)")
+    logger.info("STAGE 2: MERGING 1S-SAMPLED BATCHES (K-WAY MERGE)")
     logger.info("=" * 80)
-    logger.info(f"Merging {len(batch_files)} batch files using streaming merge...")
 
     merge_start = time.time()
 
     # Create a temporary output file for merged data
     merged_output = checkpoint_path / "merged_sorted_temp.parquet"
 
-    # Strategy: Use Polars' lazy execution with streaming
-    # 1. Scan all batches lazily
-    # 2. Concatenate lazily
-    # 3. Sort and deduplicate lazily
-    # 4. Write to disk using sink_parquet (streaming write)
-    logger.info("Building lazy query plan...")
-
-    lazy_batches = [pl.scan_parquet(batch_file) for batch_file in batch_files]
-    merged = pl.concat(lazy_batches)
-
-    # Sort and deduplicate in lazy mode
-    logger.info("Sorting and deduplicating (streaming mode)...")
-    merged_sorted = merged.sort(["timestamp_seconds", "symbol"]).unique(
-        subset=["timestamp_seconds", "symbol"], keep="last", maintain_order=True
+    # Use k-way merge with streaming and deduplication
+    total_merged_rows = kway_merge_batches_streaming(
+        batch_files=batch_files,
+        output_path=merged_output,
+        chunk_size=100_000,
+        reader_chunk_size=10_000,
     )
 
-    # Execute and write to disk using streaming sink
-    logger.info("Executing streaming merge to temporary file...")
-    merged_sorted.sink_parquet(str(merged_output), compression="snappy")
-
     merge_elapsed = time.time() - merge_start
-    logger.info(f"Streaming merge completed in {merge_elapsed:.1f}s")
+    throughput = total_merged_rows / merge_elapsed if merge_elapsed > 0 else 0
+    logger.info(f"Total merge time: {merge_elapsed:.1f}s ({throughput:,.0f} rows/sec)")
 
-    # Now read back the merged file (much smaller than loading all batches)
-    logger.info("Loading merged result...")
-    load_start = time.time()
-    df_1s = pl.read_parquet(merged_output)
-    load_elapsed = time.time() - load_start
+    # Get file size
+    merged_size_mb = merged_output.stat().st_size / (1024 * 1024)
+    logger.info(f"Merged file size: {merged_size_mb:.1f} MB")
+    logger.info(f"Merged file path: {merged_output}")
 
-    logger.info(f"Loaded {len(df_1s):,} rows in {load_elapsed:.1f}s")
-
-    # Delete temporary merged file
-    logger.info("Removing temporary merged file...")
-    try:
-        merged_output.unlink()
-    except Exception as e:
-        logger.warning(f"Failed to delete temporary file {merged_output}: {e}")
-
-    # Cleanup intermediate files
+    # Cleanup intermediate batch files
     logger.info("Cleaning up intermediate batch files...")
     for batch_file in batch_files:
         try:
@@ -242,13 +464,8 @@ def consolidate_and_sample_batched(
         except Exception as e:
             logger.warning(f"Failed to delete {batch_file}: {e}")
 
-    try:
-        checkpoint_path.rmdir()
-        logger.info(f"Removed checkpoint directory: {checkpoint_dir}")
-    except Exception as e:
-        logger.warning(f"Failed to remove checkpoint directory: {e}")
-
-    return df_1s
+    # Return path to merged file (do NOT load into memory)
+    return merged_output
 
 
 def forward_fill_gaps(
@@ -559,8 +776,8 @@ def main() -> None:
 
     start_time = time.time()
 
-    # Stage 1 & 2: Consolidate and sample
-    df_1s = consolidate_and_sample_batched(
+    # Stage 1 & 2: Consolidate and sample (returns Path to merged file)
+    merged_file_path = consolidate_and_sample_batched(
         args.input_dir,
         batch_size=args.batch_size,
         checkpoint_dir=args.checkpoint_dir,
@@ -568,20 +785,52 @@ def main() -> None:
 
     # Stage 3: Forward-fill gaps (optional)
     if args.skip_forward_fill:
+        logger.info("=" * 80)
         logger.info("Skipping forward-fill as requested")
-        df_final = df_1s
+        logger.info("=" * 80)
+        # Simply copy/rename merged file to output path
+        import shutil
+
+        shutil.copy2(merged_file_path, args.output_sampled)
+        logger.info(f"Copied merged file to {args.output_sampled}")
+        file_size_mb = os.path.getsize(args.output_sampled) / (1024 * 1024)
+        logger.info(f"Output file size: {file_size_mb:.1f} MB")
+
+        # Clean up checkpoint directory
+        checkpoint_path = merged_file_path.parent
+        try:
+            merged_file_path.unlink()
+            checkpoint_path.rmdir()
+            logger.info(f"Removed checkpoint directory: {checkpoint_path}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup checkpoint: {e}")
     else:
+        # Load merged file and apply forward-fill
+        logger.info("=" * 80)
+        logger.info("Loading merged file for forward-fill stage...")
+        df_1s = pl.read_parquet(merged_file_path)
+        logger.info(f"Loaded {len(df_1s):,} rows")
+
         df_final = forward_fill_gaps(df_1s, args.max_fill_gap)
 
-    # Write final output
-    logger.info("=" * 80)
-    logger.info("WRITING FINAL OUTPUT")
-    logger.info("=" * 80)
-    logger.info(f"Writing sampled data to {args.output_sampled}...")
-    df_final.write_parquet(args.output_sampled, compression="snappy")
+        # Write final output
+        logger.info("=" * 80)
+        logger.info("WRITING FINAL OUTPUT")
+        logger.info("=" * 80)
+        logger.info(f"Writing forward-filled data to {args.output_sampled}...")
+        df_final.write_parquet(args.output_sampled, compression="snappy")
 
-    file_size_mb = os.path.getsize(args.output_sampled) / (1024 * 1024)
-    logger.info(f"Output file size: {file_size_mb:.1f} MB")
+        file_size_mb = os.path.getsize(args.output_sampled) / (1024 * 1024)
+        logger.info(f"Output file size: {file_size_mb:.1f} MB")
+
+        # Clean up checkpoint directory
+        checkpoint_path = merged_file_path.parent
+        try:
+            merged_file_path.unlink()
+            checkpoint_path.rmdir()
+            logger.info(f"Removed checkpoint directory: {checkpoint_path}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup checkpoint: {e}")
 
     # Summary
     elapsed = time.time() - start_time
