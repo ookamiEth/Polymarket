@@ -68,6 +68,7 @@ Thumbs.db
 *.feather
 *.arrow
 *.pdf
+*.png 
 
 # Compressed data files
 *.gz
