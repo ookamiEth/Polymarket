@@ -8,6 +8,10 @@ Fixed version that avoids memory overflow by:
 2. Using lazy concatenation with sink_parquet(streaming=True) for final output
 3. Never loading more than one chunk (5M rows) into memory
 
+Supports two risk-free rate modes:
+- CONSTANT: Use a single rate for all calculations (default: 4.12%)
+- DAILY: Use per-day rates from a file (blended_supply_apr_ma7 from lending rates)
+
 Optimized for 200M+ rows with minimal memory usage (<2GB constant).
 """
 
@@ -27,6 +31,7 @@ DEFAULT_RISK_FREE_RATE = 0.0412
 DEFAULT_CHUNK_SIZE = 5_000_000  # 5M rows per chunk (~1GB memory)
 DEFAULT_INPUT = "data/consolidated/quotes_1s_atm_short_dated_optimized.parquet"
 DEFAULT_OUTPUT = "data/consolidated/quotes_1s_atm_short_dated_with_iv.parquet"
+DEFAULT_RISK_FREE_RATES_FILE = "research/risk_free_rate/data/blended_lending_rates_2023_2025.parquet"
 
 # Quality thresholds
 MIN_OPTION_PRICE_BTC = 0.00001  # Minimum option price in BTC
@@ -47,23 +52,91 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
+def load_daily_risk_free_rates(rates_file: str) -> pl.DataFrame:
+    """
+    Load daily risk-free rates from parquet file.
+
+    Args:
+        rates_file: Path to parquet file with daily rates
+
+    Returns:
+        DataFrame with 'date' and 'risk_free_rate' columns (rates in decimal)
+
+    Raises:
+        FileNotFoundError: If rates file doesn't exist
+        ValueError: If required columns are missing
+    """
+    if not Path(rates_file).exists():
+        raise FileNotFoundError(f"Risk-free rates file not found: {rates_file}")
+
+    logger.info(f"Loading daily risk-free rates from {rates_file}...")
+
+    # Load rates file
+    rates_df = pl.read_parquet(rates_file)
+
+    # Validate required columns
+    required_cols = ["date", "blended_supply_apr_ma7", "blended_supply_apr"]
+    missing_cols = [col for col in required_cols if col not in rates_df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns in rates file: {missing_cols}. Available columns: {rates_df.columns}"
+        )
+
+    # Select and process columns
+    # Use blended_supply_apr as fallback when MA7 is null (first 6 days)
+    rates_df = rates_df.select(
+        [
+            pl.col("date"),
+            # Convert from percentage to decimal (e.g., 2.79% -> 0.0279)
+            # Use MA7 if available, otherwise fall back to non-smoothed rate
+            pl.when(pl.col("blended_supply_apr_ma7").is_not_null())
+            .then(pl.col("blended_supply_apr_ma7") / 100.0)
+            .otherwise(pl.col("blended_supply_apr") / 100.0)
+            .alias("risk_free_rate"),
+        ]
+    )
+
+    # Check for any remaining nulls (shouldn't happen)
+    n_nulls = rates_df.filter(pl.col("risk_free_rate").is_null()).height
+    if n_nulls > 0:
+        logger.warning(f"Removing {n_nulls} rows with null risk-free rates")
+        rates_df = rates_df.filter(pl.col("risk_free_rate").is_not_null())
+
+    # Report statistics
+    n_dates = len(rates_df)
+    min_date = rates_df["date"].min()
+    max_date = rates_df["date"].max()
+    mean_rate: float | None = rates_df["risk_free_rate"].mean()  # type: ignore[assignment]
+
+    logger.info(f"Loaded {n_dates:,} daily rates from {min_date} to {max_date}")
+    if mean_rate is not None:
+        logger.info(f"Mean risk-free rate: {mean_rate * 100:.2f}%")
+
+    return rates_df
+
+
 def calculate_ivs_chunk(
     df: pl.DataFrame,
     risk_free_rate: float,
     chunk_idx: int,
     total_chunks: int,
+    risk_free_rates_df: Optional[pl.DataFrame] = None,
 ) -> pl.DataFrame:
     """
     Calculate implied volatilities for a single chunk using vectorized operations.
 
     Args:
         df: DataFrame chunk with options data
-        risk_free_rate: Annual risk-free rate
+        risk_free_rate: Annual risk-free rate (constant, used if risk_free_rates_df is None)
         chunk_idx: Current chunk number (for logging)
         total_chunks: Total number of chunks (for logging)
+        risk_free_rates_df: Optional DataFrame with daily rates (columns: 'date', 'risk_free_rate')
 
     Returns:
         DataFrame with IV columns added
+
+    Raises:
+        ValueError: If using daily rates and some dates are missing from rates file
     """
     start_time = time.time()
     chunk_size = len(df)
@@ -95,13 +168,44 @@ def calculate_ivs_chunk(
             ]
         )
 
+    # If using daily rates, join with rates DataFrame and extract per-row rates
+    if risk_free_rates_df is not None:
+        # Add date column from timestamp
+        df_valid = df_valid.with_columns(
+            [pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date).alias("date")]
+        )
+
+        # Join with rates DataFrame
+        df_valid = df_valid.join(risk_free_rates_df, on="date", how="left")
+
+        # Check for missing rates (dates not in rates file)
+        n_missing = df_valid.filter(pl.col("risk_free_rate").is_null()).height
+        if n_missing > 0:
+            missing_dates = (
+                df_valid.filter(pl.col("risk_free_rate").is_null())
+                .select("date")
+                .unique()
+                .sort("date")
+                .to_series()
+                .to_list()
+            )
+            raise ValueError(
+                f"Found {n_missing} rows with missing risk-free rates. "
+                f"Missing dates: {missing_dates[:10]}{'...' if len(missing_dates) > 10 else ''}"
+            )
+
     # Prepare arrays for vectorized calculation
     prices_bid = df_valid["bid_price"].to_numpy()
     prices_ask = df_valid["ask_price"].to_numpy()
     S = df_valid["spot_price"].to_numpy()  # noqa: N806
     K = df_valid["strike_price"].to_numpy()  # noqa: N806
     t = df_valid["time_to_expiry_days"].to_numpy() / 365.25  # Convert to years
-    r = np.full(valid_count, risk_free_rate)
+
+    # Use per-row rates if available, otherwise use constant rate
+    if risk_free_rates_df is not None:
+        r = df_valid["risk_free_rate"].to_numpy()
+    else:
+        r = np.full(valid_count, risk_free_rate)
 
     # Convert option type to py_vollib format
     flag = df_valid["type"].str.replace("call", "c").str.replace("put", "p").to_numpy()
@@ -157,6 +261,10 @@ def calculate_ivs_chunk(
         ]
     )
 
+    # Drop temporary columns added for daily rates (if any)
+    if risk_free_rates_df is not None:
+        df_valid = df_valid.drop(["date", "risk_free_rate"])
+
     # Join back with invalid rows (to maintain all original data)
     if invalid_count > 0:
         # Get invalid rows
@@ -201,6 +309,7 @@ def process_with_streaming(
     risk_free_rate: float,
     chunk_size: int,
     test_rows: Optional[int] = None,
+    risk_free_rates_file: Optional[str] = None,
 ) -> None:
     """
     Process large options file using TRUE streaming with chunked IV calculation.
@@ -211,16 +320,25 @@ def process_with_streaming(
     Args:
         input_file: Input parquet file path
         output_file: Output parquet file path
-        risk_free_rate: Annual risk-free rate
+        risk_free_rate: Annual risk-free rate (constant, used if risk_free_rates_file is None)
         chunk_size: Rows to process per chunk
         test_rows: If set, only process this many rows (for testing)
+        risk_free_rates_file: Optional path to daily rates file
     """
     logger.info("=" * 80)
     logger.info("STREAMING IMPLIED VOLATILITY CALCULATION (FIXED)")
     logger.info("=" * 80)
     logger.info(f"Input: {input_file}")
     logger.info(f"Output: {output_file}")
-    logger.info(f"Risk-free rate: {risk_free_rate * 100:.2f}%")
+
+    # Load daily rates if file provided
+    risk_free_rates_df = None
+    if risk_free_rates_file:
+        risk_free_rates_df = load_daily_risk_free_rates(risk_free_rates_file)
+        logger.info("Rate mode: DAILY (per-day rates from file)")
+    else:
+        logger.info(f"Rate mode: CONSTANT ({risk_free_rate * 100:.2f}%)")
+
     logger.info(f"Chunk size: {chunk_size:,} rows")
 
     # Check input file
@@ -279,6 +397,7 @@ def process_with_streaming(
             risk_free_rate,
             chunk_idx + 1,
             n_chunks,
+            risk_free_rates_df,
         )
 
         # Write chunk to temporary file
@@ -395,7 +514,12 @@ def main() -> None:
         "--risk-free-rate",
         type=float,
         default=DEFAULT_RISK_FREE_RATE,
-        help=f"Annual risk-free rate (default: {DEFAULT_RISK_FREE_RATE})",
+        help=f"Annual risk-free rate (constant, default: {DEFAULT_RISK_FREE_RATE})",
+    )
+    parser.add_argument(
+        "--risk-free-rates-file",
+        type=str,
+        help=f"Path to daily risk-free rates parquet file (default: {DEFAULT_RISK_FREE_RATES_FILE})",
     )
     parser.add_argument(
         "--chunk-size",
@@ -428,6 +552,7 @@ def main() -> None:
             risk_free_rate=args.risk_free_rate,
             chunk_size=args.chunk_size,
             test_rows=args.test_rows,
+            risk_free_rates_file=args.risk_free_rates_file,
         )
     except Exception as e:
         logger.error(f"ERROR: {e}")
