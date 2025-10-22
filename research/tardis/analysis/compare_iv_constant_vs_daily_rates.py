@@ -8,24 +8,33 @@ options quote dataset using:
 1. Constant risk-free rate (4.12%)
 2. Daily risk-free rates from blended lending rates (AAVE + USDT)
 
-Uses LAZY EVALUATION throughout to handle 204M+ rows without OOM crashes.
-Analyzes differences across time, option characteristics (moneyness, TTL, type),
-and provides statistical summaries.
+IMPROVED VERSION with staged processing to handle 204M+ rows without OOM:
+- Stage 1: Filter and checkpoint both datasets separately
+- Stage 2: Partitioned join by month (30x smaller joins)
+- Stage 3: Apply transformations and enrichments
+- Stage 4: Generate statistics from checkpointed data
 
 Memory-efficient design:
-- Uses pl.scan_parquet() for lazy loading
-- Joins and calculations done lazily
-- Only materializes small aggregated results
+- Staged processing with intermediate checkpoints
+- Partitioned joins to reduce memory pressure
+- Checkpoint/recovery system for resilience
+- Memory monitoring and proactive cleanup
 - Never loads full 204M row dataset into memory
 """
 
 import argparse
+import gc
+import json
 import logging
+import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import polars as pl
+import psutil
 
 # Constants
 DEFAULT_CONSTANT_IV_FILE = "data/consolidated/quotes_1s_atm_short_dated_with_iv.parquet"
@@ -37,13 +46,19 @@ DEFAULT_OUTPUT_DIR = "research/tardis/analysis/output"
 MATERIALITY_THRESHOLDS_ABS = [0.01, 0.05, 0.10]  # Absolute IV difference (vol points)
 MATERIALITY_THRESHOLDS_REL = [0.05, 0.10, 0.20]  # Relative difference (%)
 
-# Moneyness bins
-MONEYNESS_BINS = [0.0, 0.9, 1.1, float("inf")]
-MONEYNESS_LABELS = ["OTM (<0.9)", "ATM (0.9-1.1)", "ITM (>1.1)"]
+# Moneyness bins (using large number instead of inf for Polars compatibility)
+# Note: For cut(), number of labels must equal number of bins - 1
+MONEYNESS_BINS = [0.0, 0.9, 1.1, 10.0]  # 10 is effectively infinity for moneyness
+MONEYNESS_LABELS = ["OTM (<0.9)", "ATM (0.9-1.1)", "ITM (>1.1)"]  # 3 labels for 4 bins
 
-# Time to expiry bins (days)
-TTL_BINS = [0.0, 7.0, 30.0, 90.0, float("inf")]
-TTL_LABELS = ["<7d", "7-30d", "30-90d", ">90d"]
+# Time to expiry bins (days) - using 365*2 for max instead of inf
+TTL_BINS = [0.0, 7.0, 30.0, 90.0, 730.0]  # 730 days = 2 years max
+TTL_LABELS = ["<7d", "7-30d", "30-90d", ">90d"]  # 4 labels for 5 bins
+
+# Memory and processing limits
+MAX_MEMORY_GB = 5.0  # Maximum memory usage before cleanup
+CHUNK_SIZE_ROWS = 10_000_000  # Process in 10M row chunks for joins
+CHECKPOINT_FILE = "research/tardis/analysis/output/.checkpoint.json"
 
 logger = logging.getLogger(__name__)
 
@@ -59,45 +74,378 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
-def prepare_lazy_comparison(
+def get_memory_usage() -> float:
+    """Get current memory usage in GB."""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024**3)
+
+
+def check_memory(operation: str = "") -> None:
+    """Check memory usage and log warning if high."""
+    memory_gb = get_memory_usage()
+    logger.debug(f"Memory usage {operation}: {memory_gb:.2f} GB")
+
+    if memory_gb > MAX_MEMORY_GB:
+        logger.warning(f"⚠️ High memory usage: {memory_gb:.2f} GB (limit: {MAX_MEMORY_GB:.1f} GB)")
+        logger.info("Triggering garbage collection...")
+        gc.collect()
+        new_memory = get_memory_usage()
+        logger.info(f"Memory after GC: {new_memory:.2f} GB (freed {memory_gb - new_memory:.2f} GB)")
+
+
+def save_checkpoint(checkpoint_data: dict) -> None:
+    """Save checkpoint data to disk."""
+    checkpoint_path = Path(CHECKPOINT_FILE)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(checkpoint_path, "w") as f:
+        json.dump(checkpoint_data, f, indent=2, default=str)
+
+    logger.debug(f"Checkpoint saved to {checkpoint_path}")
+
+
+def load_checkpoint() -> Optional[dict]:
+    """Load checkpoint data if exists."""
+    checkpoint_path = Path(CHECKPOINT_FILE)
+
+    if not checkpoint_path.exists():
+        return None
+
+    try:
+        with open(checkpoint_path) as f:
+            checkpoint = json.load(f)
+        logger.info(f"Checkpoint loaded from {checkpoint_path}")
+        return checkpoint
+    except Exception as e:
+        logger.warning(f"Failed to load checkpoint: {e}")
+        return None
+
+
+def clean_checkpoint() -> None:
+    """Remove checkpoint file."""
+    checkpoint_path = Path(CHECKPOINT_FILE)
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+        logger.info("Checkpoint file removed (processing complete)")
+
+
+def clean_temp_files(temp_dir: Path) -> None:
+    """Clean up temporary files from previous runs."""
+    if temp_dir.exists():
+        for file in temp_dir.glob("*.parquet"):
+            file.unlink()
+            logger.debug(f"Removed temp file: {file}")
+    else:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+
+def stage1_filter_and_checkpoint(
     constant_file: str,
     daily_file: str,
-    rates_file: str,
-) -> tuple[pl.LazyFrame, pl.DataFrame]:
+    temp_dir: Path,
+    checkpoint: Optional[dict] = None,
+) -> tuple[Path, Path, dict]:
     """
-    Prepare lazy comparison DataFrame by joining constant and daily IV datasets.
+    Stage 1: Filter successful IVs and checkpoint to disk.
 
-    CRITICAL: Uses lazy evaluation throughout to avoid loading 204M rows into memory.
+    This separates the filtering from the join to reduce memory pressure.
 
     Args:
         constant_file: Path to IV file with constant rates
         daily_file: Path to IV file with daily rates
-        rates_file: Path to risk-free rates file
+        temp_dir: Directory for temporary files
+        checkpoint: Optional checkpoint to resume from
 
     Returns:
-        Tuple of (lazy comparison DataFrame, rates DataFrame)
-
-    Raises:
-        FileNotFoundError: If any input file doesn't exist
+        Tuple of (constant filtered path, daily filtered path, stats dict)
     """
     logger.info("=" * 80)
-    logger.info("PREPARING LAZY COMPARISON")
+    logger.info("STAGE 1: FILTER AND CHECKPOINT")
     logger.info("=" * 80)
 
-    # Check files exist
-    for file_path in [constant_file, daily_file, rates_file]:
-        if not Path(file_path).exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
+    stats = {}
 
-    # Load constant rate IVs LAZILY
-    logger.info(f"Scanning constant rate IVs from {constant_file}...")
-    df_constant_lazy = pl.scan_parquet(constant_file)
+    # Output paths
+    constant_filtered = temp_dir / "constant_filtered.parquet"
+    daily_filtered = temp_dir / "daily_filtered.parquet"
 
-    # Load daily rate IVs LAZILY
-    logger.info(f"Scanning daily rate IVs from {daily_file}...")
-    df_daily_lazy = pl.scan_parquet(daily_file)
+    # Check if already done
+    if checkpoint and checkpoint.get("stage1_complete"):
+        logger.info("Stage 1 already complete (from checkpoint)")
+        return constant_filtered, daily_filtered, checkpoint.get("stage1_stats", {})
 
-    # Load risk-free rates (small file, can load eagerly)
+    # Process constant rate file
+    if not constant_filtered.exists():
+        logger.info(f"Filtering constant rate IVs from {constant_file}...")
+        check_memory("before constant filter")
+
+        df_constant = pl.scan_parquet(constant_file)
+        n_constant_total = df_constant.select(pl.len()).collect().item()
+        stats["constant_total"] = n_constant_total
+
+        # Filter and write
+        df_constant_success = df_constant.filter(pl.col("iv_calc_status") == "success")
+
+        # Select required columns only
+        constant_cols = [
+            "timestamp_seconds",
+            "symbol",
+            "exchange",
+            "type",
+            "strike_price",
+            "expiry_timestamp",
+            "spot_price",
+            "moneyness",
+            "time_to_expiry_days",
+            "implied_vol_bid",
+            "implied_vol_ask",
+        ]
+
+        df_constant_success.select(constant_cols).sink_parquet(
+            str(constant_filtered), compression="snappy", statistics=True
+        )
+
+        # Count rows in output
+        n_constant_success = pl.scan_parquet(constant_filtered).select(pl.len()).collect().item()
+        stats["constant_success"] = n_constant_success
+
+        logger.info(
+            f"  ✅ Filtered {n_constant_success:,}/{n_constant_total:,} rows "
+            f"({n_constant_success / n_constant_total * 100:.1f}% success rate)"
+        )
+        check_memory("after constant filter")
+
+    # Process daily rate file
+    if not daily_filtered.exists():
+        logger.info(f"Filtering daily rate IVs from {daily_file}...")
+        check_memory("before daily filter")
+
+        df_daily = pl.scan_parquet(daily_file)
+        n_daily_total = df_daily.select(pl.len()).collect().item()
+        stats["daily_total"] = n_daily_total
+
+        # Filter and write
+        df_daily_success = df_daily.filter(pl.col("iv_calc_status") == "success")
+
+        # Select required columns only (fewer than constant)
+        daily_cols = [
+            "timestamp_seconds",
+            "symbol",
+            "exchange",
+            "type",
+            "strike_price",
+            "expiry_timestamp",
+            "implied_vol_bid",
+            "implied_vol_ask",
+        ]
+
+        df_daily_success.select(daily_cols).sink_parquet(str(daily_filtered), compression="snappy", statistics=True)
+
+        # Count rows in output
+        n_daily_success = pl.scan_parquet(daily_filtered).select(pl.len()).collect().item()
+        stats["daily_success"] = n_daily_success
+
+        logger.info(
+            f"  ✅ Filtered {n_daily_success:,}/{n_daily_total:,} rows "
+            f"({n_daily_success / n_daily_total * 100:.1f}% success rate)"
+        )
+        check_memory("after daily filter")
+
+    # Update checkpoint
+    checkpoint_data = {"stage1_complete": True, "stage1_stats": stats}
+    save_checkpoint(checkpoint_data)
+
+    logger.info("✅ Stage 1 complete: Filtered datasets checkpointed to disk")
+
+    return constant_filtered, daily_filtered, stats
+
+
+def stage2_partitioned_join(
+    constant_filtered: Path,
+    daily_filtered: Path,
+    temp_dir: Path,
+    checkpoint: Optional[dict] = None,
+) -> Path:
+    """
+    Stage 2: Perform partitioned join by month to reduce memory usage.
+
+    Instead of joining 198M x 198M rows at once, we partition by date and
+    join smaller chunks.
+
+    Args:
+        constant_filtered: Path to filtered constant IV file
+        daily_filtered: Path to filtered daily IV file
+        temp_dir: Directory for temporary files
+        checkpoint: Optional checkpoint to resume from
+
+    Returns:
+        Path to joined comparison file
+    """
+    logger.info("=" * 80)
+    logger.info("STAGE 2: PARTITIONED JOIN")
+    logger.info("=" * 80)
+
+    output_file = temp_dir / "comparison_joined.parquet"
+
+    # Check if already done
+    if checkpoint and checkpoint.get("stage2_complete"):
+        logger.info("Stage 2 already complete (from checkpoint)")
+        return output_file
+
+    # Get date range from data
+    logger.info("Analyzing date range...")
+    df_constant_lazy = pl.scan_parquet(constant_filtered)
+
+    # Add date column for partitioning
+    df_constant_lazy = df_constant_lazy.with_columns(
+        [pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date).alias("date")]
+    )
+
+    date_range = df_constant_lazy.select([
+        pl.col("date").min().alias("min_date"),
+        pl.col("date").max().alias("max_date")
+    ]).collect().row(0)
+    start_date, end_date = date_range
+    logger.info(f"  Date range: {start_date} to {end_date}")
+
+    # Generate monthly partitions
+    partitions = []
+    current = start_date
+    while current <= end_date:
+        month_start = current.replace(day=1)
+        # Calculate month end
+        if month_start.month == 12:
+            month_end = month_start.replace(year=month_start.year + 1, month=1, day=1)
+        else:
+            month_end = month_start.replace(month=month_start.month + 1, day=1)
+        partitions.append((month_start, month_end))
+        current = month_end
+
+    logger.info(f"  Processing {len(partitions)} monthly partitions")
+
+    # Process each partition
+    partition_files = []
+    completed_partitions = checkpoint.get("completed_partitions", []) if checkpoint else []
+
+    for i, (month_start, month_end) in enumerate(partitions, 1):
+        partition_label = f"{month_start.strftime('%Y-%m')}"
+        partition_file = temp_dir / f"partition_{partition_label}.parquet"
+
+        # Skip if already processed
+        if partition_label in completed_partitions:
+            logger.info(f"  Partition {i}/{len(partitions)}: {partition_label} (already complete)")
+            partition_files.append(partition_file)
+            continue
+
+        logger.info(f"  Partition {i}/{len(partitions)}: {partition_label}")
+        check_memory(f"before partition {partition_label}")
+
+        # Load and filter constant data for this partition
+        df_const_partition = (
+            pl.scan_parquet(constant_filtered)
+            .with_columns([pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date).alias("date")])
+            .filter((pl.col("date") >= month_start) & (pl.col("date") < month_end))
+            .drop("date")  # Drop date column after filtering
+        )
+
+        # Load and filter daily data for this partition
+        df_daily_partition = (
+            pl.scan_parquet(daily_filtered)
+            .with_columns([pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date).alias("date")])
+            .filter((pl.col("date") >= month_start) & (pl.col("date") < month_end))
+            .drop("date")  # Drop date column after filtering
+        )
+
+        # Define join keys
+        join_keys = [
+            "timestamp_seconds",
+            "symbol",
+            "exchange",
+            "type",
+            "strike_price",
+            "expiry_timestamp",
+        ]
+
+        # Perform join for this partition
+        df_joined = df_const_partition.join(
+            df_daily_partition,
+            on=join_keys,
+            how="inner",
+            suffix="_daily",
+        )
+
+        # Write partition result
+        df_joined.sink_parquet(str(partition_file), compression="snappy", statistics=True)
+
+        # Track completion
+        completed_partitions.append(partition_label)
+        partition_files.append(partition_file)
+
+        # Update checkpoint
+        checkpoint_data = {
+            "stage1_complete": True,
+            "stage1_stats": checkpoint.get("stage1_stats", {}) if checkpoint else {},
+            "completed_partitions": completed_partitions,
+        }
+        save_checkpoint(checkpoint_data)
+
+        check_memory(f"after partition {partition_label}")
+
+    # Combine all partitions into single file
+    logger.info("\nCombining all partitions...")
+    df_all = pl.scan_parquet(partition_files)
+    df_all.sink_parquet(str(output_file), compression="snappy", statistics=True)
+
+    # Clean up partition files
+    for pfile in partition_files:
+        pfile.unlink()
+
+    # Update checkpoint
+    checkpoint_data = {
+        "stage1_complete": True,
+        "stage2_complete": True,
+        "stage1_stats": checkpoint.get("stage1_stats", {}) if checkpoint else {},
+    }
+    save_checkpoint(checkpoint_data)
+
+    logger.info("✅ Stage 2 complete: Partitioned join written to disk")
+
+    return output_file
+
+
+def stage3_transform_and_enrich(
+    joined_file: Path,
+    rates_file: str,
+    output_dir: Path,
+    checkpoint: Optional[dict] = None,
+) -> Path:
+    """
+    Stage 3: Apply transformations and enrichments to joined data.
+
+    This stage calculates differences, adds bins, filters invalid data,
+    and joins with risk-free rates.
+
+    Args:
+        joined_file: Path to joined comparison file
+        rates_file: Path to risk-free rates file
+        output_dir: Output directory
+        checkpoint: Optional checkpoint to resume from
+
+    Returns:
+        Path to final comparison file
+    """
+    logger.info("=" * 80)
+    logger.info("STAGE 3: TRANSFORM AND ENRICH")
+    logger.info("=" * 80)
+
+    output_file = output_dir / "comparison_final.parquet"
+
+    # Check if already done
+    if checkpoint and checkpoint.get("stage3_complete"):
+        logger.info("Stage 3 already complete (from checkpoint)")
+        return output_file
+
+    # Load risk-free rates (small file)
     logger.info(f"Loading risk-free rates from {rates_file}...")
     df_rates = pl.read_parquet(rates_file).select(
         [
@@ -107,64 +455,16 @@ def prepare_lazy_comparison(
     )
     logger.info(f"  Loaded {len(df_rates):,} days")
 
-    # Get row counts (triggers minimal scan, doesn't load data)
-    logger.info("\nCounting rows...")
-    n_constant = df_constant_lazy.select(pl.len()).collect().item()
-    n_daily = df_daily_lazy.select(pl.len()).collect().item()
-    logger.info(f"  Constant IV file: {n_constant:,} rows")
-    logger.info(f"  Daily IV file: {n_daily:,} rows")
+    # Load joined data lazily
+    logger.info("Loading joined comparison data...")
+    df_comparison = pl.scan_parquet(joined_file)
 
-    if n_constant != n_daily:
-        logger.warning(f"Row count mismatch: constant={n_constant:,}, daily={n_daily:,}")
+    # Apply all transformations in one chain
+    logger.info("Applying transformations...")
 
-    # Filter for successful IV calculations LAZILY
-    logger.info("\nFiltering for successful IV calculations (lazy)...")
-    df_constant_success = df_constant_lazy.filter(pl.col("iv_calc_status") == "success")
-    df_daily_success = df_daily_lazy.filter(pl.col("iv_calc_status") == "success")
-
-    # Count successful calculations (minimal scan)
-    n_constant_success = df_constant_success.select(pl.len()).collect().item()
-    n_daily_success = df_daily_success.select(pl.len()).collect().item()
-    logger.info(f"  Constant: {n_constant_success:,} successful ({n_constant_success / n_constant * 100:.1f}%)")
-    logger.info(f"  Daily: {n_daily_success:,} successful ({n_daily_success / n_daily * 100:.1f}%)")
-
-    # Define join keys
-    join_keys = [
-        "timestamp_seconds",
-        "symbol",
-        "exchange",
-        "type",
-        "strike_price",
-        "expiry_timestamp",
-    ]
-
-    # Select columns for comparison
-    constant_cols = join_keys + [
-        "spot_price",
-        "moneyness",
-        "time_to_expiry_days",
-        "implied_vol_bid",
-        "implied_vol_ask",
-    ]
-    daily_cols = join_keys + ["implied_vol_bid", "implied_vol_ask"]
-
-    # Join datasets LAZILY
-    logger.info("\nJoining datasets (lazy)...")
-    df_comparison = df_constant_success.select(constant_cols).join(
-        df_daily_success.select(daily_cols),
-        on=join_keys,
-        how="inner",
-        suffix="_daily",
-    )
-
-    # OPTIMIZATION: Skip validation entirely to avoid any materialization
-    # The join will be validated implicitly during streaming write
-    logger.info("  Skipping join validation (will be validated during streaming)")
-
-    # Calculate differences LAZILY
-    logger.info("Calculating differences (lazy)...")
     df_comparison = df_comparison.with_columns(
         [
+            # Calculate all differences at once
             # Absolute differences (vol points)
             (pl.col("implied_vol_bid_daily") - pl.col("implied_vol_bid")).alias("iv_bid_diff_abs"),
             (pl.col("implied_vol_ask_daily") - pl.col("implied_vol_ask")).alias("iv_ask_diff_abs"),
@@ -178,10 +478,12 @@ def prepare_lazy_comparison(
             # Mid IVs
             ((pl.col("implied_vol_bid") + pl.col("implied_vol_ask")) / 2).alias("iv_mid_constant"),
             ((pl.col("implied_vol_bid_daily") + pl.col("implied_vol_ask_daily")) / 2).alias("iv_mid_daily"),
+            # Date for joining with rates
+            pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date).alias("date"),
         ]
     )
 
-    # Calculate mid differences LAZILY
+    # Calculate mid differences (separate step for clarity)
     df_comparison = df_comparison.with_columns(
         [
             (pl.col("iv_mid_daily") - pl.col("iv_mid_constant")).alias("iv_mid_diff_abs"),
@@ -191,77 +493,78 @@ def prepare_lazy_comparison(
         ]
     )
 
-    # Add date column LAZILY
-    df_comparison = df_comparison.with_columns(
-        [pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date).alias("date")]
-    )
-
-    # Add categorical bins LAZILY
-    logger.info("Adding categorical bins (lazy)...")
+    # Add categorical bins using when/then instead of cut() to avoid issues
+    logger.info("Adding categorical bins...")
     df_comparison = df_comparison.with_columns(
         [
-            pl.col("moneyness").cut(breaks=MONEYNESS_BINS, labels=MONEYNESS_LABELS).alias("moneyness_bin"),
-            pl.col("time_to_expiry_days").cut(breaks=TTL_BINS, labels=TTL_LABELS).alias("ttl_bin"),
+            # Moneyness binning
+            pl.when(pl.col("moneyness") < 0.9)
+            .then(pl.lit("OTM (<0.9)"))
+            .when(pl.col("moneyness") < 1.1)
+            .then(pl.lit("ATM (0.9-1.1)"))
+            .otherwise(pl.lit("ITM (>1.1)"))
+            .alias("moneyness_bin"),
+            # Time to expiry binning
+            pl.when(pl.col("time_to_expiry_days") < 7)
+            .then(pl.lit("<7d"))
+            .when(pl.col("time_to_expiry_days") < 30)
+            .then(pl.lit("7-30d"))
+            .when(pl.col("time_to_expiry_days") < 90)
+            .then(pl.lit("30-90d"))
+            .otherwise(pl.lit(">90d"))
+            .alias("ttl_bin"),
         ]
     )
 
-    # Filter invalid data (NaN, Inf, nulls) BEFORE aggregations
-    logger.info("Filtering invalid data (NaN, Inf, null)...")
+    # Filter invalid data
+    logger.info("Filtering invalid data...")
     df_comparison = df_comparison.filter(
         # Filter nulls
         pl.col("iv_mid_constant").is_not_null()
         & pl.col("iv_mid_daily").is_not_null()
-        # Filter infinities (from div-by-zero)
+        # Filter infinities
         & pl.col("iv_mid_constant").is_finite()
         & pl.col("iv_mid_daily").is_finite()
         & pl.col("iv_mid_diff_rel").is_finite()
         & pl.col("iv_bid_diff_rel").is_finite()
         & pl.col("iv_ask_diff_rel").is_finite()
-        # Filter extreme outliers (IV should be 0-20 typically)
+        # Filter extreme outliers
         & (pl.col("iv_mid_constant") > 0)
         & (pl.col("iv_mid_constant") < 20)
         & (pl.col("iv_mid_daily") > 0)
         & (pl.col("iv_mid_daily") < 20)
     )
 
-    # OPTIMIZATION: Skip counting valid rows to avoid materialization
-    # The actual count will be reported after streaming write or during aggregations
-    logger.info("  Filtering complete (count will be reported during aggregations)")
-
-    # Join with risk-free rates LAZILY
-    logger.info("Joining with risk-free rates (lazy)...")
+    # Join with risk-free rates
+    logger.info("Joining with risk-free rates...")
     df_comparison = df_comparison.join(pl.LazyFrame(df_rates), on="date", how="left")
 
-    logger.info("\n✅ Lazy comparison DataFrame prepared (no data loaded into memory yet)")
+    # Write final comparison file
+    logger.info("Writing final comparison data...")
+    check_memory("before final write")
 
-    return df_comparison, df_rates
+    df_comparison.sink_parquet(str(output_file), compression="snappy", statistics=True)
+
+    # Report file size
+    file_size_mb = output_file.stat().st_size / (1024**2)
+    logger.info(f"  ✅ Final comparison written: {file_size_mb:.1f} MB")
+
+    # Update checkpoint
+    checkpoint_data = {
+        "stage1_complete": True,
+        "stage2_complete": True,
+        "stage3_complete": True,
+        "stage1_stats": checkpoint.get("stage1_stats", {}) if checkpoint else {},
+    }
+    save_checkpoint(checkpoint_data)
+
+    check_memory("after final write")
+    logger.info("✅ Stage 3 complete: Transformations applied and data enriched")
+
+    return output_file
 
 
-def write_comparison_to_disk_streaming(df_lazy: pl.LazyFrame, output_file: str) -> None:
-    """
-    Write comparison DataFrame to disk using streaming mode.
-
-    Use when join result >100M rows to avoid OOM during aggregations.
-
-    Args:
-        df_lazy: Lazy comparison DataFrame
-        output_file: Output parquet file path
-    """
-    logger.info("Writing comparison data to disk (streaming mode)...")
-    logger.info(f"  Output: {output_file}")
-
-    # Note: sink_parquet() always uses streaming mode (vs write_parquet)
-    df_lazy.sink_parquet(
-        output_file,
-        compression="snappy",
-        statistics=True,
-    )
-
-    logger.info("✅ Comparison data written to disk")
-
-    # Report size
-    file_size_mb = Path(output_file).stat().st_size / (1024 * 1024)
-    logger.info(f"  File size: {file_size_mb:.1f} MB")
+# Note: write_comparison_to_disk_streaming removed - replaced with staged processing
 
 
 def generate_summary_statistics(df_lazy: pl.LazyFrame) -> dict[str, pl.DataFrame]:
@@ -614,8 +917,10 @@ def save_results(
 
 
 def main() -> None:
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description="Compare IV calculations using constant vs. daily risk-free rates")
+    """Main entry point with staged processing."""
+    parser = argparse.ArgumentParser(
+        description="Compare IV calculations using constant vs. daily risk-free rates (IMPROVED with staged processing)"
+    )
 
     parser.add_argument(
         "--constant-file",
@@ -638,6 +943,16 @@ def main() -> None:
         help=f"Output directory (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
+        "--test-mode",
+        action="store_true",
+        help="Use test dataset (10M rows) for quick validation",
+    )
+    parser.add_argument(
+        "--clean-start",
+        action="store_true",
+        help="Clean checkpoints and temp files before starting",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -649,38 +964,105 @@ def main() -> None:
     # Setup logging
     setup_logging(args.verbose)
 
+    # Use test files if requested
+    if args.test_mode:
+        logger.info("🧪 TEST MODE: Using 10M row test dataset")
+        args.constant_file = "research/tardis/data/consolidated/quotes_1s_atm_short_dated_with_iv_10m_test.parquet"
+        # Assuming test file for daily rates exists with same pattern
+        daily_test = args.constant_file.replace("_with_iv_10m_test", "_with_iv_daily_rates_10m_test")
+        if Path(daily_test).exists():
+            args.daily_file = daily_test
+        else:
+            logger.warning(f"Daily test file not found: {daily_test}, using full daily file")
+
     start_time = time.time()
+    logger.info("=" * 80)
+    logger.info("IV COMPARISON ANALYSIS (STAGED PROCESSING)")
+    logger.info("=" * 80)
+    logger.info(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Memory limit: {MAX_MEMORY_GB:.1f} GB")
+    logger.info(f"Initial memory: {get_memory_usage():.2f} GB")
 
     try:
-        # Prepare lazy comparison DataFrame (NO data loaded into memory yet)
-        df_comparison_lazy, df_rates = prepare_lazy_comparison(
-            args.constant_file,
-            args.daily_file,
-            args.rates_file,
-        )
+        # Check input files exist
+        for file_path in [args.constant_file, args.daily_file, args.rates_file]:
+            if not Path(file_path).exists():
+                raise FileNotFoundError(f"File not found: {file_path}")
 
-        # OPTIMIZATION: Always use streaming mode for safety with ~198M rows
-        # Avoids counting rows which would force materialization
-        logger.info("Using streaming mode for ~198M row dataset...")
-
-        # Write to disk first
+        # Setup directories
         output_path = Path(args.output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        intermediate_file = output_path / "comparison_data_intermediate.parquet"
+        temp_dir = output_path / "temp"
 
-        write_comparison_to_disk_streaming(df_comparison_lazy, str(intermediate_file))
+        # Load checkpoint or start fresh
+        checkpoint = None
+        if args.clean_start:
+            logger.info("Cleaning checkpoints and temp files...")
+            clean_checkpoint()
+            clean_temp_files(temp_dir)
+        else:
+            checkpoint = load_checkpoint()
+            if checkpoint:
+                logger.info("📥 Resuming from checkpoint")
 
-        # Reload lazily for aggregations
-        df_comparison_lazy = pl.scan_parquet(intermediate_file)
-        logger.info("✅ Data reloaded lazily from disk for aggregations")
+        # Clean temp files if no checkpoint
+        if not checkpoint:
+            clean_temp_files(temp_dir)
+
+        # ==========================================
+        # STAGE 1: Filter and checkpoint
+        # ==========================================
+        constant_filtered, daily_filtered, stage1_stats = stage1_filter_and_checkpoint(
+            args.constant_file, args.daily_file, temp_dir, checkpoint
+        )
+
+        # ==========================================
+        # STAGE 2: Partitioned join
+        # ==========================================
+        joined_file = stage2_partitioned_join(constant_filtered, daily_filtered, temp_dir, checkpoint)
+
+        # ==========================================
+        # STAGE 3: Transform and enrich
+        # ==========================================
+        final_comparison_file = stage3_transform_and_enrich(joined_file, args.rates_file, output_path, checkpoint)
+
+        # ==========================================
+        # STAGE 4: Generate statistics
+        # ==========================================
+        logger.info("=" * 80)
+        logger.info("STAGE 4: GENERATE STATISTICS")
+        logger.info("=" * 80)
+
+        # Load final data lazily for statistics
+        df_comparison_lazy = pl.scan_parquet(final_comparison_file)
+
+        # Load rates for time series analysis
+        df_rates = pl.read_parquet(args.rates_file).select(
+            [
+                pl.col("date"),
+                pl.col("blended_supply_apr_ma7").alias("risk_free_rate_pct"),
+            ]
+        )
 
         # Generate statistics (only small aggregated results are collected)
+        logger.info("\nGenerating summary statistics...")
         summaries = generate_summary_statistics(df_comparison_lazy)
+
+        logger.info("\nGenerating segmented statistics...")
         segmented = generate_segmented_statistics(df_comparison_lazy)
+
+        logger.info("\nGenerating time series statistics...")
         daily_stats = generate_time_series_statistics(df_comparison_lazy, df_rates)
 
         # Save results
         save_results(args.output_dir, summaries, segmented, daily_stats)
+
+        # Clean up temp files and checkpoint
+        logger.info("\nCleaning up...")
+        clean_temp_files(temp_dir)
+        if temp_dir.exists() and not any(temp_dir.iterdir()):
+            temp_dir.rmdir()
+        clean_checkpoint()
 
         # Get final count
         total_compared = summaries["overall"]["n_observations"][0]
@@ -688,18 +1070,25 @@ def main() -> None:
         # Final summary
         elapsed = time.time() - start_time
         logger.info("\n" + "=" * 80)
-        logger.info("ANALYSIS COMPLETE")
+        logger.info("🎉 ANALYSIS COMPLETE")
         logger.info("=" * 80)
-        logger.info(f"Total time: {elapsed:.1f} seconds")
-        logger.info(f"Analyzed {total_compared:,} options")
+        logger.info(f"Total time: {elapsed:.1f} seconds ({elapsed / 60:.1f} minutes)")
+        logger.info(f"Analyzed {total_compared:,} option quotes")
         logger.info(f"Results saved to {args.output_dir}")
-        logger.info("\n✅ Memory usage stayed low throughout (lazy evaluation)")
+        logger.info(f"Peak memory usage: {get_memory_usage():.2f} GB")
+        logger.info("\n✅ Staged processing completed successfully without OOM issues!")
+
+    except KeyboardInterrupt:
+        logger.warning("\n⚠️ Process interrupted by user")
+        logger.info("Checkpoint saved - run again to resume from last completed stage")
+        sys.exit(1)
 
     except Exception as e:
-        logger.error(f"ERROR: {e}")
+        logger.error(f"❌ ERROR: {e}")
         import traceback
 
         traceback.print_exc()
+        logger.info("\n💡 Checkpoint saved - you can resume by running the script again")
         sys.exit(1)
 
 

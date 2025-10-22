@@ -104,6 +104,7 @@ orderbook_snapshots/data/
 orderbook_snapshots/logs/
 orderbook_snapshots/config/*.json
 orderbook_snapshots/config/*.csv
+usdai/
 
 # Research data directories
 research/tardis/datasets_*/

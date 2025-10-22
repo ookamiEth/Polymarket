@@ -384,12 +384,9 @@ def process_with_streaming(
 
         logger.info(f"\nProcessing rows {chunk_start:,} to {chunk_end:,}...")
 
-        # Read chunk
-        df_chunk = pl.read_parquet(
-            input_file,
-            n_rows=actual_chunk_size,
-            row_index_offset=chunk_start,
-        )
+        # Read chunk using slice to skip rows correctly
+        # CRITICAL FIX: row_index_offset doesn't skip rows, use slice() instead
+        df_chunk = pl.scan_parquet(input_file).slice(chunk_start, actual_chunk_size).collect()
 
         # Calculate IVs for chunk
         df_with_iv = calculate_ivs_chunk(
