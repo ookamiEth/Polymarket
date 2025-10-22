@@ -301,10 +301,11 @@ def stage2_partitioned_join(
         [pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date).alias("date")]
     )
 
-    date_range = df_constant_lazy.select([
-        pl.col("date").min().alias("min_date"),
-        pl.col("date").max().alias("max_date")
-    ]).collect().row(0)
+    date_range = (
+        df_constant_lazy.select([pl.col("date").min().alias("min_date"), pl.col("date").max().alias("max_date")])
+        .collect()
+        .row(0)
+    )
     start_date, end_date = date_range
     logger.info(f"  Date range: {start_date} to {end_date}")
 
@@ -1015,6 +1016,7 @@ def main() -> None:
         constant_filtered, daily_filtered, stage1_stats = stage1_filter_and_checkpoint(
             args.constant_file, args.daily_file, temp_dir, checkpoint
         )
+        logger.info(f"Stage 1 statistics: {stage1_stats}")
 
         # ==========================================
         # STAGE 2: Partitioned join
