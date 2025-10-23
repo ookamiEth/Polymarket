@@ -37,8 +37,8 @@ import polars as pl
 import psutil
 
 # Constants
-DEFAULT_CONSTANT_IV_FILE = "data/consolidated/quotes_1s_atm_short_dated_with_iv.parquet"
-DEFAULT_DAILY_IV_FILE = "data/consolidated/quotes_1s_atm_short_dated_with_iv_daily_rates.parquet"
+DEFAULT_CONSTANT_IV_FILE = "research/tardis/data/archive/btc_options_atm_shortdated_with_iv_constant_rates_2023_2025.parquet"
+DEFAULT_DAILY_IV_FILE = "research/tardis/data/consolidated/btc_options_atm_shortdated_with_iv_2023_2025.parquet"
 DEFAULT_RATES_FILE = "research/risk_free_rate/data/blended_lending_rates_2023_2025.parquet"
 DEFAULT_OUTPUT_DIR = "research/tardis/analysis/output"
 

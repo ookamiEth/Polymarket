@@ -135,3 +135,5 @@ temp/
 
 # Documentation (separate Chainlink repository)
 documentation/
+
+*.html 
