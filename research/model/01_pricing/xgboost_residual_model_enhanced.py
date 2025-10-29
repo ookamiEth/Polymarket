@@ -23,7 +23,10 @@ Date: 2025-10-29
 from __future__ import annotations
 
 import logging
+import shutil
 import sys
+import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -67,9 +70,9 @@ MICROSTRUCTURE_FEATURES = [
     "range_300s",
     "range_900s",
     "reversals_60s",
-    "reversals_300s",
+    # reversals_300s removed (duplicate - now in ADVANCED_FEATURES)
     "jump_detected",
-    "jump_intensity_300s",
+    # jump_intensity_300s removed (duplicate - now in ADVANCED_FEATURES)
     "autocorr_lag1_300s",
     "autocorr_lag5_300s",
     "hurst_300s",
@@ -251,6 +254,72 @@ def load_and_prepare_data(
     return df
 
 
+class BoosterWrapper:
+    """
+    Wrapper to make xgb.Booster compatible with sklearn-like predict() interface.
+
+    Allows us to use external memory training (xgb.train with Booster API)
+    while maintaining compatibility with existing evaluation code that expects
+    an sklearn-like model with .predict() method.
+    """
+
+    def __init__(self, booster: xgb.Booster):
+        self.booster = booster
+
+    def predict(self, X: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Predict using the Booster."""
+        dmatrix = xgb.DMatrix(X)
+        return self.booster.predict(dmatrix)
+
+    def get_booster(self) -> xgb.Booster:
+        """Return the underlying Booster for feature importance extraction."""
+        return self.booster
+
+
+class DataFrameIterator(xgb.DataIter):
+    """
+    Iterator for XGBoost external memory training.
+
+    Yields batches of data without materializing the full DataFrame in memory.
+    Uses polars lazy row access to avoid memory spikes.
+
+    Args:
+        df: Polars DataFrame with features and target
+        batch_size: Number of rows per batch
+    """
+
+    def __init__(self, df: pl.DataFrame, batch_size: int = 2_000_000):
+        self.df = df
+        self.batch_size = batch_size
+        self.n_rows = len(df)
+        self.n_batches = (self.n_rows + batch_size - 1) // batch_size
+        self.current_batch = 0
+        super().__init__()
+
+    def next(self, input_data: Callable) -> int:  # noqa: A003
+        """Load next batch into input_data callback."""
+        if self.current_batch >= self.n_batches:
+            return 0  # Signal end of iteration
+
+        start_idx = self.current_batch * self.batch_size
+        end_idx = min(start_idx + self.batch_size, self.n_rows)
+
+        # Extract batch (lazy row access via indexing)
+        batch_df = self.df[start_idx:end_idx]
+        X_batch = batch_df.select(ALL_FEATURES).to_numpy()  # noqa: N806
+        y_batch = batch_df["residual"].to_numpy()
+
+        # Pass to XGBoost via callback
+        input_data(data=X_batch, label=y_batch)
+
+        self.current_batch += 1
+        return 1  # Signal successful load
+
+    def reset(self) -> None:
+        """Reset iterator to beginning."""
+        self.current_batch = 0
+
+
 def train_xgboost_model(
     df: pl.DataFrame,
     n_splits: int = 5,
@@ -259,12 +328,16 @@ def train_xgboost_model(
     n_estimators: int = 100,
     subsample: float = 0.8,
     colsample_bytree: float = 0.8,
-) -> tuple[xgb.XGBRegressor, dict]:
+) -> tuple[BoosterWrapper, dict]:
     """
-    Train XGBoost model with time-series cross-validation.
+    Train XGBoost model with external memory support.
+
+    Uses external memory training (ExtMemQuantileDMatrix) for the final model
+    to handle datasets that don't fit in RAM. CV is done on a 20% sample
+    to estimate performance while staying within memory limits.
 
     Args:
-        df: DataFrame with features and residuals
+        df: DataFrame with features and residuals (sorted by timestamp)
         n_splits: Number of CV splits
         max_depth: Maximum tree depth (regularization)
         learning_rate: Learning rate (eta)
@@ -273,27 +346,42 @@ def train_xgboost_model(
         colsample_bytree: Column sampling ratio
 
     Returns:
-        (model, cv_results)
+        (wrapped_booster, cv_results)
     """
     logger.info("=" * 80)
-    logger.info("TRAINING XGBOOST RESIDUAL MODEL")
+    logger.info("TRAINING XGBOOST RESIDUAL MODEL (EXTERNAL MEMORY)")
     logger.info("=" * 80)
 
     # Sort by timestamp for time-series CV
     df = df.sort("timestamp")
 
-    # Extract features and target
-    X = df.select(ALL_FEATURES).to_numpy()  # noqa: N806
-    y = df["residual"].to_numpy()
-
+    n_samples = len(df)
     logger.info(f"Features: {len(ALL_FEATURES)}")
-    logger.info(f"Samples: {len(X):,}")
+    logger.info(f"Total samples: {n_samples:,}")
     logger.info("Hyperparameters:")
     logger.info(f"  max_depth: {max_depth}")
     logger.info(f"  learning_rate: {learning_rate}")
     logger.info(f"  n_estimators: {n_estimators}")
     logger.info(f"  subsample: {subsample}")
     logger.info(f"  colsample_bytree: {colsample_bytree}")
+
+    # =========================================================================
+    # PART 1: Cross-Validation on 20% Sample (In-Memory)
+    # =========================================================================
+    logger.info("\n" + "=" * 80)
+    logger.info("CROSS-VALIDATION (20% SAMPLE)")
+    logger.info("=" * 80)
+
+    # Sample 20% of data for CV (stratified by time)
+    sample_size = max(int(n_samples * 0.2), 100_000)
+    sample_step = max(n_samples // sample_size, 1)
+    cv_df = df[::sample_step]
+
+    logger.info(f"CV sample size: {len(cv_df):,} ({len(cv_df) / n_samples * 100:.1f}%)")
+
+    # Extract features for CV
+    X_cv = cv_df.select(ALL_FEATURES).to_numpy()  # noqa: N806
+    y_cv = cv_df["residual"].to_numpy()
 
     # Time-series cross-validation
     tscv = TimeSeriesSplit(n_splits=n_splits)
@@ -307,13 +395,13 @@ def train_xgboost_model(
 
     logger.info(f"\nRunning {n_splits}-fold time-series cross-validation...")
 
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X_cv)):
         logger.info(f"\nFold {fold + 1}/{n_splits}")
         logger.info(f"  Train: {len(train_idx):,} samples")
         logger.info(f"  Val:   {len(val_idx):,} samples")
 
-        X_train, X_val = X[train_idx], X[val_idx]  # noqa: N806
-        y_train, y_val = y[train_idx], y[val_idx]
+        X_train, X_val = X_cv[train_idx], X_cv[val_idx]  # noqa: N806
+        y_train, y_val = y_cv[train_idx], y_cv[val_idx]
 
         # Train model
         model = xgb.XGBRegressor(
@@ -349,50 +437,96 @@ def train_xgboost_model(
     logger.info("=" * 80)
     logger.info(f"Mean Train MSE: {np.mean(cv_results['train_mse']):.6f} ± {np.std(cv_results['train_mse']):.6f}")
     logger.info(f"Mean Val MSE:   {np.mean(cv_results['val_mse']):.6f} ± {np.std(cv_results['val_mse']):.6f}")
+    logger.info("NOTE: CV estimates from 20% sample. Full model trained on 100% of data.")
 
-    # Train final model on all data
-    logger.info("\nTraining final model on all data...")
-    final_model = xgb.XGBRegressor(
-        max_depth=max_depth,
-        learning_rate=learning_rate,
-        n_estimators=n_estimators,
-        subsample=subsample,
-        colsample_bytree=colsample_bytree,
-        objective="reg:squarederror",
-        random_state=42,
-        n_jobs=-1,
-    )
-    final_model.fit(X, y, verbose=False)
+    # Clean up CV arrays
+    del X_cv, y_cv, cv_df
 
-    # Report feature importances
-    logger.info("\nFeature importances (top 10 by gain):")
-    importances = final_model.get_booster().get_score(importance_type="gain")
+    # =========================================================================
+    # PART 2: Final Model Training with External Memory
+    # =========================================================================
+    logger.info("\n" + "=" * 80)
+    logger.info("TRAINING FINAL MODEL (EXTERNAL MEMORY - 100% DATA)")
+    logger.info("=" * 80)
 
-    # Map feature indices to names
-    feature_importance = []
-    for i, feature_name in enumerate(ALL_FEATURES):
-        feat_key = f"f{i}"
-        if feat_key in importances:
-            feature_importance.append((feature_name, importances[feat_key]))
+    cache_dir = None
+    try:
+        # Create temporary cache directory
+        cache_dir = tempfile.mkdtemp(prefix="xgb_cache_")
+        cache_prefix = f"{cache_dir}/cache"
+        logger.info(f"Using cache: {cache_prefix}")
 
-    feature_importance.sort(key=lambda x: x[1], reverse=True)
+        # Create iterator for external memory training
+        iterator = DataFrameIterator(df, batch_size=2_000_000)
 
-    for feat, importance in feature_importance[:10]:
-        logger.info(f"  {feat}: {importance:.2f}")
+        # Create external memory DMatrix
+        logger.info("Creating ExtMemQuantileDMatrix (batched loading)...")
+        Xy = xgb.ExtMemQuantileDMatrix(  # noqa: N806
+            iterator,
+            enable_categorical=False,
+            nthread=4,
+        )
 
-    return final_model, cv_results
+        # Set parameters for xgb.train API
+        params = {
+            "max_depth": max_depth,
+            "learning_rate": learning_rate,
+            "subsample": subsample,
+            "colsample_bytree": colsample_bytree,
+            "objective": "reg:squarederror",
+            "seed": 42,
+            "nthread": 4,  # Limit parallelism to control memory
+        }
+
+        # Train using Booster API
+        logger.info(f"Training booster ({n_estimators} rounds)...")
+        booster = xgb.train(
+            params,
+            Xy,
+            num_boost_round=n_estimators,
+            verbose_eval=False,
+        )
+
+        logger.info("✅ External memory training complete")
+
+        # Wrap booster for sklearn-like interface
+        final_model = BoosterWrapper(booster)
+
+        # Report feature importances
+        logger.info("\nFeature importances (top 10 by gain):")
+        importances = final_model.get_booster().get_score(importance_type="gain")
+
+        # Map feature indices to names
+        feature_importance = []
+        for i, feature_name in enumerate(ALL_FEATURES):
+            feat_key = f"f{i}"
+            if feat_key in importances:
+                feature_importance.append((feature_name, importances[feat_key]))
+
+        feature_importance.sort(key=lambda x: x[1], reverse=True)
+
+        for feat, importance in feature_importance[:10]:
+            logger.info(f"  {feat}: {importance:.2f}")
+
+        return final_model, cv_results
+
+    finally:
+        # Clean up cache directory
+        if cache_dir and Path(cache_dir).exists():
+            logger.info(f"Cleaning up cache: {cache_dir}")
+            shutil.rmtree(cache_dir)
 
 
 def apply_xgboost_corrections(
     df: pl.DataFrame,
-    model: xgb.XGBRegressor,
+    model: xgb.XGBRegressor | BoosterWrapper,
 ) -> pl.DataFrame:
     """
     Apply XGBoost residual corrections to baseline predictions.
 
     Args:
         df: DataFrame with baseline predictions and features
-        model: Trained XGBoost model
+        model: Trained XGBoost model (XGBRegressor or BoosterWrapper)
 
     Returns:
         DataFrame with corrected predictions
