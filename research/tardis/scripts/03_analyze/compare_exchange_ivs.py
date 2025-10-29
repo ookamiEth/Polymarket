@@ -7,17 +7,13 @@ against the ground truth (exchange IVs) on the same options data.
 """
 
 import logging
-import sys
-from datetime import datetime
 
 import numpy as np
 import polars as pl
 from py_vollib_vectorized import vectorized_implied_volatility
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -43,11 +39,7 @@ def load_spot_data(spot_file: str, target_date: str) -> pl.DataFrame:
     df = pl.read_parquet(spot_file)
 
     # Convert timestamp to datetime with UTC timezone
-    df = df.with_columns([
-        pl.from_epoch(pl.col("timestamp"), time_unit="us")
-        .dt.replace_time_zone("UTC")
-        .alias("time")
-    ])
+    df = df.with_columns([pl.from_epoch(pl.col("timestamp"), time_unit="us").dt.replace_time_zone("UTC").alias("time")])
 
     # Filter to target date
     df = df.filter(pl.col("time").dt.date() == pl.date(*[int(x) for x in target_date.split("-")]))
@@ -76,27 +68,25 @@ def load_options_with_exchange_ivs(options_file: str, target_date: str) -> pl.Da
 
     # Filter to target date and BTC options only
     df = df.filter(
-        (pl.from_epoch(pl.col("timestamp"), time_unit="us").dt.date()
-         == pl.date(*[int(x) for x in target_date.split("-")])) &
-        (pl.col("underlying") == "BTC")
+        (
+            pl.from_epoch(pl.col("timestamp"), time_unit="us").dt.date()
+            == pl.date(*[int(x) for x in target_date.split("-")])
+        )
+        & (pl.col("underlying") == "BTC")
     )
 
     # Convert timestamp to datetime with UTC
-    df = df.with_columns([
-        pl.from_epoch(pl.col("timestamp"), time_unit="us")
-        .dt.replace_time_zone("UTC")
-        .alias("time")
-    ])
+    df = df.with_columns([pl.from_epoch(pl.col("timestamp"), time_unit="us").dt.replace_time_zone("UTC").alias("time")])
 
     # Filter to options with valid exchange IVs and prices
     df = df.filter(
-        pl.col("bid_iv").is_not_null() &
-        pl.col("ask_iv").is_not_null() &
-        pl.col("bid_price").is_not_null() &
-        pl.col("ask_price").is_not_null() &
-        (pl.col("bid_price") > 0) &
-        (pl.col("ask_price") > 0) &
-        (pl.col("days_to_expiry") > 0)
+        pl.col("bid_iv").is_not_null()
+        & pl.col("ask_iv").is_not_null()
+        & pl.col("bid_price").is_not_null()
+        & pl.col("ask_price").is_not_null()
+        & (pl.col("bid_price") > 0)
+        & (pl.col("ask_price") > 0)
+        & (pl.col("days_to_expiry") > 0)
     )
 
     df = df.collect()
@@ -125,31 +115,29 @@ def calculate_our_ivs(df: pl.DataFrame, spot_df: pl.DataFrame) -> pl.DataFrame:
     df = df.join_asof(spot_df, on="time", suffix="_spot")
 
     # Convert time to expiry (days_to_expiry → years)
-    df = df.with_columns([
-        (pl.col("days_to_expiry") / 365.0).alias("time_to_expiry")
-    ])
+    # Using 365.25 to account for leap years (crypto trades 24/7/365)
+    df = df.with_columns([(pl.col("days_to_expiry") / 365.25).alias("time_to_expiry")])
 
     # Parse option type from type column (already has "call"/"put")
-    df = df.with_columns([
-        pl.when(pl.col("type").str.to_lowercase() == "call")
-        .then(pl.lit("c"))
-        .otherwise(pl.lit("p"))
-        .alias("flag")
-    ])
+    df = df.with_columns(
+        [pl.when(pl.col("type").str.to_lowercase() == "call").then(pl.lit("c")).otherwise(pl.lit("p")).alias("flag")]
+    )
 
     # CRITICAL: Convert BTC-denominated option prices to USD
     # Deribit quotes option prices in BTC, but strikes/spots are in USD
-    df = df.with_columns([
-        (pl.col("bid_price") * pl.col("price")).alias("bid_price_usd"),
-        (pl.col("ask_price") * pl.col("price")).alias("ask_price_usd"),
-    ])
+    df = df.with_columns(
+        [
+            (pl.col("bid_price") * pl.col("price")).alias("bid_price_usd"),
+            (pl.col("ask_price") * pl.col("price")).alias("ask_price_usd"),
+        ]
+    )
 
     # Filter out invalid data
     df = df.filter(
-        pl.col("time_to_expiry").is_not_null() &
-        (pl.col("time_to_expiry") > 0) &
-        pl.col("price").is_not_null() &
-        (pl.col("price") > 0)
+        pl.col("time_to_expiry").is_not_null()
+        & (pl.col("time_to_expiry") > 0)
+        & pl.col("price").is_not_null()
+        & (pl.col("price") > 0)
     )
 
     logger.info(f"  {len(df):,} options ready for IV calculation")
@@ -197,12 +185,12 @@ def calculate_our_ivs(df: pl.DataFrame, spot_df: pl.DataFrame) -> pl.DataFrame:
 
     # Filter to successful IV calculations
     df = df.filter(
-        pl.col("calc_iv_bid").is_not_null() &
-        pl.col("calc_iv_ask").is_not_null() &
-        pl.col("calc_iv_bid").is_finite() &
-        pl.col("calc_iv_ask").is_finite() &
-        (pl.col("calc_iv_bid") > 0) &
-        (pl.col("calc_iv_ask") > 0)
+        pl.col("calc_iv_bid").is_not_null()
+        & pl.col("calc_iv_ask").is_not_null()
+        & pl.col("calc_iv_bid").is_finite()
+        & pl.col("calc_iv_ask").is_finite()
+        & (pl.col("calc_iv_bid") > 0)
+        & (pl.col("calc_iv_ask") > 0)
     )
 
     logger.info(f"  Successfully calculated IVs for {len(df):,} options")
@@ -222,52 +210,64 @@ def generate_comparison_metrics(df: pl.DataFrame) -> None:
     logger.info("=" * 80)
 
     # Convert IVs to percentages for display
-    df = df.with_columns([
-        (pl.col("calc_iv_bid") * 100).alias("calc_iv_bid_pct"),
-        (pl.col("calc_iv_ask") * 100).alias("calc_iv_ask_pct"),
-        (pl.col("bid_iv")).alias("exch_iv_bid_pct"),  # Already in percentage
-        (pl.col("ask_iv")).alias("exch_iv_ask_pct"),  # Already in percentage
-    ])
+    df = df.with_columns(
+        [
+            (pl.col("calc_iv_bid") * 100).alias("calc_iv_bid_pct"),
+            (pl.col("calc_iv_ask") * 100).alias("calc_iv_ask_pct"),
+            (pl.col("bid_iv")).alias("exch_iv_bid_pct"),  # Already in percentage
+            (pl.col("ask_iv")).alias("exch_iv_ask_pct"),  # Already in percentage
+        ]
+    )
 
     # Calculate differences
-    df = df.with_columns([
-        (pl.col("calc_iv_bid_pct") - pl.col("exch_iv_bid_pct")).alias("diff_bid"),
-        (pl.col("calc_iv_ask_pct") - pl.col("exch_iv_ask_pct")).alias("diff_ask"),
-    ])
+    df = df.with_columns(
+        [
+            (pl.col("calc_iv_bid_pct") - pl.col("exch_iv_bid_pct")).alias("diff_bid"),
+            (pl.col("calc_iv_ask_pct") - pl.col("exch_iv_ask_pct")).alias("diff_ask"),
+        ]
+    )
 
     # Summary statistics
     logger.info("\nBID IV Statistics:")
     logger.info(f"  Total options: {len(df):,}")
-    logger.info(f"  Calculated IV:  mean={df['calc_iv_bid_pct'].mean():.2f}%, "
-                f"median={df['calc_iv_bid_pct'].median():.2f}%, "
-                f"std={df['calc_iv_bid_pct'].std():.2f}%")
-    logger.info(f"  Exchange IV:    mean={df['exch_iv_bid_pct'].mean():.2f}%, "
-                f"median={df['exch_iv_bid_pct'].median():.2f}%, "
-                f"std={df['exch_iv_bid_pct'].std():.2f}%")
-    logger.info(f"  Difference:     mean={df['diff_bid'].mean():.2f}%, "
-                f"median={df['diff_bid'].median():.2f}%, "
-                f"MAE={df['diff_bid'].abs().mean():.2f}%")
+    logger.info(
+        f"  Calculated IV:  mean={df['calc_iv_bid_pct'].mean():.2f}%, "
+        f"median={df['calc_iv_bid_pct'].median():.2f}%, "
+        f"std={df['calc_iv_bid_pct'].std():.2f}%"
+    )
+    logger.info(
+        f"  Exchange IV:    mean={df['exch_iv_bid_pct'].mean():.2f}%, "
+        f"median={df['exch_iv_bid_pct'].median():.2f}%, "
+        f"std={df['exch_iv_bid_pct'].std():.2f}%"
+    )
+    logger.info(
+        f"  Difference:     mean={df['diff_bid'].mean():.2f}%, "
+        f"median={df['diff_bid'].median():.2f}%, "
+        f"MAE={df['diff_bid'].abs().mean():.2f}%"
+    )
 
     # Correlation
-    corr_bid = df.select([
-        pl.corr("calc_iv_bid_pct", "exch_iv_bid_pct").alias("corr")
-    ]).item(0, 0)
+    corr_bid = df.select([pl.corr("calc_iv_bid_pct", "exch_iv_bid_pct").alias("corr")]).item(0, 0)
     logger.info(f"  Correlation: {corr_bid:.4f}")
 
     logger.info("\nASK IV Statistics:")
-    logger.info(f"  Calculated IV:  mean={df['calc_iv_ask_pct'].mean():.2f}%, "
-                f"median={df['calc_iv_ask_pct'].median():.2f}%, "
-                f"std={df['calc_iv_ask_pct'].std():.2f}%")
-    logger.info(f"  Exchange IV:    mean={df['exch_iv_ask_pct'].mean():.2f}%, "
-                f"median={df['exch_iv_ask_pct'].median():.2f}%, "
-                f"std={df['exch_iv_ask_pct'].std():.2f}%")
-    logger.info(f"  Difference:     mean={df['diff_ask'].mean():.2f}%, "
-                f"median={df['diff_ask'].median():.2f}%, "
-                f"MAE={df['diff_ask'].abs().mean():.2f}%")
+    logger.info(
+        f"  Calculated IV:  mean={df['calc_iv_ask_pct'].mean():.2f}%, "
+        f"median={df['calc_iv_ask_pct'].median():.2f}%, "
+        f"std={df['calc_iv_ask_pct'].std():.2f}%"
+    )
+    logger.info(
+        f"  Exchange IV:    mean={df['exch_iv_ask_pct'].mean():.2f}%, "
+        f"median={df['exch_iv_ask_pct'].median():.2f}%, "
+        f"std={df['exch_iv_ask_pct'].std():.2f}%"
+    )
+    logger.info(
+        f"  Difference:     mean={df['diff_ask'].mean():.2f}%, "
+        f"median={df['diff_ask'].median():.2f}%, "
+        f"MAE={df['diff_ask'].abs().mean():.2f}%"
+    )
 
-    corr_ask = df.select([
-        pl.corr("calc_iv_ask_pct", "exch_iv_ask_pct").alias("corr")
-    ]).item(0, 0)
+    corr_ask = df.select([pl.corr("calc_iv_ask_pct", "exch_iv_ask_pct").alias("corr")]).item(0, 0)
     logger.info(f"  Correlation: {corr_ask:.4f}")
 
     # Show sample comparisons
@@ -275,15 +275,17 @@ def generate_comparison_metrics(df: pl.DataFrame) -> None:
     logger.info("SAMPLE COMPARISONS (10 examples)")
     logger.info("=" * 80)
 
-    sample = df.select([
-        "symbol",
-        "strike_price",
-        "flag",
-        "days_to_expiry",
-        "calc_iv_bid_pct",
-        "exch_iv_bid_pct",
-        "diff_bid",
-    ]).head(10)
+    sample = df.select(
+        [
+            "symbol",
+            "strike_price",
+            "flag",
+            "days_to_expiry",
+            "calc_iv_bid_pct",
+            "exch_iv_bid_pct",
+            "diff_bid",
+        ]
+    ).head(10)
 
     print()
     print(sample)
@@ -294,16 +296,16 @@ def generate_comparison_metrics(df: pl.DataFrame) -> None:
     logger.info("DIFFERENCE DISTRIBUTION (Calculated - Exchange)")
     logger.info("=" * 80)
 
-    bins = [-float('inf'), -5, -2, -1, 1, 2, 5, float('inf')]
+    bins = [-float("inf"), -5, -2, -1, 1, 2, 5, float("inf")]
     labels = ["< -5%", "-5% to -2%", "-2% to -1%", "-1% to +1%", "+1% to +2%", "+2% to +5%", "> +5%"]
 
     for i in range(len(labels)):
         if i == 0:
-            count = df.filter(pl.col("diff_bid") < bins[i+1]).height
+            count = df.filter(pl.col("diff_bid") < bins[i + 1]).height
         elif i == len(labels) - 1:
             count = df.filter(pl.col("diff_bid") >= bins[i]).height
         else:
-            count = df.filter((pl.col("diff_bid") >= bins[i]) & (pl.col("diff_bid") < bins[i+1])).height
+            count = df.filter((pl.col("diff_bid") >= bins[i]) & (pl.col("diff_bid") < bins[i + 1])).height
 
         pct = count / len(df) * 100
         logger.info(f"  {labels[i]:<15}: {count:>7,} ({pct:>5.1f}%)")
@@ -313,8 +315,8 @@ def generate_comparison_metrics(df: pl.DataFrame) -> None:
     logger.info("VALIDATION RESULT")
     logger.info("=" * 80)
 
-    mae_bid = df['diff_bid'].abs().mean()
-    mae_ask = df['diff_ask'].abs().mean()
+    mae_bid = df["diff_bid"].abs().mean()
+    mae_ask = df["diff_ask"].abs().mean()
 
     if mae_bid <= 5.0 and mae_ask <= 5.0 and corr_bid >= 0.90 and corr_ask >= 0.90:
         logger.info("✓ SUCCESS: Our IV calculations closely match exchange IVs!")

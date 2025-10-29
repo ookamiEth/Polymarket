@@ -80,12 +80,18 @@ CONTEXT_FEATURES = [
 ALL_FEATURES = RV_FEATURES + MICROSTRUCTURE_FEATURES + CONTEXT_FEATURES
 
 
-def load_and_prepare_data(pilot: bool = False) -> pl.DataFrame:
+def load_and_prepare_data(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    pilot: bool = False,
+) -> pl.DataFrame:
     """
     Load baseline predictions and join with features.
 
     Args:
-        pilot: If True, filter to October 2023 only
+        start_date: Start date for filtering (YYYY-MM-DD format)
+        end_date: End date for filtering (YYYY-MM-DD format)
+        pilot: If True, filter to October 2023 only (overrides start/end dates)
 
     Returns:
         DataFrame with predictions, features, and residuals
@@ -99,12 +105,21 @@ def load_and_prepare_data(pilot: bool = False) -> pl.DataFrame:
     df = pl.read_parquet(BASELINE_FILE)
     logger.info(f"Loaded {len(df):,} rows")
 
+    # Apply date filtering
     if pilot:
         logger.info("Filtering to October 2023 pilot...")
         from datetime import date
 
         df = df.filter((pl.col("date") >= date(2023, 10, 1)) & (pl.col("date") <= date(2023, 10, 31)))
         logger.info(f"Pilot data: {len(df):,} rows")
+    elif start_date and end_date:
+        logger.info(f"Filtering to date range {start_date} to {end_date}...")
+        from datetime import date
+
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+        df = df.filter((pl.col("date") >= start) & (pl.col("date") <= end))
+        logger.info(f"Filtered data: {len(df):,} rows")
 
     # Calculate residuals
     logger.info("Calculating residuals...")
@@ -396,58 +411,141 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=0.05, help="Learning rate (eta)")
     parser.add_argument("--n-estimators", type=int, default=100, help="Number of boosting rounds")
     parser.add_argument("--n-splits", type=int, default=5, help="Number of CV splits")
+    # Train/val/test split arguments
+    parser.add_argument("--train-start", type=str, help="Train start date (YYYY-MM-DD)")
+    parser.add_argument("--train-end", type=str, help="Train end date (YYYY-MM-DD)")
+    parser.add_argument("--val-start", type=str, help="Validation start date (YYYY-MM-DD)")
+    parser.add_argument("--val-end", type=str, help="Validation end date (YYYY-MM-DD)")
+    parser.add_argument("--test-start", type=str, help="Test start date (YYYY-MM-DD)")
+    parser.add_argument("--test-end", type=str, help="Test end date (YYYY-MM-DD)")
     args = parser.parse_args()
 
     logger.info("=" * 80)
     logger.info("TIER 3: XGBOOST RESIDUAL MODEL")
     logger.info("=" * 80)
-    logger.info(f"Pilot mode: {args.pilot}")
-    logger.info(f"Max depth: {args.max_depth}")
-    logger.info(f"Learning rate: {args.learning_rate}")
-    logger.info(f"N estimators: {args.n_estimators}")
-    logger.info(f"CV splits: {args.n_splits}")
 
-    # Load and prepare data
-    df = load_and_prepare_data(pilot=args.pilot)
+    # Check if using train/val/test split or legacy single-dataset mode
+    use_split = all([args.train_start, args.train_end, args.test_start, args.test_end])
 
-    # Train model
-    model, _cv_results = train_xgboost_model(
-        df,
-        n_splits=args.n_splits,
-        max_depth=args.max_depth,
-        learning_rate=args.learning_rate,
-        n_estimators=args.n_estimators,
-    )
+    if use_split:
+        logger.info("USING TRAIN/VAL/TEST SPLIT MODE")
+        logger.info(f"Train period: {args.train_start} to {args.train_end}")
+        if args.val_start and args.val_end:
+            logger.info(f"Validation period: {args.val_start} to {args.val_end}")
+        logger.info(f"Test period: {args.test_start} to {args.test_end}")
+        logger.info(f"Max depth: {args.max_depth}")
+        logger.info(f"Learning rate: {args.learning_rate}")
+        logger.info(f"N estimators: {args.n_estimators}")
+        logger.info(f"CV splits: {args.n_splits}")
 
-    # Apply corrections
-    df = apply_xgboost_corrections(df, model)
+        # Load train/val/test datasets
+        logger.info("\n" + "=" * 80)
+        logger.info("LOADING TRAIN SET")
+        df_train = load_and_prepare_data(start_date=args.train_start, end_date=args.train_end)
 
-    # Evaluate
-    _results = evaluate_performance(df)
+        if args.val_start and args.val_end:
+            logger.info("\n" + "=" * 80)
+            logger.info("LOADING VALIDATION SET")
+            df_val = load_and_prepare_data(start_date=args.val_start, end_date=args.val_end)
 
-    # Save results
-    output_file = OUTPUT_DIR / (
-        "xgboost_residual_model_pilot.parquet" if args.pilot else "xgboost_residual_model_full.parquet"
-    )
-    logger.info(f"\nSaving results to {output_file}...")
+        logger.info("\n" + "=" * 80)
+        logger.info("LOADING TEST SET")
+        df_test = load_and_prepare_data(start_date=args.test_start, end_date=args.test_end)
 
-    df.select(
-        [
-            "contract_id",
-            "timestamp",
-            "seconds_offset",
-            "S",
-            "K",
-            "prob_mid",
-            "prob_corrected_xgb",
-            "residual",
-            "residual_pred_xgb",
-            "outcome",
-        ]
-        + ALL_FEATURES
-    ).write_parquet(output_file)
+        # Train model ONLY on training set
+        model, _cv_results = train_xgboost_model(
+            df_train,
+            n_splits=args.n_splits,
+            max_depth=args.max_depth,
+            learning_rate=args.learning_rate,
+            n_estimators=args.n_estimators,
+        )
 
-    logger.info("=" * 80)
+        # Evaluate on validation set (if provided)
+        if args.val_start and args.val_end:
+            logger.info("\n" + "=" * 80)
+            logger.info("VALIDATION SET PERFORMANCE")
+            logger.info("=" * 80)
+            df_val = apply_xgboost_corrections(df_val, model)
+            _val_results = evaluate_performance(df_val)
+
+        # Evaluate on test set (FINAL HONEST METRICS)
+        logger.info("\n" + "=" * 80)
+        logger.info("TEST SET PERFORMANCE (FINAL)")
+        logger.info("=" * 80)
+        df_test = apply_xgboost_corrections(df_test, model)
+        _test_results = evaluate_performance(df_test)
+
+        # Save test set results
+        output_file = OUTPUT_DIR / f"xgboost_residual_model_test_{args.test_start}_{args.test_end}.parquet"
+        logger.info(f"\nSaving test set results to {output_file}...")
+
+        df_test.select(
+            [
+                "contract_id",
+                "timestamp",
+                "seconds_offset",
+                "S",
+                "K",
+                "prob_mid",
+                "prob_corrected_xgb",
+                "residual",
+                "residual_pred_xgb",
+                "outcome",
+            ]
+            + ALL_FEATURES
+        ).write_parquet(output_file)
+
+    else:
+        # Legacy mode - single dataset (for backward compatibility)
+        logger.info("LEGACY MODE - SINGLE DATASET (WARNING: No train/test split!)")
+        logger.info(f"Pilot mode: {args.pilot}")
+        logger.info(f"Max depth: {args.max_depth}")
+        logger.info(f"Learning rate: {args.learning_rate}")
+        logger.info(f"N estimators: {args.n_estimators}")
+        logger.info(f"CV splits: {args.n_splits}")
+
+        # Load and prepare data
+        df = load_and_prepare_data(pilot=args.pilot)
+
+        # Train model
+        model, _cv_results = train_xgboost_model(
+            df,
+            n_splits=args.n_splits,
+            max_depth=args.max_depth,
+            learning_rate=args.learning_rate,
+            n_estimators=args.n_estimators,
+        )
+
+        # Apply corrections
+        df = apply_xgboost_corrections(df, model)
+
+        # Evaluate
+        _results = evaluate_performance(df)
+
+        # Save results
+        output_file = OUTPUT_DIR / (
+            "xgboost_residual_model_pilot.parquet" if args.pilot else "xgboost_residual_model_full.parquet"
+        )
+        logger.info(f"\nSaving results to {output_file}...")
+
+        df.select(
+            [
+                "contract_id",
+                "timestamp",
+                "seconds_offset",
+                "S",
+                "K",
+                "prob_mid",
+                "prob_corrected_xgb",
+                "residual",
+                "residual_pred_xgb",
+                "outcome",
+            ]
+            + ALL_FEATURES
+        ).write_parquet(output_file)
+
+    logger.info("\n" + "=" * 80)
     logger.info("COMPLETE")
     logger.info("=" * 80)
 
