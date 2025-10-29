@@ -109,10 +109,12 @@ class ProfessionalVisualizer:
             cal_data = self._calculate_calibration_with_ci(price_col, n_bins=15, n_bootstrap=1000)
 
             # Plot main calibration points
+            # Scale dot size: min 30, max 300 based on sample count
+            sizes = np.clip(cal_data['counts'] / 1000, 30, 300)
             ax.scatter(
                 cal_data['bin_centers'],
                 cal_data['actual_rates'],
-                s=cal_data['counts'] / 50,
+                s=sizes,
                 c=color,
                 alpha=0.8,
                 edgecolors='white',
