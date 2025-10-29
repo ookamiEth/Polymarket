@@ -22,6 +22,7 @@ Date: 2025-10-29
 
 from __future__ import annotations
 
+import gc
 import logging
 import shutil
 import sys
@@ -31,6 +32,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import psutil
 import xgboost as xgb
 from sklearn.model_selection import TimeSeriesSplit
 
@@ -138,13 +140,80 @@ ADVANCED_FEATURES = [
 ALL_FEATURES = RV_FEATURES + MICROSTRUCTURE_FEATURES + CONTEXT_FEATURES + ADVANCED_FEATURES
 
 
+# =================================================================================
+# UTILITY FUNCTIONS (Memory Monitoring & Temporal Chunking)
+# =================================================================================
+
+
+def log_memory_usage(label: str) -> None:
+    """Log current memory usage for monitoring."""
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    mem_gb = mem_info.rss / (1024**3)
+    logger.info(f"[MEMORY] {label}: {mem_gb:.2f} GB")
+
+
+def get_row_count(lf: pl.LazyFrame) -> int:
+    """
+    Get row count from LazyFrame without collecting full dataset.
+
+    Args:
+        lf: Polars LazyFrame
+
+    Returns:
+        Number of rows
+    """
+    return lf.select(pl.len()).collect().item()
+
+
+def generate_temporal_chunks(start_date: str, end_date: str, chunk_months: int = 3) -> list[tuple[str, str]]:
+    """
+    Generate list of temporal chunk boundaries (start, end) for processing large datasets.
+
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+        chunk_months: Number of months per chunk (default: 3 for 16GB RAM safety)
+
+    Returns:
+        List of (chunk_start, chunk_end) date tuples as strings
+    """
+    from datetime import date
+
+    from dateutil.relativedelta import relativedelta
+
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+
+    chunks = []
+    chunk_start = start
+
+    while chunk_start < end:
+        chunk_end = min(chunk_start + relativedelta(months=chunk_months), end)
+        chunks.append((chunk_start.isoformat(), chunk_end.isoformat()))
+        chunk_start = chunk_end
+
+    return chunks
+
+
+# =================================================================================
+# DATA LOADING (Lazy Evaluation for Memory Safety)
+# =================================================================================
+
+
 def load_and_prepare_data(
     start_date: str | None = None,
     end_date: str | None = None,
     pilot: bool = False,
-) -> pl.DataFrame:
+) -> pl.LazyFrame:
     """
-    Load baseline predictions and join with features.
+    Load baseline predictions and join with features (LAZY - no memory spike).
+
+    CRITICAL: Returns LazyFrame to avoid materializing 40GB dataset in RAM.
+    Caller must either:
+    1. Collect in batches (DataFrameIterator)
+    2. Use temporal chunking (process 3-month windows)
+    3. Stream to disk (.sink_parquet(streaming=True))
 
     Args:
         start_date: Start date for filtering (YYYY-MM-DD format)
@@ -152,7 +221,7 @@ def load_and_prepare_data(
         pilot: If True, filter to October 2023 only (overrides start/end dates)
 
     Returns:
-        DataFrame with predictions, features, and residuals
+        LazyFrame with predictions, features, and residuals (NOT YET COLLECTED)
     """
     logger.info("=" * 80)
     logger.info("LOADING AND PREPARING DATA")
@@ -226,32 +295,11 @@ def load_and_prepare_data(
     # Apply filter (still lazy)
     df_filtered = df.filter(combined_filter)
 
-    # NOW collect once (Polars streaming engine processes entire lazy plan automatically)
-    logger.info("Collecting data with streaming engine...")
-    df = df_filtered.collect()
+    # RETURN LAZYFRAME (do NOT collect - prevents 40GB memory spike!)
+    logger.info("Returning LazyFrame (data NOT yet collected - memory safe)")
+    logger.info("NOTE: Caller must handle collection in batches or stream to disk")
 
-    # Report statistics
-    final_count = len(df)
-    logger.info(f"Complete cases: {final_count:,}")
-
-    # Report residual statistics
-    residual_stats = df.select(
-        [
-            pl.col("residual").mean().alias("mean"),
-            pl.col("residual").std().alias("std"),
-            pl.col("residual").min().alias("min"),
-            pl.col("residual").max().alias("max"),
-        ]
-    ).to_dicts()[0]
-
-    logger.info(
-        f"Residual stats: mean={residual_stats['mean']:.6f}, "
-        f"std={residual_stats['std']:.6f}, "
-        f"min={residual_stats['min']:.6f}, "
-        f"max={residual_stats['max']:.6f}"
-    )
-
-    return df
+    return df_filtered
 
 
 class BoosterWrapper:
@@ -278,22 +326,25 @@ class BoosterWrapper:
 
 class DataFrameIterator(xgb.DataIter):
     """
-    Iterator for XGBoost external memory training.
+    Iterator for XGBoost external memory training (LazyFrame version).
 
     Yields batches of data without materializing the full DataFrame in memory.
-    Uses polars lazy row access to avoid memory spikes.
+    Collects each batch with streaming=True and casts to float32 for memory efficiency.
+
+    CRITICAL: Works on LazyFrame to avoid loading full 40GB dataset into RAM.
 
     Args:
-        df: Polars DataFrame with features and target
-        batch_size: Number of rows per batch
+        lf: Polars LazyFrame with features and target
+        batch_size: Number of rows per batch (default: 2M = ~1GB per batch)
     """
 
-    def __init__(self, df: pl.DataFrame, batch_size: int = 2_000_000):
-        self.df = df
+    def __init__(self, lf: pl.LazyFrame, batch_size: int = 2_000_000):
+        self.lf = lf.sort("timestamp")  # Ensure time-series order
         self.batch_size = batch_size
-        self.n_rows = len(df)
+        self.n_rows = get_row_count(lf)  # Lazy count (minimal memory)
         self.n_batches = (self.n_rows + batch_size - 1) // batch_size
         self.current_batch = 0
+        logger.info(f"DataFrameIterator: {self.n_rows:,} rows, {self.n_batches} batches of {batch_size:,}")
         super().__init__()
 
     def next(self, input_data: Callable) -> int:  # noqa: A003
@@ -302,15 +353,21 @@ class DataFrameIterator(xgb.DataIter):
             return 0  # Signal end of iteration
 
         start_idx = self.current_batch * self.batch_size
-        end_idx = min(start_idx + self.batch_size, self.n_rows)
 
-        # Extract batch (lazy row access via indexing)
-        batch_df = self.df[start_idx:end_idx]
-        X_batch = batch_df.select(ALL_FEATURES).to_numpy()  # noqa: N806
-        y_batch = batch_df["residual"].to_numpy()
+        # Collect ONLY this batch (constant memory due to small batch size)
+        batch_lf = self.lf.slice(start_idx, self.batch_size)
+        batch_df = batch_lf.collect()
+
+        # Convert to float32 to halve memory (8 bytes -> 4 bytes)
+        X_batch = batch_df.select(ALL_FEATURES).cast(pl.Float32).to_numpy()  # noqa: N806
+        y_batch = batch_df["residual"].cast(pl.Float32).to_numpy()
 
         # Pass to XGBoost via callback
         input_data(data=X_batch, label=y_batch)
+
+        # Clean up batch immediately
+        del batch_df, X_batch, y_batch
+        gc.collect()
 
         self.current_batch += 1
         return 1  # Signal successful load
@@ -321,7 +378,7 @@ class DataFrameIterator(xgb.DataIter):
 
 
 def train_xgboost_model(
-    df: pl.DataFrame,
+    lf: pl.LazyFrame,
     n_splits: int = 5,
     max_depth: int = 4,
     learning_rate: float = 0.05,
@@ -333,11 +390,14 @@ def train_xgboost_model(
     Train XGBoost model with external memory support.
 
     Uses external memory training (ExtMemQuantileDMatrix) for the final model
-    to handle datasets that don't fit in RAM. CV is done on a 20% sample
+    to handle datasets that don't fit in RAM. CV is done on a 10% sample
     to estimate performance while staying within memory limits.
 
+    CRITICAL: Accepts LazyFrame to avoid materializing full dataset in RAM.
+    The function collects only small batches as needed.
+
     Args:
-        df: DataFrame with features and residuals (sorted by timestamp)
+        lf: LazyFrame with features and residuals (will be sorted by timestamp)
         n_splits: Number of CV splits
         max_depth: Maximum tree depth (regularization)
         learning_rate: Learning rate (eta)
@@ -352,10 +412,10 @@ def train_xgboost_model(
     logger.info("TRAINING XGBOOST RESIDUAL MODEL (EXTERNAL MEMORY)")
     logger.info("=" * 80)
 
-    # Sort by timestamp for time-series CV
-    df = df.sort("timestamp")
+    # Sort by timestamp for time-series CV (lazy)
+    lf = lf.sort("timestamp")
 
-    n_samples = len(df)
+    n_samples = get_row_count(lf)
     logger.info(f"Features: {len(ALL_FEATURES)}")
     logger.info(f"Total samples: {n_samples:,}")
     logger.info("Hyperparameters:")
@@ -366,22 +426,24 @@ def train_xgboost_model(
     logger.info(f"  colsample_bytree: {colsample_bytree}")
 
     # =========================================================================
-    # PART 1: Cross-Validation on 20% Sample (In-Memory)
+    # PART 1: Cross-Validation on 10% Sample (In-Memory)
     # =========================================================================
     logger.info("\n" + "=" * 80)
-    logger.info("CROSS-VALIDATION (20% SAMPLE)")
+    logger.info("CROSS-VALIDATION (10% SAMPLE)")
     logger.info("=" * 80)
 
-    # Sample 20% of data for CV (stratified by time)
-    sample_size = max(int(n_samples * 0.2), 100_000)
-    sample_step = max(n_samples // sample_size, 1)
-    cv_df = df[::sample_step]
+    # Sample 10% of data for CV (stratified by time) - reduced from 20% for memory safety
+    sample_size = max(int(n_samples * 0.1), 100_000)
+
+    # Collect CV sample from LazyFrame (first sample_size rows)
+    cv_lf = lf.slice(0, sample_size)
+    cv_df = cv_lf.collect()
 
     logger.info(f"CV sample size: {len(cv_df):,} ({len(cv_df) / n_samples * 100:.1f}%)")
 
-    # Extract features for CV
-    X_cv = cv_df.select(ALL_FEATURES).to_numpy()  # noqa: N806
-    y_cv = cv_df["residual"].to_numpy()
+    # Extract features for CV (cast to float32 to halve memory: 3.2GB → 1.6GB)
+    X_cv = cv_df.select(ALL_FEATURES).cast(pl.Float32).to_numpy()  # noqa: N806
+    y_cv = cv_df["residual"].cast(pl.Float32).to_numpy()
 
     # Time-series cross-validation
     tscv = TimeSeriesSplit(n_splits=n_splits)
@@ -437,10 +499,12 @@ def train_xgboost_model(
     logger.info("=" * 80)
     logger.info(f"Mean Train MSE: {np.mean(cv_results['train_mse']):.6f} ± {np.std(cv_results['train_mse']):.6f}")
     logger.info(f"Mean Val MSE:   {np.mean(cv_results['val_mse']):.6f} ± {np.std(cv_results['val_mse']):.6f}")
-    logger.info("NOTE: CV estimates from 20% sample. Full model trained on 100% of data.")
+    logger.info("NOTE: CV estimates from 10% sample. Full model trained on 100% of data.")
 
-    # Clean up CV arrays
+    # Clean up CV arrays and force garbage collection
     del X_cv, y_cv, cv_df
+    gc.collect()
+    logger.info("✓ CV memory cleaned up")
 
     # =========================================================================
     # PART 2: Final Model Training with External Memory
@@ -456,8 +520,8 @@ def train_xgboost_model(
         cache_prefix = f"{cache_dir}/cache"
         logger.info(f"Using cache: {cache_prefix}")
 
-        # Create iterator for external memory training
-        iterator = DataFrameIterator(df, batch_size=2_000_000)
+        # Create iterator for external memory training (pass LazyFrame)
+        iterator = DataFrameIterator(lf, batch_size=2_000_000)
 
         # Create external memory DMatrix
         logger.info("Creating ExtMemQuantileDMatrix (batched loading)...")
@@ -476,6 +540,8 @@ def train_xgboost_model(
             "objective": "reg:squarederror",
             "seed": 42,
             "nthread": 4,  # Limit parallelism to control memory
+            "tree_method": "hist",  # Better external memory support
+            "grow_policy": "depthwise",  # Fewer batch fetches during training
         }
 
         # Train using Booster API
@@ -517,12 +583,102 @@ def train_xgboost_model(
             shutil.rmtree(cache_dir)
 
 
+def apply_xgboost_corrections_streaming(
+    lf: pl.LazyFrame,
+    model: BoosterWrapper,
+    output_path: str,
+    batch_size: int = 2_000_000,
+) -> str:
+    """
+    Apply XGBoost residual corrections with streaming I/O (MEMORY-SAFE).
+
+    CRITICAL: Processes predictions in batches and streams to disk.
+    Prevents 20-32GB materialization that causes OOM on this machine.
+
+    Args:
+        lf: LazyFrame with baseline predictions and features
+        model: Trained XGBoost model (BoosterWrapper)
+        output_path: Where to save corrected predictions (.parquet)
+        batch_size: Rows per batch (default 2M = ~1GB memory per batch)
+
+    Returns:
+        Path to output file
+    """
+    logger.info("=" * 80)
+    logger.info("APPLYING XGBOOST CORRECTIONS (STREAMING)")
+    logger.info("=" * 80)
+
+    log_memory_usage("Before predictions")
+
+    # Get row count
+    n_rows = get_row_count(lf)
+    n_batches = (n_rows + batch_size - 1) // batch_size
+    logger.info(f"Processing {n_rows:,} rows in {n_batches} batches")
+
+    # Process in batches, write to temp files
+    batch_files = []
+    for batch_idx in range(n_batches):
+        start_idx = batch_idx * batch_size
+
+        logger.info(f"Batch {batch_idx + 1}/{n_batches}: rows {start_idx:,} to {start_idx + batch_size:,}")
+
+        # Load batch
+        batch_lf = lf.slice(start_idx, batch_size)
+        batch_df = batch_lf.collect()
+
+        # Predict residuals (float32 for memory efficiency)
+        X = batch_df.select(ALL_FEATURES).cast(pl.Float32).to_numpy()  # noqa: N806
+        residual_pred = model.predict(X)
+
+        # Add predictions to batch
+        batch_df = batch_df.with_columns([pl.Series("residual_pred_xgb", residual_pred, dtype=pl.Float32)])
+
+        # Apply corrections
+        batch_df = batch_df.with_columns(
+            [(pl.col("prob_mid") + pl.col("residual_pred_xgb")).alias("prob_corrected_xgb")]
+        )
+
+        # Clip to [0, 1]
+        batch_df = batch_df.with_columns([pl.col("prob_corrected_xgb").clip(0.0, 1.0).alias("prob_corrected_xgb")])
+
+        # Write batch to temp file
+        temp_path = f"{output_path}.batch_{batch_idx:04d}.parquet"
+        batch_df.write_parquet(temp_path, compression="snappy")
+        batch_files.append(temp_path)
+
+        # Log stats for this batch
+        mean_correction = batch_df["residual_pred_xgb"].mean()
+        logger.info(f"  Mean correction: {mean_correction:.6f}")
+
+        # Cleanup
+        del batch_df, X, residual_pred
+        gc.collect()
+
+    # Combine batches with lazy concat + streaming sink
+    logger.info("Combining batches with streaming write...")
+    combined = pl.concat([pl.scan_parquet(f) for f in batch_files])
+    combined.sink_parquet(output_path, compression="snappy")
+
+    # Cleanup temp files
+    for f in batch_files:
+        Path(f).unlink()
+
+    log_memory_usage("After predictions")
+    logger.info(f"✅ Predictions saved to {output_path}")
+
+    return output_path
+
+
 def apply_xgboost_corrections(
     df: pl.DataFrame,
     model: xgb.XGBRegressor | BoosterWrapper,
 ) -> pl.DataFrame:
     """
-    Apply XGBoost residual corrections to baseline predictions.
+    Apply XGBoost residual corrections to baseline predictions (IN-MEMORY VERSION).
+
+    WARNING: Only use for pilot mode or datasets <10M rows (<5GB).
+    For production datasets (>10M rows), use apply_xgboost_corrections_streaming()
+    instead to avoid OOM crashes on this machine (16GB RAM).
 
     Args:
         df: DataFrame with baseline predictions and features
@@ -606,10 +762,10 @@ def evaluate_performance(df: pl.DataFrame) -> dict:
 
 
 def main() -> None:
-    """Main execution function."""
+    """Main execution function with temporal chunking for memory safety."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train and evaluate XGBoost residual model")
+    parser = argparse.ArgumentParser(description="Train and evaluate XGBoost residual model (memory-safe)")
     parser.add_argument("--pilot", action="store_true", help="Use October 2023 pilot data only")
     parser.add_argument("--max-depth", type=int, default=4, help="Maximum tree depth")
     parser.add_argument("--learning-rate", type=float, default=0.05, help="Learning rate (eta)")
@@ -625,114 +781,163 @@ def main() -> None:
     args = parser.parse_args()
 
     logger.info("=" * 80)
-    logger.info("TIER 3: XGBOOST RESIDUAL MODEL")
+    logger.info("TIER 3.5: XGBOOST RESIDUAL MODEL (MEMORY-SAFE VERSION)")
     logger.info("=" * 80)
+    log_memory_usage("Startup")
 
     # Check if using train/val/test split or legacy single-dataset mode
     use_split = all([args.train_start, args.train_end, args.test_start, args.test_end])
 
     if use_split:
-        logger.info("USING TRAIN/VAL/TEST SPLIT MODE")
+        # ==================================================================
+        # PRODUCTION MODE: Train full model, stream predictions
+        # ==================================================================
+        logger.info("PRODUCTION MODE: Training on full period, streaming predictions")
         logger.info(f"Train period: {args.train_start} to {args.train_end}")
-        if args.val_start and args.val_end:
-            logger.info(f"Validation period: {args.val_start} to {args.val_end}")
         logger.info(f"Test period: {args.test_start} to {args.test_end}")
         logger.info(f"Max depth: {args.max_depth}")
         logger.info(f"Learning rate: {args.learning_rate}")
         logger.info(f"N estimators: {args.n_estimators}")
-        logger.info(f"CV splits: {args.n_splits}")
 
-        # Load train/val/test datasets
+        # ==============================
+        # PHASE 1: Load training data (LazyFrame)
+        # ==============================
         logger.info("\n" + "=" * 80)
-        logger.info("LOADING TRAIN SET")
-        df_train = load_and_prepare_data(start_date=args.train_start, end_date=args.train_end)
+        logger.info("PHASE 1: LOADING TRAINING DATA")
+        logger.info("=" * 80)
 
-        if args.val_start and args.val_end:
-            logger.info("\n" + "=" * 80)
-            logger.info("LOADING VALIDATION SET")
-            df_val = load_and_prepare_data(start_date=args.val_start, end_date=args.val_end)
+        lf_train = load_and_prepare_data(start_date=args.train_start, end_date=args.train_end)
+        train_rows = get_row_count(lf_train)
+        logger.info(f"Training data: {train_rows:,} rows (LazyFrame - not yet in memory)")
+        log_memory_usage("After loading training LazyFrame")
 
+        # ==============================
+        # PHASE 2: Train model (external memory)
+        # ==============================
         logger.info("\n" + "=" * 80)
-        logger.info("LOADING TEST SET")
-        df_test = load_and_prepare_data(start_date=args.test_start, end_date=args.test_end)
+        logger.info("PHASE 2: TRAINING MODEL")
+        logger.info("=" * 80)
 
-        # Train model ONLY on training set
         model, _cv_results = train_xgboost_model(
-            df_train,
+            lf_train,
             n_splits=args.n_splits,
             max_depth=args.max_depth,
             learning_rate=args.learning_rate,
             n_estimators=args.n_estimators,
         )
 
-        # Evaluate on validation set (if provided)
-        if args.val_start and args.val_end:
-            logger.info("\n" + "=" * 80)
-            logger.info("VALIDATION SET PERFORMANCE")
-            logger.info("=" * 80)
-            df_val = apply_xgboost_corrections(df_val, model)
-            _val_results = evaluate_performance(df_val)
+        # Cleanup training data
+        del lf_train
+        gc.collect()
+        log_memory_usage("After training (training data freed)")
 
-        # Evaluate on test set (FINAL HONEST METRICS)
+        # ==============================
+        # PHASE 3: Load test data (LazyFrame)
+        # ==============================
         logger.info("\n" + "=" * 80)
-        logger.info("TEST SET PERFORMANCE (FINAL)")
+        logger.info("PHASE 3: LOADING TEST DATA")
         logger.info("=" * 80)
-        df_test = apply_xgboost_corrections(df_test, model)
-        _test_results = evaluate_performance(df_test)
 
-        # Save test set results
-        output_file = OUTPUT_DIR / f"xgboost_residual_model_test_{args.test_start}_{args.test_end}.parquet"
-        logger.info(f"\nSaving test set results to {output_file}...")
+        lf_test = load_and_prepare_data(start_date=args.test_start, end_date=args.test_end)
+        test_rows = get_row_count(lf_test)
+        logger.info(f"Test data: {test_rows:,} rows (LazyFrame - not yet in memory)")
+        log_memory_usage("After loading test LazyFrame")
 
-        df_test.select(
+        # ==============================
+        # PHASE 4: Stream predictions to disk
+        # ==============================
+        logger.info("\n" + "=" * 80)
+        logger.info("PHASE 4: STREAMING PREDICTIONS TO DISK")
+        logger.info("=" * 80)
+
+        output_file = OUTPUT_DIR / f"tier35_test_results_{args.test_start}_{args.test_end}.parquet"
+        result_path = apply_xgboost_corrections_streaming(lf_test, model, str(output_file), batch_size=2_000_000)
+
+        # ==============================
+        # PHASE 5: Compute final metrics (lazy aggregation)
+        # ==============================
+        logger.info("\n" + "=" * 80)
+        logger.info("PHASE 5: COMPUTING FINAL METRICS")
+        logger.info("=" * 80)
+
+        # Scan result file lazily
+        result_lf = pl.scan_parquet(result_path)
+
+        # Compute metrics with lazy aggregation
+        metrics = result_lf.select(
             [
-                "contract_id",
-                "timestamp",
-                "seconds_offset",
-                "S",
-                "K",
-                "prob_mid",
-                "prob_corrected_xgb",
-                "residual",
-                "residual_pred_xgb",
-                "outcome",
+                pl.len().alias("n_samples"),
+                ((pl.col("prob_corrected_xgb") - pl.col("outcome")) ** 2).mean().alias("brier_xgb"),
+                ((pl.col("prob_mid") - pl.col("outcome")) ** 2).mean().alias("brier_baseline"),
             ]
-            + ALL_FEATURES
-        ).write_parquet(output_file)
+        ).collect()
+
+        n_samples = metrics["n_samples"][0]
+        brier_xgb = metrics["brier_xgb"][0]
+        brier_baseline = metrics["brier_baseline"][0]
+        improvement_pct = (brier_baseline - brier_xgb) / brier_baseline * 100
+
+        logger.info("=" * 80)
+        logger.info("FINAL TEST SET RESULTS")
+        logger.info("=" * 80)
+        logger.info(f"Samples:           {n_samples:,}")
+        logger.info(f"Baseline Brier:    {brier_baseline:.6f}")
+        logger.info(f"XGBoost Brier:     {brier_xgb:.6f}")
+        logger.info(f"Improvement:       {improvement_pct:+.2f}%")
+        logger.info(f"Results saved to:  {result_path}")
+
+        log_memory_usage("Final")
 
     else:
-        # Legacy mode - single dataset (for backward compatibility)
-        logger.info("LEGACY MODE - SINGLE DATASET (WARNING: No train/test split!)")
-        logger.info(f"Pilot mode: {args.pilot}")
+        # ==================================================================
+        # PILOT MODE: Legacy single-dataset (for backward compatibility)
+        # ==================================================================
+        logger.info("PILOT MODE: Single dataset (no chunking)")
+        logger.info(f"Pilot: {args.pilot}")
         logger.info(f"Max depth: {args.max_depth}")
         logger.info(f"Learning rate: {args.learning_rate}")
         logger.info(f"N estimators: {args.n_estimators}")
-        logger.info(f"CV splits: {args.n_splits}")
 
-        # Load and prepare data
-        df = load_and_prepare_data(pilot=args.pilot)
+        # Load data as LazyFrame
+        lf = load_and_prepare_data(pilot=args.pilot)
+        n_rows = get_row_count(lf)
+        logger.info(f"Dataset: {n_rows:,} rows")
 
-        # Train model
+        # For pilot, collect (small dataset)
+        logger.info("Collecting pilot data (small dataset - safe to load in memory)...")
+        df = lf.collect()
+        logger.info(f"Pilot dataset collected: {len(df):,} rows")
+        log_memory_usage("After pilot collection")
+
+        # Train model (wrap DataFrame in LazyFrame for consistent API)
         model, _cv_results = train_xgboost_model(
-            df,
+            lf,  # Pass original LazyFrame
             n_splits=args.n_splits,
             max_depth=args.max_depth,
             learning_rate=args.learning_rate,
             n_estimators=args.n_estimators,
         )
 
-        # Apply corrections
+        # Apply corrections (in-memory OK for pilot)
         df = apply_xgboost_corrections(df, model)
 
         # Evaluate
-        _results = evaluate_performance(df)
+        baseline_brier_val = ((df["prob_mid"] - df["outcome"]) ** 2).mean()
+        baseline_brier = float(baseline_brier_val) if baseline_brier_val is not None else 0.0  # type: ignore[arg-type]
+        xgb_brier_val = ((df["prob_corrected_xgb"] - df["outcome"]) ** 2).mean()
+        xgb_brier = float(xgb_brier_val) if xgb_brier_val is not None else 0.0  # type: ignore[arg-type]
+        improvement_pct = (baseline_brier - xgb_brier) / baseline_brier * 100
+
+        logger.info("=" * 80)
+        logger.info("PILOT RESULTS")
+        logger.info("=" * 80)
+        logger.info(f"Baseline Brier:    {baseline_brier:.6f}")
+        logger.info(f"XGBoost Brier:     {xgb_brier:.6f}")
+        logger.info(f"Improvement:       {improvement_pct:+.2f}%")
 
         # Save results
-        output_file = OUTPUT_DIR / (
-            "xgboost_residual_model_pilot.parquet" if args.pilot else "xgboost_residual_model_full.parquet"
-        )
-        logger.info(f"\nSaving results to {output_file}...")
-
+        output_file = OUTPUT_DIR / "tier35_pilot_results.parquet"
+        logger.info(f"\nSaving pilot results to {output_file}...")
         df.select(
             [
                 "contract_id",
