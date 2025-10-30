@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -390,10 +389,7 @@ class BoosterWrapper:
 
 class DataFrameIterator(xgb.DataIter):
     """
-    Iterator for XGBoost external memory training (XGBoost 3.0+ compatible).
-
-    Implements Python iterator protocol (__iter__, __next__, StopIteration)
-    instead of the old callback-based API for compatibility with ExtMemQuantileDMatrix.
+    Iterator for XGBoost external memory training (LazyFrame version).
 
     Yields batches of data without materializing the full DataFrame in memory.
     Collects each batch with streaming=True and casts to float32 for memory efficiency.
@@ -415,26 +411,14 @@ class DataFrameIterator(xgb.DataIter):
         self.n_batches = (self.n_rows + batch_size - 1) // batch_size
         self.current_batch = 0
         logger.info(f"DataFrameIterator: {self.n_rows:,} rows, {self.n_batches} batches of {batch_size:,}")
-        # CRITICAL: Must call parent __init__ with cache_prefix for XGBoost 3.0+
-        super().__init__(cache_prefix=os.path.join(".", "xgb_cache"))
+        super().__init__()
 
-    def __iter__(self):
-        """Return self as iterator (Python iterator protocol)."""
-        self.current_batch = 0
-        return self
-
-    def next(self, input_data: callable) -> int:
-        """
-        XGBoost DataIter abstract method implementation.
-
-        This method is called by XGBoost to fetch the next batch.
-        Returns 0 when successful, 1 when no more data.
-        """
+    def next(self, input_data: Callable) -> int:  # noqa: A003
+        """Load next batch into input_data callback."""
         if self.current_batch >= self.n_batches:
-            return 1  # No more data
+            return 0  # Signal end of iteration
 
         start_idx = self.current_batch * self.batch_size
-        logger.info(f"  Loading batch {self.current_batch + 1}/{self.n_batches} (rows {start_idx:,} to {min(start_idx + self.batch_size, self.n_rows):,})")
 
         # Collect ONLY this batch (constant memory due to small batch size)
         batch_lf = self.lf.slice(start_idx, self.batch_size)
@@ -444,31 +428,15 @@ class DataFrameIterator(xgb.DataIter):
         X_batch = batch_df.select(ALL_FEATURES).cast(pl.Float32).to_numpy()  # noqa: N806
         y_batch = batch_df["residual"].cast(pl.Float32).to_numpy()
 
-        # Clean up DataFrame immediately (keep numpy arrays for return)
-        del batch_df
-        gc.collect()
-
-        # Use the callback to pass data to XGBoost
+        # Pass to XGBoost via callback
         input_data(data=X_batch, label=y_batch)
 
-        self.current_batch += 1
-        return 0  # Success
-
-    def __next__(self) -> tuple[np.ndarray, np.ndarray]:
-        """Python iterator protocol for compatibility."""
-        if self.current_batch >= self.n_batches:
-            raise StopIteration
-
-        # Reuse the logic from next() but return directly
-        start_idx = self.current_batch * self.batch_size
-        batch_lf = self.lf.slice(start_idx, self.batch_size)
-        batch_df = batch_lf.collect()
-        X_batch = batch_df.select(ALL_FEATURES).cast(pl.Float32).to_numpy()  # noqa: N806
-        y_batch = batch_df["residual"].cast(pl.Float32).to_numpy()
-        del batch_df
+        # Clean up batch immediately
+        del batch_df, X_batch, y_batch
         gc.collect()
+
         self.current_batch += 1
-        return X_batch, y_batch
+        return 1  # Signal successful load
 
     def reset(self) -> None:
         """Reset iterator to beginning."""
@@ -565,7 +533,6 @@ def train_xgboost_model(
         logger.info(f"\nFold {fold + 1}/{n_splits}")
         logger.info(f"  Train: {len(train_idx):,} samples")
         logger.info(f"  Val:   {len(val_idx):,} samples")
-        logger.info("  Starting training for this fold...")
 
         X_train, X_val = X_cv[train_idx], X_cv[val_idx]  # noqa: N806
         y_train, y_val = y_cv[train_idx], y_cv[val_idx]
@@ -585,13 +552,7 @@ def train_xgboost_model(
             random_state=hp_config["seed"],
             n_jobs=-1,  # Use all cores for CV (in-memory, small dataset)
         )
-        # Fix: Add eval_set and proper verbose parameter for progress tracking
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_train, y_train), (X_val, y_val)],
-            verbose=10  # Log every 10 rounds to show progress
-        )
-        logger.info(f"  Training completed for fold {fold + 1}")
+        model.fit(X_train, y_train, verbose=True)  # Enable per-round logging
 
         # Evaluate
         train_pred = model.predict(X_train)
@@ -622,64 +583,65 @@ def train_xgboost_model(
     logger.info("✓ CV memory cleaned up")
 
     # =========================================================================
-    # PART 2: Final Model Training with ExtMemQuantileDMatrix (External Memory)
+    # PART 2: Final Model Training with Validation Set (Memory-Safe)
     # =========================================================================
     logger.info("\n" + "=" * 80)
-    logger.info("TRAINING FINAL MODEL (EXTERNAL MEMORY - ExtMemQuantileDMatrix)")
+    logger.info("TRAINING FINAL MODEL (VALIDATION SET APPROACH - 80% TRAIN / 20% VAL)")
     logger.info("=" * 80)
-    logger.info("NOTE: Using external memory for memory-efficient training on large dataset")
-    logger.info("      Training with streaming batches to avoid loading all data into RAM")
+    logger.info("NOTE: Using validation set instead of external memory for better OOM safety")
+    logger.info("      Training on 80% of data with early stopping on 20% validation set")
 
-    # Calculate split point for train/validation
+    # Calculate split point
     n_train = int(n_samples * 0.8)
     n_val = n_samples - n_train
     logger.info(f"Train samples: {n_train:,} (80%)")
     logger.info(f"Val samples:   {n_val:,} (20%)")
 
-    log_memory_usage("Before external memory setup")
+    log_memory_usage("Before train/val split")
 
     # =========================================================================
-    # Create Training Iterator
+    # Load Training Set (80%)
     # =========================================================================
-    logger.info("\nCreating training data iterator...")
+    logger.info("\nLoading training set (80%)...")
     train_lf = lf.slice(0, n_train)
-    train_iterator = DataFrameIterator(train_lf, batch_size=2_000_000)
+    train_df = train_lf.collect()
+    logger.info(f"Training set collected: {len(train_df):,} rows")
 
-    # Create ExtMemQuantileDMatrix for training
-    logger.info("Creating ExtMemQuantileDMatrix for training (external memory)...")
-    logger.info("This will process data in batches and cache to disk...")
+    # Convert to numpy (float32 for memory efficiency)
+    logger.info("Converting training set to float32 arrays...")
+    X_train = train_df.select(ALL_FEATURES).cast(pl.Float32).to_numpy()  # noqa: N806
+    y_train = train_df["residual"].cast(pl.Float32).to_numpy()
 
-    # Create training DMatrix with external memory
-    dtrain = xgb.ExtMemQuantileDMatrix(
-        train_iterator,
-        max_bin=mem_config.get("max_bin", 32),
-        missing=np.nan,
-        nthread=mem_config.get("nthread", 1),
-    )
-    logger.info("✓ Training ExtMemQuantileDMatrix created")
-    log_memory_usage("After training ExtMemQuantileDMatrix")
+    # Create DMatrix
+    logger.info("Creating training DMatrix...")
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+
+    # Clean up training DataFrame
+    del train_df, train_lf, X_train, y_train
+    gc.collect()
+    log_memory_usage("After training set loaded")
 
     # =========================================================================
-    # Create Validation Iterator
+    # Load Validation Set (20%)
     # =========================================================================
-    logger.info("\nCreating validation data iterator...")
+    logger.info("\nLoading validation set (20%)...")
     val_lf = lf.slice(n_train, n_val)
-    val_iterator = DataFrameIterator(val_lf, batch_size=2_000_000)
+    val_df = val_lf.collect()
+    logger.info(f"Validation set collected: {len(val_df):,} rows")
 
-    # Create ExtMemQuantileDMatrix for validation
-    logger.info("Creating ExtMemQuantileDMatrix for validation...")
-    logger.info("Using training quantiles for consistency...")
+    # Convert to numpy (float32 for memory efficiency)
+    logger.info("Converting validation set to float32 arrays...")
+    X_val = val_df.select(ALL_FEATURES).cast(pl.Float32).to_numpy()  # noqa: N806
+    y_val = val_df["residual"].cast(pl.Float32).to_numpy()
 
-    # Create validation DMatrix using training quantiles
-    dval = xgb.ExtMemQuantileDMatrix(
-        val_iterator,
-        ref=dtrain,  # Use training quantiles for consistency
-        max_bin=mem_config.get("max_bin", 32),
-        missing=np.nan,
-        nthread=mem_config.get("nthread", 1),
-    )
-    logger.info("✓ Validation ExtMemQuantileDMatrix created")
-    log_memory_usage("After validation ExtMemQuantileDMatrix")
+    # Create DMatrix
+    logger.info("Creating validation DMatrix...")
+    dval = xgb.DMatrix(X_val, label=y_val)
+
+    # Clean up validation DataFrame
+    del val_df, val_lf, X_val, y_val
+    gc.collect()
+    log_memory_usage("After validation set loaded")
 
     # =========================================================================
     # Train with Early Stopping
@@ -743,8 +705,8 @@ def train_xgboost_model(
     logger.info(f"Best iteration: {best_iteration} (out of max {hp_config['n_estimators']})")
     logger.info(f"Best validation score: {best_score:.6f}")
 
-    # Clean up ExtMemQuantileDMatrix objects and iterators
-    del dtrain, dval, train_iterator, val_iterator
+    # Clean up DMatrix objects
+    del dtrain, dval
     gc.collect()
     log_memory_usage("After training complete")
 
