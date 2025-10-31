@@ -54,6 +54,10 @@ env/
 .DS_Store
 Thumbs.db
 
+# Shell scripts (except check_code.sh)
+*.sh
+!check_code.sh
+
 # Data files - BLANKET IGNORE (no data files uploaded)
 *.parquet
 *.csv
