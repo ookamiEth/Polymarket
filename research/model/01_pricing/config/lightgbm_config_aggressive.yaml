@@ -1,0 +1,75 @@
+# LightGBM Aggressive Configuration
+# Purpose: Maximum regularization - use if conservative config still overfits
+# Target: Force train-validation gap < 3% even at cost of underfitting
+# Dataset: 63M rows (full production) / 2.6M rows (pilot)
+
+# Hyperparameters for training
+hyperparameters:
+  # Core objective and metrics
+  objective: regression
+  metric:
+    - mse      # MSE directly equals Brier improvement for residual models
+    - rmse     # Square root of MSE for interpretability
+    - mae      # Mean absolute error
+  boosting_type: gbdt
+  seed: 42
+
+  # Tree complexity control - VERY CONSERVATIVE
+  num_leaves: 10              # Minimal tree complexity (was 31)
+  max_depth: 4                # Shallow trees only (was unlimited)
+  min_data_in_leaf: 200       # Require many samples per leaf (was 20)
+  min_sum_hessian_in_leaf: 1e-2  # Higher than default
+
+  # Regularization - VERY STRONG
+  lambda_l1: 10.0             # 10x original L1 penalty
+  lambda_l2: 100.0            # 5x original L2 penalty
+  min_gain_to_split: 3.0      # Very high split threshold
+
+  # Feature and data sampling - VERY AGGRESSIVE
+  feature_fraction: 0.5       # Use only half of features per tree
+  bagging_fraction: 0.5       # Use only half of data per tree
+  bagging_freq: 2             # Apply bagging every other iteration
+
+  # Learning parameters - VERY SLOW
+  learning_rate: 0.02         # Very slow learning (was 0.05)
+  n_estimators: 800           # Many more trees to compensate for slow learning
+  early_stopping_rounds: 10   # Very strict early stopping
+
+  # Additional constraints
+  path_smooth: 10.0           # Smoothing parameter for tree paths
+  max_delta_step: 1.0         # Limit the max output of leaves
+
+# Memory optimization settings
+memory:
+  max_bin: 31                 # Fewer bins to reduce memory and complexity
+  min_data_per_group: 200     # High threshold for categorical groups
+  max_cat_threshold: 16        # Lower categorical cardinality limit
+  histogram_pool_size: -1      # Auto-configure based on data
+  num_threads: 1               # Single thread for memory safety
+
+# Evaluation settings
+evaluation:
+  eval_frequency: 10           # Evaluate every 10 iterations
+  save_best_model: true        # Save model with best validation score
+
+# Use cases for aggressive config:
+# 1. Conservative/moderate configs still show > 10% train-val gap
+# 2. Dataset has high noise-to-signal ratio
+# 3. Prefer underfitting to overfitting (production safety)
+# 4. Need maximum generalization for deployment
+
+# Expected outcomes:
+# - Train-val gap: < 3% (may have identical train/val scores)
+# - Higher absolute RMSE but better generalization
+# - Memory usage: 6-10GB (very efficient)
+# - Extremely stable out-of-sample performance
+
+# Warning signs of over-regularization:
+# - Train and validation RMSE nearly identical from iteration 1
+# - No improvement after 50-100 iterations
+# - Feature importances all very similar (no clear patterns)
+
+# Recovery if too aggressive:
+# - First try moderate config
+# - Gradually reduce lambda values by 20% increments
+# - Increase num_leaves to 12, then 15

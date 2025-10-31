@@ -1,0 +1,60 @@
+# LightGBM Conservative Configuration
+# Purpose: Aggressive regularization to prevent overfitting on large datasets
+# Target: Reduce train-validation gap from 527% to < 5%
+# Dataset: 63M rows (full production) / 2.6M rows (pilot)
+
+# Hyperparameters for training
+hyperparameters:
+  # Core objective and metrics
+  objective: regression
+  metric:
+    - mse      # MSE directly equals Brier improvement for residual models
+    - rmse     # Square root of MSE for interpretability
+    - mae      # Mean absolute error
+  boosting_type: gbdt
+  seed: 42
+
+  # Tree complexity control - CONSERVATIVE
+  num_leaves: 15              # Reduced from 31 (50% fewer leaf nodes)
+  max_depth: 5                # Added explicit depth limit (was unlimited)
+  min_data_in_leaf: 100       # Increased from 20 (5x more samples per leaf)
+  min_sum_hessian_in_leaf: 1e-3
+
+  # Regularization - STRONG
+  lambda_l1: 5.0              # Increased from 1.0 (5x L1 penalty)
+  lambda_l2: 50.0             # Increased from 20.0 (2.5x L2 penalty)
+  min_gain_to_split: 2.0      # Increased from 1.0 (higher split threshold)
+
+  # Feature and data sampling - AGGRESSIVE
+  feature_fraction: 0.6       # Reduced from 0.8 (fewer features per tree)
+  bagging_fraction: 0.6       # Reduced from 0.7 (fewer samples per tree)
+  bagging_freq: 3             # Reduced from 5 (apply bagging more often)
+
+  # Learning parameters - SLOWER
+  learning_rate: 0.03         # Reduced from 0.05 (slower learning)
+  n_estimators: 500           # Increased from 200 (more iterations with early stopping)
+  early_stopping_rounds: 15   # Reduced from 25 (stricter stopping)
+
+# Memory optimization settings
+memory:
+  max_bin: 63                 # Histogram bins for continuous features
+  min_data_per_group: 100     # Minimum data per categorical group
+  max_cat_threshold: 32        # Maximum categorical cardinality
+  histogram_pool_size: -1      # Auto-configure based on data
+  num_threads: 1               # Single thread for memory safety
+
+# Evaluation settings
+evaluation:
+  eval_frequency: 10           # Evaluate every 10 iterations
+  save_best_model: true        # Save model with best validation score
+
+# Expected outcomes vs production config:
+# - Train-val gap: 527% → < 5%
+# - Memory usage: 15-20GB → 8-12GB
+# - Out-of-sample performance: +20-40% improvement
+# - Training time: Slightly longer due to more trees (but early stopping)
+
+# Tuning notes:
+# - If still overfitting: Increase lambda_l1/l2, reduce num_leaves
+# - If underfitting: Slightly increase num_leaves, reduce lambda values
+# - Monitor validation plateau for early stopping effectiveness
