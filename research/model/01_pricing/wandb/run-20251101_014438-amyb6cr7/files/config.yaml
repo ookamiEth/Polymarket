@@ -1,0 +1,60 @@
+_wandb:
+    value:
+        cli_version: 0.22.3
+        e:
+            sjd473dyr6awtuno3x50a0biz6583llg:
+                args:
+                    - --config
+                    - config/lightgbm_grid_search_config_optimized.yaml
+                codePath: research/model/01_pricing/lightgbm_grid_search.py
+                codePathLocal: lightgbm_grid_search.py
+                cpu_count: 8
+                cpu_count_logical: 16
+                disk:
+                    /:
+                        total: "155897610240"
+                        used: "45657006080"
+                email: shotgunCH@protonmail.com
+                executable: /home/ubuntu/Polymarket/.venv/bin/python3
+                git:
+                    commit: 2dcb7572c06f8a85267bd931eddd15e832404d3d
+                    remote: git@github.com:ookamiEth/Polymarket
+                host: ip-172-31-40-209
+                memory:
+                    total: "132919635968"
+                os: Linux-6.8.0-1040-aws-x86_64-with-glibc2.35
+                program: /home/ubuntu/Polymarket/research/model/01_pricing/lightgbm_grid_search.py
+                python: CPython 3.10.12
+                root: /home/ubuntu/Polymarket/research/model/01_pricing
+                startedAt: "2025-11-01T01:44:38.583245Z"
+                writerId: sjd473dyr6awtuno3x50a0biz6583llg
+        m: []
+        python_version: 3.10.12
+        t:
+            "1":
+                - 5
+                - 8
+                - 53
+            "2":
+                - 5
+                - 8
+                - 53
+            "3":
+                - 2
+                - 13
+                - 15
+                - 16
+            "4": 3.10.12
+            "5": 0.22.3
+            "10":
+                - 20
+            "12": 0.22.3
+            "13": linux-x86_64
+lambda_l2:
+    value: 10
+learning_rate:
+    value: 0.02
+min_data_in_leaf:
+    value: 50
+num_leaves:
+    value: 15

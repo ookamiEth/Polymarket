@@ -1,0 +1,173 @@
+# LightGBM Grid Search Configuration - OPTION B (Research-Optimized)
+# 16-trial grid with research-validated hyperparameter ranges
+#
+# Changes from original config:
+# - Reduced from 6 params (64 trials) to 4 params (16 trials)
+# - Fixed boosting_type='gbdt' and min_gain_to_split=0.01 based on research
+# - Adjusted lambda_l2 range: [10.0, 20.0] → [1.0, 10.0] (research: 0-1 typical)
+# - Adjusted min_data_in_leaf range: [20, 100] → [50, 100] (higher for 63M rows)
+#
+# Expected runtime: 4-5 hours on 63M rows (vs 16-20 hours for 64 trials)
+# Research basis: ArXiv 2022, PMC 2023, DIVA-portal 2024
+
+# Grid search parameters (4 params = 2^4 = 16 combinations)
+grid_search:
+  # Learning rate (HIGHEST PRIORITY - universally ranked #1)
+  # Research range: 0.01-0.3, lower end for smoother convergence on large data
+  learning_rate:
+    - 0.02  # Conservative (more trees, smoother)
+    - 0.05  # Baseline (balanced)
+
+  # Tree complexity (CRITICAL for LightGBM leaf-wise growth)
+  # Research range: 10-256, mid-range balances complexity/generalization
+  num_leaves:
+    - 15  # Simpler trees (smoother probabilities, better calibration)
+    - 31  # More complex (captures finer patterns)
+
+  # Minimum samples per leaf (ESSENTIAL for large/noisy datasets)
+  # Research range: 1-100, higher for 63M rows prevents overfitting
+  # ADJUSTED: Focus on high end [50, 100] vs original [20, 100]
+  min_data_in_leaf:
+    - 50   # Medium threshold
+    - 100  # High threshold (better generalization for financial data)
+
+  # L2 regularization (KEY for overfitting control)
+  # Research range: 0-1 typical, up to 10 for some tasks
+  # ADJUSTED: [1.0, 10.0] vs original [10.0, 20.0] to match research
+  lambda_l2:
+    - 1.0   # Research-typical value
+    - 10.0  # Higher regularization (more conservative)
+
+# Fixed parameters (not tuned, research-informed defaults)
+fixed_params:
+  # Core settings
+  objective: "regression"
+  metric:
+    - "mse"
+    - "rmse"
+    - "mae"
+  seed: 42
+  verbose: -1
+
+  # FIXED BASED ON RESEARCH (removed from grid)
+  # Boosting type: GBDT is standard, GOSS can be tested separately
+  boosting_type: "gbdt"
+
+  # Min gain to split: Research suggests 0-0.01 for subtle financial patterns
+  # ADJUSTED: 0.01 (fixed) vs original grid [0.1, 1.0]
+  min_gain_to_split: 0.01
+
+  # Tree structure (fixed)
+  max_depth: -1  # No limit (controlled by num_leaves)
+  min_sum_hessian_in_leaf: 0.001
+
+  # L1 regularization (fixed, L2 is more impactful per research)
+  lambda_l1: 0.5
+
+  # Sampling (fixed, validated from optimized config)
+  feature_fraction: 0.8
+  bagging_fraction: 0.8
+  bagging_freq: 1
+
+  # Training
+  n_estimators: 1000  # High limit, rely on early stopping
+  early_stopping_rounds: 50
+
+  # Memory optimization
+  max_bin: 255
+  num_threads: 12
+  min_data_per_group: 100
+  max_cat_threshold: 32
+  histogram_pool_size: -1  # Auto
+
+  # Performance
+  use_missing: true
+  zero_as_missing: false
+  two_round: true
+  force_row_wise: true
+  deterministic: true
+  data_sample_strategy: "bagging"
+  enable_bundle: true
+  max_conflict_rate: 0.0
+
+# Dataset configuration
+# NOTE: Data actually starts 2023-10-01 (not 2023-01-01)
+# Using 2023-10-01 to 2024-10-31 = 13 months of actual data
+dataset:
+  start_date: "2023-10-01"  # CORRECTED: Data starts here (was incorrectly 2023-01-01)
+  end_date: "2024-10-31"     # End date (13 months of data)
+  chunk_months: 6
+  train_ratio: 0.6   # 60% for training (changed from 80%)
+  val_ratio: 0.2     # 20% for validation (changed from 10%)
+  test_ratio: 0.2    # 20% for testing (changed from 10%)
+  shuffle: true
+
+# Weights & Biases configuration
+wandb:
+  project: "lightgbm-residual-tuning"
+  entity: null  # Set to your W&B username/team if needed
+  tags:
+    - "grid-search"
+    - "option-b-optimized"     # Distinguish from pilot and original 64-trial
+    - "16-trials"              # Quick identification
+    - "research-validated"     # Based on ArXiv/PMC/DIVA studies
+    - "63M-rows"
+    - "13-months-data"         # 2023-10-01 to 2024-10-31
+    - "60-20-20-split"         # Train/val/test split
+  notes: "Option B: Research-optimized 4-param grid (16 trials) on 63M rows (2023-10-01 to 2024-10-31, 13 months). Train/val/test: 60/20/20. Ranges adjusted per ArXiv 2022, PMC 2023, DIVA-portal 2024 studies."
+
+  # Run naming pattern with trial number for easy tracking
+  # Format: T01_LR-0.02_Leaves-15_MinData-50_L2-1.0
+  # Note: boosting_type now fixed to 'gbdt', trial_num added by script
+  run_name_template: "T{trial_num:02d}_LR-{learning_rate}_Leaves-{num_leaves}_MinData-{min_data_in_leaf}_L2-{lambda_l2}"
+
+# Grid search execution settings
+execution:
+  checkpoint_every: 5  # Save progress every N trials
+  checkpoint_file: "results/grid_search_checkpoint_optimized.json"
+  results_csv: "results/grid_search_results_optimized.csv"
+  best_model_path: "results/lightgbm_model_best_optimized.txt"
+  summary_file: "results/grid_search_summary_optimized.txt"
+
+  # Resume from checkpoint if interrupted
+  resume_from_checkpoint: true
+
+  # Parallel execution (if multiple GPUs/instances available)
+  parallel: false
+  n_parallel_jobs: 1
+
+# Optimization objective
+optimization:
+  metric: "brier_improvement_pct"  # Primary metric to maximize
+  direction: "maximize"
+
+  # Secondary metrics to track
+  secondary_metrics:
+    - "model_brier"
+    - "residual_mse"
+    - "residual_rmse"
+    - "residual_mae"
+    - "training_time_minutes"
+
+# Research references for these hyperparameter choices
+#
+# 1. ArXiv "A Large-Scale Study of Hyperparameter Tuning" (2022)
+#    - Tested LightGBM on 250+ datasets
+#    - Learning_rate most impactful, range [0.01, 0.2]
+#    - Low tunability overall (defaults often sufficient)
+#
+# 2. PMC "Practical Guidelines for Gradient Boosting" (2023)
+#    - QSAR benchmark on 157k models
+#    - fANOVA shows learning_rate/min_split_gain top priority
+#    - Regularization (lambda_l2) range 0-1 typical
+#    - Min_data_in_leaf: 1-100, higher for large datasets
+#
+# 3. DIVA-portal "Impact of LightGBM Hyperparameters on Class Imbalance" (2024)
+#    - Loan default dataset analysis
+#    - Min_gain_to_split: 0-0.01 for subtle patterns
+#    - Bayesian optimization recommended over grid for >5 params
+#
+# 4. LightGBM Official Documentation (2024)
+#    - Num_leaves: 10-100 for most tasks
+#    - Lambda_l2: Start at 0-1, increase if overfitting
+#    - Boosting_type: GBDT standard, GOSS for speed (3.5x faster)

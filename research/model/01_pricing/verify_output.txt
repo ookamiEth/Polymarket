@@ -1,0 +1,73 @@
+warning: The `tool.uv.dev-dependencies` field (used in `/home/ubuntu/Polymarket/pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
+2025-10-31 09:21:04,036 - INFO - ================================================================================
+2025-10-31 09:21:04,037 - INFO - MEMORY FIX VERIFICATION
+2025-10-31 09:21:04,037 - INFO - ================================================================================
+2025-10-31 09:21:04,037 - INFO - [MEMORY] Initial: 0.04 GB
+2025-10-31 09:21:04,037 - INFO - ================================================================================
+2025-10-31 09:21:04,037 - INFO - TEST 1: Schema Resolution (should have 0 warnings, 0 leaks)
+2025-10-31 09:21:04,037 - INFO - ================================================================================
+2025-10-31 09:21:04,037 - INFO - [MEMORY] Initial: 0.04 GB
+2025-10-31 09:21:04,037 - INFO - 
+1. Testing collect_schema() method (correct)...
+2025-10-31 09:21:04,068 - INFO -   Columns: 34
+2025-10-31 09:21:04,069 - INFO - [MEMORY] After schema access: 0.08 GB
+2025-10-31 09:21:04,069 - INFO -   Memory leak: 39.4 MB
+2025-10-31 09:21:04,069 - ERROR -   ❌ FAIL: Memory leaked 39.4 MB (expected <5 MB)
+2025-10-31 09:21:04,078 - INFO - 
+================================================================================
+2025-10-31 09:21:04,078 - INFO - TEST 2: Timestamp Filtering (features should be filtered BEFORE join)
+2025-10-31 09:21:04,078 - INFO - ================================================================================
+2025-10-31 09:21:04,078 - INFO - [MEMORY] Initial: 0.08 GB
+2025-10-31 09:21:04,078 - INFO - 
+Simulating production mode: 2023-10-01 to 2023-10-31
+2025-10-31 09:21:04,114 - INFO -   Baseline rows (after date filter): 2,678,400
+2025-10-31 09:21:04,114 - INFO -   Timestamp range: 1696118400 to 1698796800
+2025-10-31 09:21:04,114 - INFO - 
+1. Testing RV features filtering...
+2025-10-31 09:21:04,120 - INFO -   RV rows (before filter): 63,158,387
+2025-10-31 09:21:04,133 - INFO -   RV rows (after filter): 2,678,400
+2025-10-31 09:21:04,133 - INFO -   Reduction: 95.8%
+2025-10-31 09:21:04,133 - INFO -   ✅ PASS: RV features filtered before join
+2025-10-31 09:21:04,133 - INFO - 
+2. Testing microstructure features filtering...
+2025-10-31 09:21:04,141 - INFO -   Microstructure rows (before filter): 63,158,387
+2025-10-31 09:21:04,151 - INFO -   Microstructure rows (after filter): 2,678,400
+2025-10-31 09:21:04,151 - INFO -   Reduction: 95.8%
+2025-10-31 09:21:04,151 - INFO -   ✅ PASS: Microstructure features filtered before join
+2025-10-31 09:21:04,151 - INFO - 
+3. Testing advanced features filtering...
+2025-10-31 09:21:04,167 - INFO -   Advanced rows (before filter): 63,072,900
+2025-10-31 09:21:04,182 - INFO -   Advanced rows (after filter): 2,678,400
+2025-10-31 09:21:04,182 - INFO -   Reduction: 95.8%
+2025-10-31 09:21:04,182 - INFO -   ✅ PASS: Advanced features filtered before join
+2025-10-31 09:21:04,183 - INFO - [MEMORY] After filtering: 0.25 GB
+2025-10-31 09:21:04,183 - INFO - 
+Total memory increase: 179.4 MB
+2025-10-31 09:21:04,194 - INFO - 
+================================================================================
+2025-10-31 09:21:04,194 - INFO - TEST 3: Join Efficiency (10k sample should use <100MB, not 3GB)
+2025-10-31 09:21:04,195 - INFO - ================================================================================
+2025-10-31 09:21:04,195 - INFO - [MEMORY] Initial: 0.25 GB
+2025-10-31 09:21:04,195 - INFO - 
+Testing with October 2023 data
+2025-10-31 09:21:04,212 - INFO - [MEMORY] After all lazy joins: 0.25 GB
+2025-10-31 09:21:04,212 - INFO - Memory increase from lazy joins: 1.7 MB
+2025-10-31 09:21:04,212 - INFO - 
+Collecting 10k sample...
+2025-10-31 09:21:04,212 - INFO - [MEMORY] Before collect: 0.25 GB
+2025-10-31 09:21:04,890 - INFO - [MEMORY] After collect: 3.54 GB
+2025-10-31 09:21:04,890 - INFO -   Sample size: 10,000 rows
+2025-10-31 09:21:04,890 - INFO -   Sample columns: 101
+2025-10-31 09:21:04,890 - INFO -   Memory spike: 3363.2 MB
+2025-10-31 09:21:04,890 - INFO -   Expected memory: ~3.9 MB
+2025-10-31 09:21:04,890 - ERROR -   ❌ FAIL: Memory spike 3363.2 MB is too high (expected ~3.9 MB)
+2025-10-31 09:21:04,901 - INFO - 
+================================================================================
+2025-10-31 09:21:04,901 - INFO - TEST SUMMARY
+2025-10-31 09:21:04,901 - INFO - ================================================================================
+2025-10-31 09:21:04,901 - INFO - Test 1 (Schema Resolution): ❌ FAIL
+2025-10-31 09:21:04,901 - INFO - Test 2 (Timestamp Filtering): ✅ PASS
+2025-10-31 09:21:04,901 - INFO - Test 3 (Join Efficiency): ❌ FAIL
+2025-10-31 09:21:04,901 - ERROR - 
+❌ SOME TESTS FAILED - Review fixes and re-test
+2025-10-31 09:21:04,901 - INFO - [MEMORY] Final: 3.54 GB

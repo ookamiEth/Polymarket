@@ -1,18 +1,24 @@
-# LightGBM Residual Model - Production Configuration (63M rows)
+# LightGBM Residual Model - Optimized Configuration (63M rows)
 #
-# This configuration is optimized for the full 63M row dataset on 128GB RAM system
-# Uses LightGBM's memory-efficient features and leaf-wise growth
-# Optimized for better speed and accuracy compared to XGBoost
+# This configuration incorporates best practices from comprehensive research
+# and analysis to improve Brier score from 7.91% to 10-15% improvement
+#
+# Key changes from production:
+# - Lower learning rate (0.02) with more estimators (1000)
+# - Reduced complexity (num_leaves 15, max_depth 7)
+# - Increased min_data_in_leaf (50) for better generalization
+# - Reduced min_gain_to_split (0.1) to capture subtle patterns
+# - More frequent bagging (bagging_freq 1)
 #
 # ==============================================================================
 # MEMORY OPTIMIZATION - LIGHTGBM NATIVE EFFICIENCY
 # ==============================================================================
 memory:
   # LightGBM can handle more bins efficiently due to histogram optimization
-  max_bin: 255  # Increased for 128GB RAM system (better accuracy)
+  max_bin: 255  # Keep high for accuracy on 128GB RAM system
 
   # Thread control - LightGBM handles threading better than XGBoost
-  num_threads: 12  # Utilize 12 cores on 128GB EC2 instance (10-12x faster)
+  num_threads: 12  # Utilize 12 cores on 128GB EC2 instance
 
   # Histogram pool size (-1 = auto-managed by LightGBM)
   histogram_pool_size: -1
@@ -30,89 +36,89 @@ memory:
   enable_bundle: true
 
   # CV sample percentage for hyperparameter tuning
-  cv_sample_pct: 0.01  # 1% of 63M = 630K rows
+  cv_sample_pct: 0.01  # 1% of 63M = 630K rows for quick iterations
 
 # ==============================================================================
-# HYPERPARAMETERS - OPTIMIZED FOR LIGHTGBM
+# HYPERPARAMETERS - OPTIMIZED BASED ON ANALYSIS
 # ==============================================================================
 hyperparameters:
   # --------------------------------------------------------------------------
   # Core Parameters
   # --------------------------------------------------------------------------
-  # Objective function
+  # Objective function (keep regression for residual modeling)
   objective: "regression"
 
-  # Evaluation metrics
-  metric: ["mse", "rmse", "mae"]  # MSE added for Brier score relationship
+  # Evaluation metrics - MSE directly relates to Brier improvement
+  metric: ["mse", "rmse", "mae"]
 
-  # Boosting type
-  boosting_type: "gbdt"  # Options: gbdt, dart, goss, rf
+  # Boosting type - standard gradient boosting
+  boosting_type: "gbdt"  # Will test GOSS separately
 
   # Random seed for reproducibility
   seed: 42
 
   # --------------------------------------------------------------------------
-  # Tree Structure Control - KEY DIFFERENCE FROM XGBOOST
+  # Tree Structure Control - OPTIMIZED FOR PROBABILITY CALIBRATION
   # --------------------------------------------------------------------------
-  # Number of leaves - LightGBM uses leaf-wise growth (more efficient)
-  num_leaves: 31  # 2^5 - 1, equivalent to max_depth=5 but more flexible
+  # Number of leaves - REDUCED for smoother probabilities
+  num_leaves: 15  # Down from 31 (smoother probability surfaces)
 
-  # Maximum tree depth (optional with num_leaves)
-  max_depth: -1  # -1 means no limit, controlled by num_leaves
+  # Maximum tree depth - SET EXPLICIT LIMIT
+  max_depth: 7  # From -1 (unlimited) to prevent overfitting
 
-  # Minimum samples in leaf
-  min_data_in_leaf: 20  # Similar to min_child_weight in XGBoost
+  # Minimum samples in leaf - INCREASED for better generalization
+  min_data_in_leaf: 50  # Up from 20 (prevents overfitting on 63M rows)
 
   # Minimum sum of hessian in leaf
   min_sum_hessian_in_leaf: 1e-3
 
   # --------------------------------------------------------------------------
-  # Regularization - ADAPTED FOR LIGHTGBM
+  # Regularization - FINE-TUNED FOR FINANCIAL DATA
   # --------------------------------------------------------------------------
-  # L1 regularization
-  lambda_l1: 1.0  # Equivalent to reg_alpha in XGBoost
+  # L1 regularization - REDUCED
+  lambda_l1: 0.5  # Down from 1.0 (less aggressive)
 
-  # L2 regularization
-  lambda_l2: 20.0  # Equivalent to reg_lambda in XGBoost
+  # L2 regularization - SLIGHTLY REDUCED
+  lambda_l2: 15.0  # Down from 20.0 (allow more flexibility)
 
-  # Minimum loss reduction for split
-  min_gain_to_split: 1.0  # Equivalent to gamma in XGBoost
+  # Minimum loss reduction for split - SIGNIFICANTLY REDUCED
+  min_gain_to_split: 0.1  # Down from 1.0 (capture subtle patterns)
 
   # --------------------------------------------------------------------------
-  # Sampling Parameters - FEATURE & ROW SAMPLING
+  # Sampling Parameters - OPTIMIZED FOR STABILITY
   # --------------------------------------------------------------------------
   # Feature sampling per tree
-  feature_fraction: 0.8  # Equivalent to colsample_bytree
+  feature_fraction: 0.8  # Keep current (good for 59 features)
 
-  # Row sampling per tree
-  bagging_fraction: 0.7  # Equivalent to subsample
+  # Row sampling per tree - INCREASED
+  bagging_fraction: 0.8  # Up from 0.7 (more data per tree)
 
-  # Frequency of bagging
-  bagging_freq: 5  # Apply bagging every 5 iterations
+  # Frequency of bagging - MORE FREQUENT
+  bagging_freq: 1  # Down from 5 (bagging every iteration for more randomness)
 
-  # Feature sampling by node (additional regularization)
+  # Feature sampling by node
   feature_fraction_bynode: 0.8
 
   # --------------------------------------------------------------------------
-  # Learning Parameters
+  # Learning Parameters - KEY OPTIMIZATION
   # --------------------------------------------------------------------------
-  # Learning rate
-  learning_rate: 0.05  # Conservative for large dataset
+  # Learning rate - REDUCED for gradual convergence
+  learning_rate: 0.02  # Down from 0.05 (finer steps, better convergence)
 
-  # Number of boosting iterations
-  n_estimators: 200  # Will use early stopping
+  # Number of boosting iterations - SIGNIFICANTLY INCREASED
+  n_estimators: 1000  # Up from 200 (more trees with lower learning rate)
 
-  # Early stopping rounds
-  early_stopping_rounds: 25  # Stop if no improvement for 25 rounds
+  # Early stopping rounds - INCREASED PATIENCE
+  early_stopping_rounds: 50  # Up from 25 (more patience for convergence)
 
   # --------------------------------------------------------------------------
   # Advanced LightGBM Features
   # --------------------------------------------------------------------------
   # Path smoothing (helps prevent overfitting)
-  path_smooth: 0.0  # 0 = disabled, small values like 1e-3 can help
+  path_smooth: 0.0  # Keep disabled for now
 
   # Extra trees (adds randomness like Random Forest)
-  extra_trees: false
+  extra_trees: false  # Test separately if needed
 
   # Use two-round loading (memory efficiency)
   two_round: true
@@ -125,7 +131,7 @@ hyperparameters:
   deterministic: true
 
   # Data sample strategy
-  data_sample_strategy: "bagging"  # Options: bagging, goss
+  data_sample_strategy: "bagging"  # Will test GOSS separately
 
   # --------------------------------------------------------------------------
   # Categorical Features (if any)
@@ -140,26 +146,6 @@ hyperparameters:
   cat_l2: 10.0
 
 # ==============================================================================
-# DART-SPECIFIC PARAMETERS (Alternative to GBDT)
-# ==============================================================================
-# Uncomment to use DART (Dropouts meet Multiple Additive Regression Trees)
-# dart:
-#   drop_rate: 0.1  # Fraction of trees to drop
-#   max_drop: 50  # Maximum number of trees to drop
-#   skip_drop: 0.5  # Probability of skipping dropout
-#   uniform_drop: false  # Uniform vs weighted dropout
-#   xgboost_dart_mode: false  # Use XGBoost's DART implementation
-#   drop_seed: 42  # Random seed for dropout
-
-# ==============================================================================
-# GOSS-SPECIFIC PARAMETERS (Gradient-based One-Side Sampling)
-# ==============================================================================
-# Uncomment to use GOSS for faster training on large datasets
-# goss:
-#   top_rate: 0.2  # Retain top 20% samples with large gradients
-#   other_rate: 0.1  # Randomly sample 10% of remaining samples
-
-# ==============================================================================
 # VALIDATION STRATEGY
 # ==============================================================================
 validation:
@@ -168,13 +154,14 @@ validation:
   monitor_metrics:
     - "rmse"
     - "mae"
+    - "mse"  # Added for Brier score tracking
 
-  # Stratified sampling (if needed for imbalanced data)
-  stratified: false
+  # Stratified sampling
+  stratified: false  # Keep temporal order for time series
 
-  # Cross-validation settings (if using CV instead of single split)
+  # Cross-validation settings (for hyperparameter tuning)
   cv_folds: 5
-  cv_shuffle: true
+  cv_shuffle: false  # IMPORTANT: Don't shuffle for time series
 
 # ==============================================================================
 # GPU SETTINGS (Optional)
@@ -183,17 +170,17 @@ use_gpu: false  # Set to true if GPU available
 gpu:
   gpu_device_id: 0
   gpu_platform_id: 0
-  gpu_use_dp: false  # Use double precision (slower but more accurate)
+  gpu_use_dp: false  # Use double precision
 
 # ==============================================================================
 # OUTPUT SETTINGS
 # ==============================================================================
 output:
   # Feature importance type
-  importance_type: "gain"  # Options: gain, split
+  importance_type: "gain"  # Most informative for understanding model
 
   # Number of top features to log
-  top_features: 20
+  top_features: 30  # Increased to see more feature interactions
 
   # Save feature importance plot
   save_importance_plot: true
@@ -204,14 +191,23 @@ output:
     - "json"  # Human-readable format
 
 # ==============================================================================
-# COMPARISON WITH XGBOOST
+# EXPECTED IMPROVEMENTS
 # ==============================================================================
-# Expected improvements over XGBoost:
-# - Training speed: 2-10x faster due to leaf-wise growth
-# - Memory usage: 30-50% less due to histogram optimization
-# - Accuracy: Similar or slightly better with proper tuning
-# - Feature handling: Better with high-cardinality features
-comparison:
-  expected_speedup: 3.0  # Expected training speed improvement
-  expected_memory_reduction: 0.4  # Expected 40% memory reduction
-  benchmark_against_xgboost: true
+# Based on comprehensive analysis and research:
+# - Current Brier improvement: 7.91%
+# - Expected with these optimizations: 10-12%
+# - Additional gains possible with:
+#   - Binary objective instead of regression: +1-2%
+#   - Feature engineering (interactions): +1-2%
+#   - Ensemble methods: +1-2%
+#
+# Key changes driving improvement:
+# 1. Lower learning rate + more trees → better convergence
+# 2. Reduced complexity → smoother probabilities
+# 3. Lower min_gain_to_split → capture subtle patterns
+# 4. Increased min_data_in_leaf → better generalization
+# 5. More frequent bagging → increased robustness
+improvement_targets:
+  expected_brier_improvement: 0.10  # 10% minimum target
+  expected_rmse: 0.38  # Down from 0.387
+  expected_mae: 0.30  # Down from 0.308

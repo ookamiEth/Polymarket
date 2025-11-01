@@ -1,0 +1,105 @@
+# XGBoost Residual Model - Aggressive Configuration
+#
+# Low regularization for maximum accuracy
+# Higher risk of overfitting but potentially better performance
+# Good for experimentation and finding upper bounds
+
+# ==============================================================================
+# MEMORY OPTIMIZATION - SAME AS PRODUCTION
+# ==============================================================================
+memory:
+  # Bin reduction for memory efficiency
+  max_bin: 32
+
+  # CRITICAL: Single thread for external memory safety
+  nthread: 1
+
+  # Aggressive histogram cache reduction
+  max_cached_hist_node: 8
+
+  # Enable resource-aware memory management
+  ref_resource_aware: true
+
+  # Small CV sample for large dataset
+  cv_sample_pct: 0.01
+
+# ==============================================================================
+# HYPERPARAMETERS - AGGRESSIVE (LOW REGULARIZATION)
+# ==============================================================================
+hyperparameters:
+  # --------------------------------------------------------------------------
+  # Tree Structure Control
+  # --------------------------------------------------------------------------
+  # Deeper trees for more complex patterns
+  max_depth: 6  # Increased from production
+
+  # Lower minimum samples per leaf
+  min_child_weight: 3  # Much lower than production
+
+  # --------------------------------------------------------------------------
+  # Regularization - AGGRESSIVE (MINIMAL REGULARIZATION)
+  # --------------------------------------------------------------------------
+  # Low minimum loss reduction for more splits
+  gamma: 0.1  # Much lower than production
+
+  # Light L2 regularization
+  reg_lambda: 5  # Much lower than production
+
+  # Very light L1 regularization
+  reg_alpha: 0.1  # Much lower than production
+
+  # --------------------------------------------------------------------------
+  # Learning & Ensemble
+  # --------------------------------------------------------------------------
+  # Moderate learning rate
+  learning_rate: 0.05  # Same as production
+
+  # More trees (let early stopping decide)
+  n_estimators: 300  # More than production
+
+  # Less patience (stop earlier if overfitting)
+  early_stopping_rounds: 15  # Less than production
+
+  # --------------------------------------------------------------------------
+  # Sampling - Aggressive
+  # --------------------------------------------------------------------------
+  # More row sampling for full data usage
+  subsample: 0.9  # Higher than production
+
+  # More feature sampling
+  colsample_bytree: 0.9  # Higher than production
+
+  # --------------------------------------------------------------------------
+  # Other Settings
+  # --------------------------------------------------------------------------
+  objective: "reg:squarederror"
+  eval_metric: ["rmse", "mae"]
+  tree_method: "hist"
+  grow_policy: "depthwise"
+  seed: 42
+
+# ==============================================================================
+# VALIDATION STRATEGY
+# ==============================================================================
+validation:
+  use_validation_set: true
+  val_split: 0.2
+  monitor_metrics:
+    - "rmse"
+    - "mae"
+
+# ==============================================================================
+# EXTERNAL MEMORY SETTINGS
+# ==============================================================================
+external_memory:
+  batch_size: 2000000
+  cache_dir: "./xgb_cache"
+  clean_cache: true
+
+# ==============================================================================
+# EXPECTED OUTCOMES - AGGRESSIVE
+# ==============================================================================
+# Memory Usage: 9-11GB (slightly higher due to deeper trees)
+# Model Performance: 10-15% improvement (best case)
+# Training time: 60-120 minutes
+# Risk of overfitting, monitor validation carefully

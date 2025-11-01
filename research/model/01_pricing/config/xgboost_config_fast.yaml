@@ -1,0 +1,105 @@
+# XGBoost Residual Model - Fast Configuration
+#
+# Optimized for quick experimentation and testing
+# Fewer trees and simpler model for rapid iteration
+# Good for testing pipeline and quick validation
+
+# ==============================================================================
+# MEMORY OPTIMIZATION - OPTIMIZED FOR SPEED
+# ==============================================================================
+memory:
+  # Bin reduction for memory efficiency
+  max_bin: 32
+
+  # Use 2 threads for faster training (if memory allows)
+  nthread: 2  # Increased for speed
+
+  # Slightly more cache for speed
+  max_cached_hist_node: 16  # Increased for speed
+
+  # Enable resource-aware memory management
+  ref_resource_aware: true
+
+  # Larger CV sample for better estimates (still safe)
+  cv_sample_pct: 0.02  # 2% for better CV
+
+# ==============================================================================
+# HYPERPARAMETERS - FAST (QUICK TRAINING)
+# ==============================================================================
+hyperparameters:
+  # --------------------------------------------------------------------------
+  # Tree Structure Control
+  # --------------------------------------------------------------------------
+  # Moderate depth
+  max_depth: 4  # Shallower for speed
+
+  # Moderate minimum samples
+  min_child_weight: 10  # Balanced
+
+  # --------------------------------------------------------------------------
+  # Regularization - BALANCED FOR SPEED
+  # --------------------------------------------------------------------------
+  # Moderate regularization
+  gamma: 1.0
+
+  # Moderate L2
+  reg_lambda: 15
+
+  # Moderate L1
+  reg_alpha: 0.8
+
+  # --------------------------------------------------------------------------
+  # Learning & Ensemble - OPTIMIZED FOR SPEED
+  # --------------------------------------------------------------------------
+  # Higher learning rate for fewer rounds
+  learning_rate: 0.1  # Higher for speed
+
+  # Fewer trees for quick training
+  n_estimators: 50  # Much fewer for speed
+
+  # Quick early stopping
+  early_stopping_rounds: 10  # Quick stopping
+
+  # --------------------------------------------------------------------------
+  # Sampling - Moderate for speed
+  # --------------------------------------------------------------------------
+  # Less data per tree for speed
+  subsample: 0.5  # Lower for speed
+
+  # Less features for speed
+  colsample_bytree: 0.6  # Lower for speed
+
+  # --------------------------------------------------------------------------
+  # Other Settings
+  # --------------------------------------------------------------------------
+  objective: "reg:squarederror"
+  eval_metric: ["rmse", "mae"]
+  tree_method: "hist"
+  grow_policy: "depthwise"
+  seed: 42
+
+# ==============================================================================
+# VALIDATION STRATEGY
+# ==============================================================================
+validation:
+  use_validation_set: true
+  val_split: 0.2
+  monitor_metrics:
+    - "rmse"
+    - "mae"
+
+# ==============================================================================
+# EXTERNAL MEMORY SETTINGS - OPTIMIZED FOR SPEED
+# ==============================================================================
+external_memory:
+  batch_size: 5000000  # Larger batches for speed
+  cache_dir: "./xgb_cache"
+  clean_cache: true
+
+# ==============================================================================
+# EXPECTED OUTCOMES - FAST
+# ==============================================================================
+# Memory Usage: 7-9GB
+# Model Performance: 5-7% improvement (reasonable)
+# Training time: 15-30 minutes (MUCH FASTER)
+# Good for quick experimentation and pipeline testing

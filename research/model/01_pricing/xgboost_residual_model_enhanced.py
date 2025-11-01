@@ -319,21 +319,64 @@ def load_and_prepare_data(
     # Join RV features (LAZY - no .collect()!)
     logger.info("Joining realized volatility features...")
     rv = pl.scan_parquet(RV_FILE).select(["timestamp_seconds"] + RV_FEATURES)
+
+    # CRITICAL FIX: Filter feature files to match baseline date range BEFORE joining
+    # This prevents loading all 63M rows when we only need the filtered subset
+    # Calculate timestamp range from date filters (for both pilot and production modes)
+    from datetime import datetime
+
+    if pilot:
+        # For pilot, filter to October 2023 timestamps
+        start_ts = int(datetime(2023, 10, 1).timestamp())
+        end_ts = int(datetime(2023, 11, 1).timestamp())  # Nov 1 00:00 (exclusive)
+        logger.info(f"Pilot mode: filtering features to October 2023 ({start_ts} to {end_ts})")
+    elif start_date and end_date:
+        # For production, calculate timestamp range from date arguments
+        start_ts = int(datetime.fromisoformat(start_date).timestamp())
+        end_ts = int(datetime.fromisoformat(end_date).timestamp())
+        logger.info(f"Production mode: filtering features to {start_date} - {end_date} ({start_ts} to {end_ts})")
+    else:
+        # No filtering if no dates specified (full dataset - rare case)
+        start_ts = None
+        end_ts = None
+        logger.warning("No date filters specified - loading full feature datasets (may cause OOM!)")
+
+    # Apply timestamp filters to ALL feature files (if dates specified)
+    if start_ts is not None and end_ts is not None:
+        rv = rv.filter((pl.col("timestamp_seconds") >= start_ts) & (pl.col("timestamp_seconds") < end_ts))
+        logger.info(f"Filtered RV features to timestamp range")
+
     df = df.join(rv, left_on="timestamp", right_on="timestamp_seconds", how="left")
 
     # Join microstructure features (LAZY - no .collect()!)
     logger.info("Joining microstructure features...")
     micro = pl.scan_parquet(MICROSTRUCTURE_FILE).select(["timestamp_seconds"] + MICROSTRUCTURE_FEATURES)
+
+    # Apply same timestamp filter
+    if start_ts is not None and end_ts is not None:
+        micro = micro.filter((pl.col("timestamp_seconds") >= start_ts) & (pl.col("timestamp_seconds") < end_ts))
+        logger.info("Filtered microstructure features to timestamp range")
+
     df = df.join(micro, left_on="timestamp", right_on="timestamp_seconds", how="left")
 
     # Join advanced features (LAZY - no .collect()!)
     logger.info("Joining advanced features...")
     advanced = pl.scan_parquet(ADVANCED_FILE).select(["timestamp"] + ADVANCED_FEATURES)
+
+    # Apply same timestamp filter (note: advanced uses "timestamp" not "timestamp_seconds")
+    if start_ts is not None and end_ts is not None:
+        advanced = advanced.filter((pl.col("timestamp") >= start_ts) & (pl.col("timestamp") < end_ts))
+        logger.info("Filtered advanced features to timestamp range")
+
     df = df.join(advanced, on="timestamp", how="left")
 
     # Filter to complete cases (still lazy until final collect)
     # Build combined filter expression first, then apply, then collect once at the end
     logger.info("Filtering to complete cases (using lazy evaluation for memory safety)...")
+
+    # Count rows before filtering (lazy count)
+    n_before_filter = get_row_count(df)
+    logger.info(f"Rows before filtering: {n_before_filter:,}")
 
     # Boolean features (don't apply .is_finite())
     boolean_features = ["is_us_hours", "is_asia_hours", "is_europe_hours"]
@@ -358,6 +401,18 @@ def load_and_prepare_data(
 
     # Apply filter (still lazy)
     df_filtered = df.filter(combined_filter)
+
+    # Count rows after filtering (lazy count)
+    n_after_filter = get_row_count(df_filtered)
+    n_removed = n_before_filter - n_after_filter
+    pct_removed = (n_removed / n_before_filter * 100) if n_before_filter > 0 else 0
+    logger.info(f"Rows after filtering: {n_after_filter:,}")
+    logger.info(f"Rows removed: {n_removed:,} ({pct_removed:.1f}%)")
+
+    # Log warning if too many rows were removed
+    if pct_removed > 10:
+        logger.warning(f"⚠️  High data loss: {pct_removed:.1f}% of rows removed due to nulls/infinities")
+        logger.warning("   Consider investigating data quality issues in feature engineering pipeline")
 
     # RETURN LAZYFRAME (do NOT collect - prevents 40GB memory spike!)
     logger.info("Returning LazyFrame (data NOT yet collected - memory safe)")
@@ -414,6 +469,8 @@ class DataFrameIterator(xgb.DataIter):
         self.n_rows = get_row_count(lf)  # Lazy count (minimal memory)
         self.n_batches = (self.n_rows + batch_size - 1) // batch_size
         self.current_batch = 0
+        self._started = False  # Track if iteration has started
+        self._data_yielded = False  # Track if we've yielded data in current iteration
         logger.info(f"DataFrameIterator: {self.n_rows:,} rows, {self.n_batches} batches of {batch_size:,}")
         # CRITICAL: Must call parent __init__ with cache_prefix for XGBoost 3.0+
         super().__init__(cache_prefix=os.path.join(".", "xgb_cache"))
@@ -429,30 +486,55 @@ class DataFrameIterator(xgb.DataIter):
 
         This method is called by XGBoost to fetch the next batch.
         Returns 0 when successful, 1 when no more data.
+
+        NOTE: XGBoost may call this multiple times during initialization
+        for quantile sketch building. We need to handle this properly.
         """
+        # Initialize on first call if not already started
+        if not self._started:
+            self._started = True
+            self.current_batch = 0
+            self._data_yielded = False
+
+        # Check if we have more batches
         if self.current_batch >= self.n_batches:
+            # If we never yielded data, there's a problem
+            if not self._data_yielded:
+                logger.warning("DataFrameIterator: next() called but no data was yielded")
             return 1  # No more data
 
         start_idx = self.current_batch * self.batch_size
-        logger.info(f"  Loading batch {self.current_batch + 1}/{self.n_batches} (rows {start_idx:,} to {min(start_idx + self.batch_size, self.n_rows):,})")
+        end_idx = min(start_idx + self.batch_size, self.n_rows)
+        logger.info(f"  Loading batch {self.current_batch + 1}/{self.n_batches} (rows {start_idx:,} to {end_idx:,})")
 
-        # Collect ONLY this batch (constant memory due to small batch size)
-        batch_lf = self.lf.slice(start_idx, self.batch_size)
-        batch_df = batch_lf.collect()
+        try:
+            # Collect ONLY this batch (constant memory due to small batch size)
+            batch_lf = self.lf.slice(start_idx, self.batch_size)
+            batch_df = batch_lf.collect()
 
-        # Convert to float32 to halve memory (8 bytes -> 4 bytes)
-        X_batch = batch_df.select(ALL_FEATURES).cast(pl.Float32).to_numpy()  # noqa: N806
-        y_batch = batch_df["residual"].cast(pl.Float32).to_numpy()
+            # Verify we have data
+            if len(batch_df) == 0:
+                logger.error(f"Empty batch at index {self.current_batch}")
+                return 1
 
-        # Clean up DataFrame immediately (keep numpy arrays for return)
-        del batch_df
-        gc.collect()
+            # Convert to float32 to halve memory (8 bytes -> 4 bytes)
+            X_batch = batch_df.select(ALL_FEATURES).cast(pl.Float32).to_numpy()  # noqa: N806
+            y_batch = batch_df["residual"].cast(pl.Float32).to_numpy()
 
-        # Use the callback to pass data to XGBoost
-        input_data(data=X_batch, label=y_batch)
+            # Clean up DataFrame immediately (keep numpy arrays for return)
+            del batch_df
+            gc.collect()
 
-        self.current_batch += 1
-        return 0  # Success
+            # Use the callback to pass data to XGBoost
+            input_data(data=X_batch, label=y_batch)
+
+            self._data_yielded = True
+            self.current_batch += 1
+            return 0  # Success
+
+        except Exception as e:
+            logger.error(f"Error loading batch {self.current_batch}: {e}")
+            return 1  # Error
 
     def __next__(self) -> tuple[np.ndarray, np.ndarray]:
         """Python iterator protocol for compatibility."""
@@ -473,12 +555,15 @@ class DataFrameIterator(xgb.DataIter):
     def reset(self) -> None:
         """Reset iterator to beginning."""
         self.current_batch = 0
+        self._started = False
+        self._data_yielded = False
 
 
 def train_xgboost_model(
     lf: pl.LazyFrame,
     config: dict,
     n_splits: int = 5,
+    lf_val: pl.LazyFrame | None = None,
 ) -> tuple[BoosterWrapper, dict]:
     """
     Train XGBoost model with external memory support and config-based hyperparameters.
@@ -491,9 +576,10 @@ def train_xgboost_model(
     The function collects only small batches as needed.
 
     Args:
-        lf: LazyFrame with features and residuals (will be sorted by timestamp)
+        lf: LazyFrame with training features and residuals (will be sorted by timestamp)
         config: Configuration dict with memory, hyperparameters, and validation settings
         n_splits: Number of CV splits
+        lf_val: Optional separate validation LazyFrame. If None, uses 80/20 split from lf.
 
     Returns:
         (wrapped_booster, cv_results)
@@ -630,56 +716,112 @@ def train_xgboost_model(
     logger.info("NOTE: Using external memory for memory-efficient training on large dataset")
     logger.info("      Training with streaming batches to avoid loading all data into RAM")
 
-    # Calculate split point for train/validation
-    n_train = int(n_samples * 0.8)
-    n_val = n_samples - n_train
-    logger.info(f"Train samples: {n_train:,} (80%)")
-    logger.info(f"Val samples:   {n_val:,} (20%)")
+    # Handle validation data: use provided lf_val or split from training data
+    if lf_val is not None:
+        # Use provided validation LazyFrame
+        n_train = n_samples  # All of lf is training data
+        n_val = get_row_count(lf_val)
+        logger.info(f"Using separate validation LazyFrame")
+        logger.info(f"Train samples: {n_train:,}")
+        logger.info(f"Val samples:   {n_val:,}")
+        train_lf = lf
+        val_lf = lf_val.sort("timestamp")  # Ensure validation is also sorted
+    else:
+        # Fall back to 80/20 split if no validation LazyFrame provided
+        n_train = int(n_samples * 0.8)
+        n_val = n_samples - n_train
+        logger.info(f"No separate validation provided, using 80/20 split")
+        logger.info(f"Train samples: {n_train:,} (80%)")
+        logger.info(f"Val samples:   {n_val:,} (20%)")
+        train_lf = lf.slice(0, n_train)
+        val_lf = lf.slice(n_train, n_val)
 
-    log_memory_usage("Before external memory setup")
-
-    # =========================================================================
-    # Create Training Iterator
-    # =========================================================================
-    logger.info("\nCreating training data iterator...")
-    train_lf = lf.slice(0, n_train)
-    train_iterator = DataFrameIterator(train_lf, batch_size=2_000_000)
-
-    # Create ExtMemQuantileDMatrix for training
-    logger.info("Creating ExtMemQuantileDMatrix for training (external memory)...")
-    logger.info("This will process data in batches and cache to disk...")
-
-    # Create training DMatrix with external memory
-    dtrain = xgb.ExtMemQuantileDMatrix(
-        train_iterator,
-        max_bin=mem_config.get("max_bin", 32),
-        missing=np.nan,
-        nthread=mem_config.get("nthread", 1),
-    )
-    logger.info("✓ Training ExtMemQuantileDMatrix created")
-    log_memory_usage("After training ExtMemQuantileDMatrix")
+    log_memory_usage("Before DMatrix setup")
 
     # =========================================================================
-    # Create Validation Iterator
+    # Choose DMatrix Strategy Based on Dataset Size
     # =========================================================================
-    logger.info("\nCreating validation data iterator...")
-    val_lf = lf.slice(n_train, n_val)
-    val_iterator = DataFrameIterator(val_lf, batch_size=2_000_000)
+    # Use standard DMatrix for smaller datasets that fit in memory (<10M rows)
+    # Use ExtMemQuantileDMatrix for larger datasets
+    USE_EXTERNAL_MEMORY_THRESHOLD = 10_000_000  # 10M rows
+    use_external_memory = n_train > USE_EXTERNAL_MEMORY_THRESHOLD
 
-    # Create ExtMemQuantileDMatrix for validation
-    logger.info("Creating ExtMemQuantileDMatrix for validation...")
-    logger.info("Using training quantiles for consistency...")
+    if not use_external_memory:
+        # =====================================================================
+        # Standard DMatrix for Small/Medium Datasets (<10M rows)
+        # =====================================================================
+        logger.info("\nUsing standard DMatrix (dataset fits in memory)")
+        logger.info(f"Training samples: {n_train:,} (< {USE_EXTERNAL_MEMORY_THRESHOLD:,} threshold)")
 
-    # Create validation DMatrix using training quantiles
-    dval = xgb.ExtMemQuantileDMatrix(
-        val_iterator,
-        ref=dtrain,  # Use training quantiles for consistency
-        max_bin=mem_config.get("max_bin", 32),
-        missing=np.nan,
-        nthread=mem_config.get("nthread", 1),
-    )
-    logger.info("✓ Validation ExtMemQuantileDMatrix created")
-    log_memory_usage("After validation ExtMemQuantileDMatrix")
+        # Collect training data
+        logger.info("Collecting training data...")
+        train_df = train_lf.collect()
+        X_train = train_df.select(ALL_FEATURES).cast(pl.Float32).to_numpy()
+        y_train = train_df["residual"].cast(pl.Float32).to_numpy()
+        del train_df
+        gc.collect()
+
+        # Create standard training DMatrix
+        dtrain = xgb.DMatrix(X_train, label=y_train)
+        logger.info("✓ Training DMatrix created")
+        log_memory_usage("After training DMatrix")
+
+        # Collect validation data
+        logger.info("Collecting validation data...")
+        val_df = val_lf.collect()
+        X_val = val_df.select(ALL_FEATURES).cast(pl.Float32).to_numpy()
+        y_val = val_df["residual"].cast(pl.Float32).to_numpy()
+        del val_df
+        gc.collect()
+
+        # Create standard validation DMatrix
+        dval = xgb.DMatrix(X_val, label=y_val)
+        logger.info("✓ Validation DMatrix created")
+        log_memory_usage("After validation DMatrix")
+
+    else:
+        # =====================================================================
+        # ExtMemQuantileDMatrix for Large Datasets (>10M rows)
+        # =====================================================================
+        logger.info("\nUsing ExtMemQuantileDMatrix (external memory for large dataset)")
+        logger.info(f"Training samples: {n_train:,} (> {USE_EXTERNAL_MEMORY_THRESHOLD:,} threshold)")
+
+        # Create Training Iterator
+        logger.info("\nCreating training data iterator...")
+        train_iterator = DataFrameIterator(train_lf, batch_size=2_000_000)
+
+        # Create ExtMemQuantileDMatrix for training
+        logger.info("Creating ExtMemQuantileDMatrix for training (external memory)...")
+        logger.info("This will process data in batches and cache to disk...")
+
+        # Create training DMatrix with external memory
+        dtrain = xgb.ExtMemQuantileDMatrix(
+            train_iterator,
+            max_bin=mem_config.get("max_bin", 32),
+            missing=np.nan,
+            nthread=mem_config.get("nthread", 1),
+        )
+        logger.info("✓ Training ExtMemQuantileDMatrix created")
+        log_memory_usage("After training ExtMemQuantileDMatrix")
+
+        # Create Validation Iterator
+        logger.info("\nCreating validation data iterator...")
+        val_iterator = DataFrameIterator(val_lf, batch_size=2_000_000)
+
+        # Create ExtMemQuantileDMatrix for validation
+        logger.info("Creating ExtMemQuantileDMatrix for validation...")
+        logger.info("Using training quantiles for consistency...")
+
+        # Create validation DMatrix using training quantiles
+        dval = xgb.ExtMemQuantileDMatrix(
+            val_iterator,
+            ref=dtrain,  # Use training quantiles for consistency
+            max_bin=mem_config.get("max_bin", 32),
+            missing=np.nan,
+            nthread=mem_config.get("nthread", 1),
+        )
+        logger.info("✓ Validation ExtMemQuantileDMatrix created")
+        log_memory_usage("After validation ExtMemQuantileDMatrix")
 
     # =========================================================================
     # Train with Early Stopping
@@ -975,7 +1117,7 @@ def main() -> None:
     log_memory_usage("Startup")
 
     # Check if using train/val/test split or legacy single-dataset mode
-    use_split = all([args.train_start, args.train_end, args.test_start, args.test_end])
+    use_split = all([args.train_start, args.train_end, args.val_start, args.val_end, args.test_start, args.test_end])
 
     if use_split:
         # ==================================================================
@@ -983,38 +1125,46 @@ def main() -> None:
         # ==================================================================
         logger.info("PRODUCTION MODE: Training on full period, streaming predictions")
         logger.info(f"Train period: {args.train_start} to {args.train_end}")
-        logger.info(f"Test period: {args.test_start} to {args.test_end}")
+        logger.info(f"Val period:   {args.val_start} to {args.val_end}")
+        logger.info(f"Test period:  {args.test_start} to {args.test_end}")
         # Hyperparameters already logged during config load
 
         # ==============================
-        # PHASE 1: Load training data (LazyFrame)
+        # PHASE 1: Load training and validation data (LazyFrame)
         # ==============================
         logger.info("\n" + "=" * 80)
-        logger.info("PHASE 1: LOADING TRAINING DATA")
+        logger.info("PHASE 1: LOADING TRAINING AND VALIDATION DATA")
         logger.info("=" * 80)
 
+        # Load training data
         lf_train = load_and_prepare_data(start_date=args.train_start, end_date=args.train_end)
         train_rows = get_row_count(lf_train)
         logger.info(f"Training data: {train_rows:,} rows (LazyFrame - not yet in memory)")
-        log_memory_usage("After loading training LazyFrame")
+
+        # Load validation data separately for temporal split
+        lf_val = load_and_prepare_data(start_date=args.val_start, end_date=args.val_end)
+        val_rows = get_row_count(lf_val)
+        logger.info(f"Validation data: {val_rows:,} rows (LazyFrame - not yet in memory)")
+        log_memory_usage("After loading training and validation LazyFrames")
 
         # ==============================
         # PHASE 2: Train model (external memory)
         # ==============================
         logger.info("\n" + "=" * 80)
-        logger.info("PHASE 2: TRAINING MODEL")
+        logger.info("PHASE 2: TRAINING MODEL WITH TEMPORAL VALIDATION")
         logger.info("=" * 80)
 
         model, _cv_results = train_xgboost_model(
             lf_train,
             config=config,
             n_splits=args.n_splits,
+            lf_val=lf_val,  # Pass separate validation LazyFrame
         )
 
-        # Cleanup training data
-        del lf_train
+        # Cleanup training and validation data
+        del lf_train, lf_val
         gc.collect()
-        log_memory_usage("After training (training data freed)")
+        log_memory_usage("After training (training and validation data freed)")
 
         # ==============================
         # PHASE 3: Load test data (LazyFrame)

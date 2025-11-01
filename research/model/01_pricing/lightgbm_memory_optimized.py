@@ -51,10 +51,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Memory constraints - Updated for 30GB RAM system
-MAX_MEMORY_GB = 20.0  # Safe limit for 30GB RAM (leaving ~10GB for OS)
-BATCH_SIZE = 5_000_000  # 5M rows per batch (more efficient with 30GB RAM)
-CHUNK_MONTHS = 6  # Process 6 months at a time (larger chunks with more RAM)
+# Memory constraints - Updated for 128GB RAM EC2 instance
+MAX_MEMORY_GB = 120  # Soft limit for 128GB RAM (leaving 8GB for OS)
+BATCH_SIZE = 20_000_000  # 20M rows per batch (optimized for 128GB RAM)
+CHUNK_MONTHS = 6  # 6-month chunks for memory safety (can handle 2-year with 128GB RAM)
 
 # File paths
 MODEL_DIR = Path(__file__).parent.parent
@@ -163,9 +163,9 @@ class MemoryMonitor:
         """Warn if memory limit exceeded but don't fail unless critical."""
         gc.collect()
         mem_gb = self.get_memory_gb()
-        # Only fail if we're approaching system limits (>28GB on 30GB system)
-        if mem_gb > 28.0:
-            raise MemoryError(f"Critical memory limit: {mem_gb:.2f} GB > 28.0 GB (system limit)")
+        # Only fail if we're approaching system limits (>120GB on 128GB system)
+        if mem_gb > 120.0:
+            raise MemoryError(f"Critical memory limit: {mem_gb:.2f} GB > 120.0 GB (system limit)")
         elif mem_gb > self.max_gb:
             logger.warning(f"Soft limit exceeded: {mem_gb:.2f} GB > {self.max_gb:.2f} GB (continuing)")
 
@@ -262,12 +262,18 @@ def prepare_features_streaming(
         statistics=True,
     )
 
-    # Get row count without loading full dataset
-    row_count = pl.scan_parquet(output_file).select(pl.len()).collect().item()
-    logger.info(f"Wrote {row_count:,} rows to {output_file}")
+    # Clean up lazy frames and force garbage collection
+    del lazy_df, baseline_timestamps
+    gc.collect()
+    monitor.check_memory("After cleanup")
+
+    # Log file size instead of row count (avoids re-scanning)
+    file_size_gb = Path(output_file).stat().st_size / 1e9
+    logger.info(f"Wrote features to {output_file}")
+    logger.info(f"File size: {file_size_gb:.2f} GB")
 
     monitor.check_memory("After streaming write")
-    return row_count
+    return 1  # Return 1 to indicate success (file was written)
 
 
 def create_lgb_dataset_from_parquet(
@@ -324,15 +330,18 @@ def evaluate_brier_score(predictions_df: pl.DataFrame) -> dict[str, float]:
         Dictionary with baseline_brier, model_brier, and improvement_pct
     """
     # Calculate baseline Brier score
-    baseline_brier = float(((predictions_df["prob_mid"] - predictions_df["outcome"]) ** 2).mean())
+    baseline_brier_val = ((predictions_df["prob_mid"] - predictions_df["outcome"]) ** 2).mean()
+    baseline_brier = float(baseline_brier_val) if baseline_brier_val is not None else 0.0  # type: ignore[arg-type]
 
     # Calculate model Brier score (using final corrected probabilities)
     if "final_prob" in predictions_df.columns:
-        model_brier = float(((predictions_df["final_prob"] - predictions_df["outcome"]) ** 2).mean())
+        model_brier_val = ((predictions_df["final_prob"] - predictions_df["outcome"]) ** 2).mean()
+        model_brier = float(model_brier_val) if model_brier_val is not None else 0.0  # type: ignore[arg-type]
     else:
         # If no final_prob, use residual_pred to compute it
         final_prob = predictions_df["prob_mid"] + predictions_df["residual_pred"]
-        model_brier = float(((final_prob - predictions_df["outcome"]) ** 2).mean())
+        model_brier_val = ((final_prob - predictions_df["outcome"]) ** 2).mean()
+        model_brier = float(model_brier_val) if model_brier_val is not None else 0.0  # type: ignore[arg-type]
 
     # Calculate improvement
     improvement_pct = (baseline_brier - model_brier) / baseline_brier * 100 if baseline_brier > 0 else 0
@@ -645,9 +654,9 @@ def split_data_three_way(
     test_rows = total_rows - train_rows - val_rows  # Ensures we use all rows
 
     logger.info(f"Total rows: {total_rows:,}")
-    logger.info(f"Train rows: {train_rows:,} ({train_rows/total_rows:.1%})")
-    logger.info(f"Val rows:   {val_rows:,} ({val_rows/total_rows:.1%})")
-    logger.info(f"Test rows:  {test_rows:,} ({test_rows/total_rows:.1%})")
+    logger.info(f"Train rows: {train_rows:,} ({train_rows / total_rows:.1%})")
+    logger.info(f"Val rows:   {val_rows:,} ({val_rows / total_rows:.1%})")
+    logger.info(f"Test rows:  {test_rows:,} ({test_rows / total_rows:.1%})")
 
     # Define output files
     train_file = output_dir / "train_features_lgb.parquet"
@@ -658,9 +667,11 @@ def split_data_three_way(
         logger.info("Shuffling data before split...")
         # For large datasets, we'll use a hash-based shuffle
         # Add a random column for shuffling
-        shuffled_data = all_data.with_columns([
-            (pl.col("timestamp").hash(seed) % 1000000).alias("shuffle_key")
-        ]).sort("shuffle_key").drop("shuffle_key")
+        shuffled_data = (
+            all_data.with_columns([(pl.col("timestamp").hash(seed) % 1000000).alias("shuffle_key")])
+            .sort("shuffle_key")
+            .drop("shuffle_key")
+        )
 
         # Write splits using streaming
         logger.info("Writing train set...")
@@ -698,7 +709,7 @@ def train_temporal_chunks(
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
     evaluate_test: bool = True,
-) -> None:
+) -> dict[str, Any]:
     """
     Train model using temporal chunking for very large datasets with train/val/test splits.
 
@@ -711,6 +722,9 @@ def train_temporal_chunks(
         val_ratio: Proportion for validation set
         test_ratio: Proportion for test set
         evaluate_test: Whether to evaluate on test set after training
+
+    Returns:
+        Dictionary with test set metrics (if evaluate_test=True), empty dict otherwise
     """
     monitor = MemoryMonitor()
 
@@ -783,6 +797,7 @@ def train_temporal_chunks(
     logger.info(f"Model (JSON) saved to {model_json_file}")
 
     # Evaluate on test set if requested
+    results = {}
     if evaluate_test and test_file:
         logger.info("\n" + "=" * 80)
         logger.info("EVALUATING ON TEST SET")
@@ -800,23 +815,32 @@ def train_temporal_chunks(
         test_pred = model.predict(
             x_test, num_iteration=model.best_iteration if hasattr(model, "best_iteration") else None
         )
+        # Ensure predictions are ndarray for type checking
+        test_pred_array = np.asarray(test_pred)
 
         # Calculate residual metrics
         if "residual" in test_df.columns:
             y_test = test_df.select("residual").to_numpy().ravel()
-            test_metrics = calculate_residual_metrics(y_test, test_pred)
+            test_metrics = calculate_residual_metrics(y_test, test_pred_array)
 
             logger.info("\nTest Set Residual Metrics:")
             logger.info(f"  MSE:  {test_metrics['residual_mse']:.6f}")
             logger.info(f"  RMSE: {test_metrics['residual_rmse']:.6f}")
             logger.info(f"  MAE:  {test_metrics['residual_mae']:.6f}")
 
+            # Add to results
+            results.update(test_metrics)
+
         # Calculate Brier scores if we have the necessary columns
         if "prob_mid" in test_df.columns and "outcome" in test_df.columns:
-            test_with_pred = test_df.with_columns([
-                pl.Series("residual_pred", test_pred).cast(pl.Float32),
-                (pl.col("prob_mid") + pl.Series("residual_pred", test_pred)).alias("final_prob").cast(pl.Float32),
-            ])
+            test_with_pred = test_df.with_columns(
+                [
+                    pl.Series("residual_pred", test_pred_array).cast(pl.Float32),
+                    (pl.col("prob_mid") + pl.Series("residual_pred", test_pred_array))
+                    .alias("final_prob")
+                    .cast(pl.Float32),
+                ]
+            )
 
             test_brier_results = evaluate_brier_score(test_with_pred)
 
@@ -824,6 +848,9 @@ def train_temporal_chunks(
             logger.info(f"  Baseline Brier: {test_brier_results['baseline_brier']:.6f}")
             logger.info(f"  Model Brier:    {test_brier_results['model_brier']:.6f}")
             logger.info(f"  Improvement:    {test_brier_results['improvement_pct']:+.2f}%")
+
+            # Add to results
+            results.update(test_brier_results)
 
             # Summary across all sets
             logger.info("\n" + "=" * 80)
@@ -845,6 +872,8 @@ def train_temporal_chunks(
         Path(test_file).unlink(missing_ok=True)
 
     monitor.check_memory("Final")
+
+    return results
 
 
 def compare_with_xgboost(
@@ -872,9 +901,11 @@ def compare_with_xgboost(
     # Load and predict with LightGBM
     lgb_model = lgb.Booster(model_file=lgb_model_path)
     lgb_pred = lgb_model.predict(x_test)
+    # Ensure predictions are ndarray for type checking
+    lgb_pred_array = np.asarray(lgb_pred)
 
     # Calculate residual metrics for LightGBM
-    lgb_metrics = calculate_residual_metrics(y_test, lgb_pred)
+    lgb_metrics = calculate_residual_metrics(y_test, lgb_pred_array)
 
     logger.info("\n" + "-" * 40)
     logger.info("RESIDUAL METRICS")
@@ -887,10 +918,12 @@ def compare_with_xgboost(
     # Calculate Brier scores if we have prob_mid and outcome
     if "prob_mid" in test_df.columns and "outcome" in test_df.columns:
         # Add predictions to dataframe for Brier calculation
-        test_with_lgb_pred = test_df.with_columns([
-            pl.Series("residual_pred", lgb_pred).cast(pl.Float32),
-            (pl.col("prob_mid") + pl.Series("residual_pred", lgb_pred)).alias("final_prob").cast(pl.Float32),
-        ])
+        test_with_lgb_pred = test_df.with_columns(
+            [
+                pl.Series("residual_pred", lgb_pred_array).cast(pl.Float32),
+                (pl.col("prob_mid") + pl.Series("residual_pred", lgb_pred_array)).alias("final_prob").cast(pl.Float32),
+            ]
+        )
 
         lgb_brier_results = evaluate_brier_score(test_with_lgb_pred)
 
@@ -913,8 +946,10 @@ def compare_with_xgboost(
 
         dtest = xgb.DMatrix(x_test)
         xgb_pred = xgb_model.predict(dtest)
+        # Ensure predictions are ndarray for type checking
+        xgb_pred_array = np.asarray(xgb_pred)
 
-        xgb_metrics = calculate_residual_metrics(y_test, xgb_pred)
+        xgb_metrics = calculate_residual_metrics(y_test, xgb_pred_array)
 
         logger.info("\nXGBoost Performance:")
         logger.info(f"  Residual MSE:  {xgb_metrics['residual_mse']:.6f}")
@@ -923,10 +958,14 @@ def compare_with_xgboost(
 
         # Calculate XGBoost Brier scores
         if "prob_mid" in test_df.columns and "outcome" in test_df.columns:
-            test_with_xgb_pred = test_df.with_columns([
-                pl.Series("residual_pred", xgb_pred).cast(pl.Float32),
-                (pl.col("prob_mid") + pl.Series("residual_pred", xgb_pred)).alias("final_prob").cast(pl.Float32),
-            ])
+            test_with_xgb_pred = test_df.with_columns(
+                [
+                    pl.Series("residual_pred", xgb_pred_array).cast(pl.Float32),
+                    (pl.col("prob_mid") + pl.Series("residual_pred", xgb_pred_array))
+                    .alias("final_prob")
+                    .cast(pl.Float32),
+                ]
+            )
 
             xgb_brier_results = evaluate_brier_score(test_with_xgb_pred)
 
@@ -939,17 +978,23 @@ def compare_with_xgboost(
             logger.info("HEAD-TO-HEAD COMPARISON")
             logger.info("=" * 40)
             logger.info("\nResidual Metrics (LightGBM vs XGBoost):")
-            logger.info(f"  MSE:  {((xgb_metrics['residual_mse'] - lgb_metrics['residual_mse']) / xgb_metrics['residual_mse'] * 100):+.2f}% (negative = LightGBM better)")
-            logger.info(f"  RMSE: {((xgb_metrics['residual_rmse'] - lgb_metrics['residual_rmse']) / xgb_metrics['residual_rmse'] * 100):+.2f}%")
-            logger.info(f"  MAE:  {((xgb_metrics['residual_mae'] - lgb_metrics['residual_mae']) / xgb_metrics['residual_mae'] * 100):+.2f}%")
+            logger.info(
+                f"  MSE:  {((xgb_metrics['residual_mse'] - lgb_metrics['residual_mse']) / xgb_metrics['residual_mse'] * 100):+.2f}% (negative = LightGBM better)"
+            )
+            logger.info(
+                f"  RMSE: {((xgb_metrics['residual_rmse'] - lgb_metrics['residual_rmse']) / xgb_metrics['residual_rmse'] * 100):+.2f}%"
+            )
+            logger.info(
+                f"  MAE:  {((xgb_metrics['residual_mae'] - lgb_metrics['residual_mae']) / xgb_metrics['residual_mae'] * 100):+.2f}%"
+            )
 
             logger.info("\nBrier Score Comparison:")
             logger.info(f"  LightGBM Brier: {lgb_brier_results['model_brier']:.6f}")
             logger.info(f"  XGBoost Brier:  {xgb_brier_results['model_brier']:.6f}")
-            if lgb_brier_results['model_brier'] < xgb_brier_results['model_brier']:
-                logger.info(f"  Winner: LightGBM (lower is better)")
+            if lgb_brier_results["model_brier"] < xgb_brier_results["model_brier"]:
+                logger.info("  Winner: LightGBM (lower is better)")
             else:
-                logger.info(f"  Winner: XGBoost (lower is better)")
+                logger.info("  Winner: XGBoost (lower is better)")
 
 
 def main():

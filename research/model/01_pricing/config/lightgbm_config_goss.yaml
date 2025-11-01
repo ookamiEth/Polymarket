@@ -1,0 +1,232 @@
+# LightGBM Residual Model - GOSS Configuration (Gradient-based One-Side Sampling)
+#
+# This configuration uses GOSS for faster training on the 63M row dataset
+# GOSS keeps all samples with large gradients and randomly samples from
+# samples with small gradients, significantly speeding up training
+#
+# Expected benefits:
+# - 2-3x faster training than standard GBDT
+# - Minimal accuracy loss (typically <1%)
+# - Better handling of class imbalance
+# - Reduced memory usage during training
+#
+# ==============================================================================
+# MEMORY OPTIMIZATION - GOSS-SPECIFIC SETTINGS
+# ==============================================================================
+memory:
+  # LightGBM can handle more bins efficiently due to histogram optimization
+  max_bin: 255  # Keep high for accuracy on 128GB RAM system
+
+  # Thread control - LightGBM handles threading better than XGBoost
+  num_threads: 12  # Utilize 12 cores on 128GB EC2 instance
+
+  # Histogram pool size (-1 = auto-managed by LightGBM)
+  histogram_pool_size: -1
+
+  # Minimum data per group for categorical features
+  min_data_per_group: 100
+
+  # Maximum categories for a categorical feature
+  max_cat_threshold: 32
+
+  # Force row-wise histogram building (lower memory but slower)
+  force_row_wise: true
+
+  # Enable feature bundling to save memory
+  enable_bundle: true
+
+  # CV sample percentage for hyperparameter tuning
+  cv_sample_pct: 0.01  # 1% of 63M = 630K rows for quick iterations
+
+# ==============================================================================
+# HYPERPARAMETERS - GOSS-OPTIMIZED
+# ==============================================================================
+hyperparameters:
+  # --------------------------------------------------------------------------
+  # Core Parameters
+  # --------------------------------------------------------------------------
+  # Objective function (keep regression for residual modeling)
+  objective: "regression"
+
+  # Evaluation metrics - MSE directly relates to Brier improvement
+  metric: ["mse", "rmse", "mae"]
+
+  # Boosting type - GOSS for speed
+  boosting_type: "goss"  # KEY CHANGE: Gradient-based One-Side Sampling
+
+  # Random seed for reproducibility
+  seed: 42
+
+  # --------------------------------------------------------------------------
+  # GOSS-SPECIFIC PARAMETERS
+  # --------------------------------------------------------------------------
+  # Top rate: retain samples with top gradients
+  # Higher = more accurate but slower
+  top_rate: 0.2  # Keep top 20% samples with largest gradients
+
+  # Other rate: randomly sample from remaining samples
+  # Higher = more accurate but slower
+  other_rate: 0.1  # Randomly sample 10% of remaining samples
+
+  # Note: Effective sample rate = top_rate + (1-top_rate) * other_rate
+  # In this case: 0.2 + 0.8 * 0.1 = 0.28 (using 28% of data per iteration)
+  # This gives ~3.5x speedup while maintaining accuracy
+
+  # --------------------------------------------------------------------------
+  # Tree Structure Control - ADAPTED FOR GOSS
+  # --------------------------------------------------------------------------
+  # Number of leaves - REDUCED for smoother probabilities
+  num_leaves: 15  # Reduced from 31 for better calibration
+
+  # Maximum tree depth - SET EXPLICIT LIMIT
+  max_depth: 7  # Prevent overfitting
+
+  # Minimum samples in leaf - INCREASED for GOSS
+  # Note: With GOSS, effective samples are weighted, so we can use higher values
+  min_data_in_leaf: 100  # Higher than standard config due to sampling
+
+  # Minimum sum of hessian in leaf
+  min_sum_hessian_in_leaf: 1e-3
+
+  # --------------------------------------------------------------------------
+  # Regularization - ADJUSTED FOR GOSS SAMPLING
+  # --------------------------------------------------------------------------
+  # L1 regularization - SLIGHTLY HIGHER for GOSS
+  lambda_l1: 0.8  # Slightly higher to compensate for sampling
+
+  # L2 regularization - KEPT MODERATE
+  lambda_l2: 15.0  # Same as optimized config
+
+  # Minimum loss reduction for split - LOWER FOR SUBTLE PATTERNS
+  min_gain_to_split: 0.1  # Low to capture financial microstructure
+
+  # --------------------------------------------------------------------------
+  # Sampling Parameters - MODIFIED FOR GOSS
+  # --------------------------------------------------------------------------
+  # Feature sampling per tree
+  feature_fraction: 0.8  # Keep feature sampling
+
+  # Row sampling - NOT USED WITH GOSS
+  # GOSS handles row sampling internally via top_rate and other_rate
+  bagging_fraction: 1.0  # Set to 1.0 (no additional bagging with GOSS)
+  bagging_freq: 0  # Disabled for GOSS
+
+  # Feature sampling by node
+  feature_fraction_bynode: 0.8
+
+  # --------------------------------------------------------------------------
+  # Learning Parameters - ADJUSTED FOR GOSS
+  # --------------------------------------------------------------------------
+  # Learning rate - SLIGHTLY HIGHER for GOSS
+  # Can use higher rate due to gradient-based sampling
+  learning_rate: 0.03  # Slightly higher than optimized (0.02)
+
+  # Number of boosting iterations
+  n_estimators: 800  # Slightly fewer trees due to higher learning rate
+
+  # Early stopping rounds
+  early_stopping_rounds: 50  # Same patience as optimized
+
+  # --------------------------------------------------------------------------
+  # Advanced LightGBM Features
+  # --------------------------------------------------------------------------
+  # Path smoothing (helps prevent overfitting)
+  path_smooth: 0.0  # Keep disabled
+
+  # Extra trees - DO NOT USE with GOSS
+  extra_trees: false  # Incompatible with GOSS
+
+  # Use two-round loading (memory efficiency)
+  two_round: true
+
+  # Handle missing values
+  use_missing: true
+  zero_as_missing: false
+
+  # Deterministic training
+  deterministic: true
+
+  # Data sample strategy - MUST BE GOSS
+  data_sample_strategy: "goss"  # Ensures GOSS is used
+
+  # --------------------------------------------------------------------------
+  # Categorical Features (if any)
+  # --------------------------------------------------------------------------
+  # Maximum number of bins for categorical features
+  max_cat_to_onehot: 4
+
+  # Categorical smoothing
+  cat_smooth: 10.0
+
+  # L2 regularization in categorical split
+  cat_l2: 10.0
+
+# ==============================================================================
+# VALIDATION STRATEGY
+# ==============================================================================
+validation:
+  use_validation_set: true
+  val_split: 0.2  # 80/20 split
+  monitor_metrics:
+    - "rmse"
+    - "mae"
+    - "mse"
+
+  # Stratified sampling
+  stratified: false  # Keep temporal order for time series
+
+  # Cross-validation settings
+  cv_folds: 5
+  cv_shuffle: false  # IMPORTANT: Don't shuffle for time series
+
+# ==============================================================================
+# GPU SETTINGS (Optional)
+# ==============================================================================
+use_gpu: false  # GOSS works well on CPU
+gpu:
+  gpu_device_id: 0
+  gpu_platform_id: 0
+  gpu_use_dp: false
+
+# ==============================================================================
+# OUTPUT SETTINGS
+# ==============================================================================
+output:
+  # Feature importance type
+  importance_type: "gain"
+
+  # Number of top features to log
+  top_features: 30
+
+  # Save feature importance plot
+  save_importance_plot: true
+
+  # Model formats to save
+  save_formats:
+    - "txt"  # LightGBM native format
+    - "json"  # Human-readable format
+
+# ==============================================================================
+# GOSS PERFORMANCE EXPECTATIONS
+# ==============================================================================
+# Based on research and benchmarks:
+# - Training time: ~3-5 minutes (vs ~9 minutes for standard GBDT)
+# - Memory usage: ~30-40% less during training
+# - Accuracy: Within 0.5-1% of standard GBDT
+# - Best for: Large datasets with many "easy" samples
+#
+# GOSS is particularly effective for:
+# - Financial time series with many near-zero residuals
+# - Large datasets where training time is critical
+# - Situations where slight accuracy trade-off is acceptable
+#
+# Tuning tips:
+# - Increase top_rate for higher accuracy (but slower)
+# - Increase other_rate for better coverage of tail events
+# - Monitor validation metrics closely as GOSS can underfit
+performance_expectations:
+  expected_speedup: 3.5  # ~3.5x faster than standard GBDT
+  expected_memory_reduction: 0.35  # 35% less memory during training
+  expected_brier_improvement: 0.095  # Slightly lower than optimized (9.5% vs 10%)
+  expected_rmse: 0.382  # Slightly higher than optimized
+  training_time_minutes: 4  # Down from ~9 minutes

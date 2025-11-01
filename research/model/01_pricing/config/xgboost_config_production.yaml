@@ -1,0 +1,125 @@
+# XGBoost Residual Model - Production Configuration (63M rows)
+#
+# This configuration is optimized for the full 63M row dataset
+# Uses external memory and conservative memory settings
+# Maintains improved regularization for better accuracy
+
+# ==============================================================================
+# MEMORY OPTIMIZATION - CONSERVATIVE FOR LARGE DATASET
+# ==============================================================================
+memory:
+  # Bin reduction for memory efficiency
+  max_bin: 32  # Keep low for 63M rows
+
+  # CRITICAL: Single thread for external memory safety
+  # Multi-threading with external memory can cause OOM
+  nthread: 1  # Must be 1 for production
+
+  # Aggressive histogram cache reduction for large dataset
+  max_cached_hist_node: 8  # Conservative for 63M rows
+
+  # Enable resource-aware memory management
+  ref_resource_aware: true
+
+  # Small CV sample for large dataset
+  cv_sample_pct: 0.01  # 1% of 63M = 630K rows (statistically valid)
+
+# ==============================================================================
+# HYPERPARAMETERS - OPTIMIZED FOR ACCURACY
+# ==============================================================================
+hyperparameters:
+  # --------------------------------------------------------------------------
+  # Tree Structure Control
+  # --------------------------------------------------------------------------
+  # Maximum depth - balanced for large dataset
+  max_depth: 5  # Good balance for 63M rows
+
+  # Minimum samples per leaf - slightly higher for large dataset
+  min_child_weight: 10  # Moderate (between old 20 and pilot 5)
+
+  # --------------------------------------------------------------------------
+  # Regularization - IMPROVED FROM ORIGINAL
+  # --------------------------------------------------------------------------
+  # Minimum loss reduction for split
+  gamma: 1.0  # Slightly higher than pilot for 63M rows
+
+  # L2 regularization - moderate for large dataset
+  reg_lambda: 20  # Higher than pilot (10) but much lower than original (100)
+
+  # L1 regularization - moderate sparsity
+  reg_alpha: 1.0  # Higher than pilot (0.5) but much lower than original (5)
+
+  # --------------------------------------------------------------------------
+  # Learning & Ensemble
+  # --------------------------------------------------------------------------
+  # Learning rate - keep conservative
+  learning_rate: 0.05
+
+  # Number of trees with early stopping
+  n_estimators: 200  # Early stopping will find optimal
+
+  # Early stopping patience
+  early_stopping_rounds: 25  # More patience for large dataset
+
+  # --------------------------------------------------------------------------
+  # Sampling - More aggressive for 63M rows
+  # --------------------------------------------------------------------------
+  # Row sampling per tree - reduce for large dataset
+  subsample: 0.7  # Reduced from 0.8 for more regularization
+
+  # Feature sampling per tree
+  colsample_bytree: 0.8  # Keep same
+
+  # --------------------------------------------------------------------------
+  # Other Settings
+  # --------------------------------------------------------------------------
+  objective: "reg:squarederror"
+  eval_metric: ["rmse", "mae"]
+  tree_method: "hist"
+  grow_policy: "depthwise"
+  seed: 42
+
+# ==============================================================================
+# VALIDATION STRATEGY
+# ==============================================================================
+validation:
+  use_validation_set: true
+  val_split: 0.2  # 80/20 split
+  monitor_metrics:
+    - "rmse"
+    - "mae"
+
+# ==============================================================================
+# EXTERNAL MEMORY SETTINGS
+# ==============================================================================
+external_memory:
+  # Batch size for DataFrameIterator
+  batch_size: 2000000  # 2M rows per batch
+
+  # Cache directory for external memory files
+  cache_dir: "./xgb_cache"
+
+  # Clean cache after training
+  clean_cache: true
+
+# ==============================================================================
+# EXPECTED OUTCOMES - PRODUCTION
+# ==============================================================================
+# Memory Usage (with data loading improvements):
+#   - Peak memory: 8-10GB (safe for 30GB RAM)
+#   - Batch processing: 2M rows at a time
+#   - External memory handles overflow
+#
+# Model Performance:
+#   - Expected improvement: 8-12% over baseline
+#   - Training time: 45-90 minutes
+#   - Better than pilot due to more data
+#
+# Key Differences from Pilot:
+#   - nthread: 2 → 1 (external memory requirement)
+#   - cv_sample_pct: 0.05 → 0.01 (smaller percentage)
+#   - min_child_weight: 5 → 10 (more conservative)
+#   - gamma: 0.5 → 1.0 (slightly more pruning)
+#   - reg_lambda: 10 → 20 (more L2 for large dataset)
+#   - reg_alpha: 0.5 → 1.0 (more L1 for large dataset)
+#   - subsample: 0.8 → 0.7 (more regularization)

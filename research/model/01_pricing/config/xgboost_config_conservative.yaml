@@ -1,0 +1,105 @@
+# XGBoost Residual Model - Conservative Configuration
+#
+# High regularization for stable, conservative model
+# Lower risk of overfitting but potentially less accurate
+# Good for production when stability is critical
+
+# ==============================================================================
+# MEMORY OPTIMIZATION - SAME AS PRODUCTION
+# ==============================================================================
+memory:
+  # Bin reduction for memory efficiency
+  max_bin: 32
+
+  # CRITICAL: Single thread for external memory safety
+  nthread: 1
+
+  # Aggressive histogram cache reduction
+  max_cached_hist_node: 8
+
+  # Enable resource-aware memory management
+  ref_resource_aware: true
+
+  # Small CV sample for large dataset
+  cv_sample_pct: 0.01
+
+# ==============================================================================
+# HYPERPARAMETERS - CONSERVATIVE (HIGH REGULARIZATION)
+# ==============================================================================
+hyperparameters:
+  # --------------------------------------------------------------------------
+  # Tree Structure Control
+  # --------------------------------------------------------------------------
+  # Shallow trees for conservative model
+  max_depth: 4  # Reduced from 5
+
+  # Higher minimum samples per leaf
+  min_child_weight: 20  # Increased from 10
+
+  # --------------------------------------------------------------------------
+  # Regularization - CONSERVATIVE (MORE REGULARIZATION)
+  # --------------------------------------------------------------------------
+  # Higher minimum loss reduction for split
+  gamma: 2.0  # Higher than production
+
+  # Strong L2 regularization
+  reg_lambda: 50  # Higher than production
+
+  # Strong L1 regularization
+  reg_alpha: 2.0  # Higher than production
+
+  # --------------------------------------------------------------------------
+  # Learning & Ensemble
+  # --------------------------------------------------------------------------
+  # Lower learning rate for stability
+  learning_rate: 0.03  # Lower than production
+
+  # Fewer trees (early stopping will find optimal)
+  n_estimators: 150
+
+  # More patience for early stopping
+  early_stopping_rounds: 30
+
+  # --------------------------------------------------------------------------
+  # Sampling - Conservative
+  # --------------------------------------------------------------------------
+  # Less row sampling for stability
+  subsample: 0.6  # Lower than production
+
+  # Less feature sampling
+  colsample_bytree: 0.7  # Lower than production
+
+  # --------------------------------------------------------------------------
+  # Other Settings
+  # --------------------------------------------------------------------------
+  objective: "reg:squarederror"
+  eval_metric: ["rmse", "mae"]
+  tree_method: "hist"
+  grow_policy: "depthwise"
+  seed: 42
+
+# ==============================================================================
+# VALIDATION STRATEGY
+# ==============================================================================
+validation:
+  use_validation_set: true
+  val_split: 0.2
+  monitor_metrics:
+    - "rmse"
+    - "mae"
+
+# ==============================================================================
+# EXTERNAL MEMORY SETTINGS
+# ==============================================================================
+external_memory:
+  batch_size: 2000000
+  cache_dir: "./xgb_cache"
+  clean_cache: true
+
+# ==============================================================================
+# EXPECTED OUTCOMES - CONSERVATIVE
+# ==============================================================================
+# Memory Usage: 8-10GB (same as production)
+# Model Performance: 4-6% improvement (lower than production)
+# Training time: 30-60 minutes
+# Very stable, low risk of overfitting

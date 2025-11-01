@@ -109,14 +109,16 @@ def analyze_data_characteristics(
 
     # Baseline features (from main data file)
     baseline_df = pl.scan_parquet(data_file)
-    baseline_cols = [c for c in baseline_df.columns if c not in ["date", "symbol", "timestamp_seconds"]]
+    schema = baseline_df.collect_schema()
+    baseline_cols = [c for c in schema.names() if c not in ["date", "symbol", "timestamp_seconds"]]
     feature_counts["Baseline"] = len(baseline_cols)
     logger.info(f"Baseline features:      {feature_counts['Baseline']:3d}")
 
     # RV features
     if rv_file.exists():
         rv_df = pl.scan_parquet(rv_file)
-        rv_cols = [c for c in rv_df.columns if c not in ["timestamp_seconds"]]
+        schema_rv = rv_df.collect_schema()
+        rv_cols = [c for c in schema_rv.names() if c not in ["timestamp_seconds"]]
         feature_counts["RV"] = len(rv_cols)
         logger.info(f"RV features:            {feature_counts['RV']:3d}")
     else:
@@ -126,7 +128,8 @@ def analyze_data_characteristics(
     # Microstructure features
     if micro_file.exists():
         micro_df = pl.scan_parquet(micro_file)
-        micro_cols = [c for c in micro_df.columns if c not in ["timestamp_seconds"]]
+        schema_micro = micro_df.collect_schema()
+        micro_cols = [c for c in schema_micro.names() if c not in ["timestamp_seconds"]]
         feature_counts["Microstructure"] = len(micro_cols)
         logger.info(f"Microstructure features: {feature_counts['Microstructure']:3d}")
     else:
@@ -136,7 +139,8 @@ def analyze_data_characteristics(
     # Advanced features
     if advanced_file.exists():
         advanced_df = pl.scan_parquet(advanced_file)
-        advanced_cols = [c for c in advanced_df.columns if c not in ["timestamp_seconds"]]
+        schema_advanced = advanced_df.collect_schema()
+        advanced_cols = [c for c in schema_advanced.names() if c not in ["timestamp_seconds", "timestamp"]]
         feature_counts["Advanced"] = len(advanced_cols)
         logger.info(f"Advanced features:      {feature_counts['Advanced']:3d}")
     else:
@@ -272,8 +276,14 @@ def analyze_data_characteristics(
     logger.info("")
     logger.info("Time-series risks:")
 
-    train_months = (datetime.fromisoformat(train_end) - datetime.fromisoformat(train_start)).days // 30
-    test_months = (datetime.fromisoformat(test_end) - datetime.fromisoformat(test_start)).days // 30
+    # Convert dates to datetime for calculation if needed
+    from datetime import date
+    train_start_dt = datetime(train_start.year, train_start.month, train_start.day) if isinstance(train_start, date) else datetime.fromisoformat(train_start)
+    train_end_dt = datetime(train_end.year, train_end.month, train_end.day) if isinstance(train_end, date) else datetime.fromisoformat(train_end)
+    test_end_dt = datetime(test_end.year, test_end.month, test_end.day) if isinstance(test_end, date) else datetime.fromisoformat(test_end)
+
+    train_months = (train_end_dt - train_start_dt).days // 30
+    test_months = (test_end_dt - train_start_dt).days // 30
 
     logger.info(f"  Training period:        {train_months} months ({train_start} to {train_end})")
     logger.info(f"  Test period:            {test_months} months ({test_start} to {test_end})")
@@ -376,22 +386,22 @@ def analyze_data_characteristics(
 def main() -> None:
     """Main entry point."""
     # File paths
-    base_dir = Path("/Users/lgierhake/Documents/ETH/BT")
-    data_dir = base_dir / "research" / "model" / "01_pricing"
-    feature_dir = base_dir / "research" / "model" / "00_data_prep"
+    base_dir = Path("/home/ubuntu/Polymarket")
+    results_dir = base_dir / "research" / "model" / "results"
 
-    data_file = data_dir / "production_backtest_results.parquet"
-    rv_file = feature_dir / "realized_volatility_1s.parquet"
-    micro_file = feature_dir / "microstructure_features.parquet"
-    advanced_file = feature_dir / "advanced_features.parquet"
+    data_file = results_dir / "production_backtest_results.parquet"
+    rv_file = results_dir / "realized_volatility_1s.parquet"
+    micro_file = results_dir / "microstructure_features.parquet"
+    advanced_file = results_dir / "advanced_features.parquet"
 
     # Date ranges (matching typical training setup)
-    train_start = "2023-10-01"
-    train_end = "2024-03-31"  # 6 months
-    val_start = "2024-04-01"
-    val_end = "2024-06-30"    # 3 months
-    test_start = "2024-07-01"
-    test_end = "2025-09-30"   # 15 months
+    from datetime import date
+    train_start = date(2023, 10, 1)
+    train_end = date(2024, 3, 31)  # 6 months
+    val_start = date(2024, 4, 1)
+    val_end = date(2024, 6, 30)    # 3 months
+    test_start = date(2024, 7, 1)
+    test_end = date(2025, 9, 30)   # 15 months
 
     # Run analysis
     analyze_data_characteristics(
