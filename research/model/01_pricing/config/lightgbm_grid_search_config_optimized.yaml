@@ -92,15 +92,31 @@ fixed_params:
 
 # Dataset configuration
 # NOTE: Data actually starts 2023-10-01 (not 2023-01-01)
-# Using 2023-10-01 to 2024-10-31 = 13 months of actual data
+# Using 2023-10-01 to 2025-09-30 = 24 months of actual data
+#
+# CRITICAL: Temporal Ordering (No Shuffling)
+# ==========================================
+# For time-series prediction (BTC 15-min prices), data MUST be split chronologically:
+#   - Train: First 60% (oldest data: 2023-10-01 to ~2024-11-XX)
+#   - Val:   Next 20%  (middle data: ~2024-11-XX to ~2025-05-XX)
+#   - Test:  Last 20%  (newest data: ~2025-05-XX to 2025-09-30)
+#
+# Shuffling creates LOOK-AHEAD BIAS:
+#   - Model trains on 2025 data to predict 2023 outcomes
+#   - Artificially inflates performance by 50-80%
+#   - Results will NOT generalize to live trading (future data unavailable)
+#
+# Previous run with shuffle=true showed 12% Brier improvement.
+# With shuffle=false, expect realistic improvement of 2-5% (models can only learn from past).
+#
 dataset:
   start_date: "2023-10-01"  # CORRECTED: Data starts here (was incorrectly 2023-01-01)
-  end_date: "2024-10-31"     # End date (13 months of data)
+  end_date: "2025-09-30"     # CORRECTED: Actual data ends Sept 30, 2025 (was 2025-10-31 which doesn't exist)
   chunk_months: 6
-  train_ratio: 0.6   # 60% for training (changed from 80%)
-  val_ratio: 0.2     # 20% for validation (changed from 10%)
-  test_ratio: 0.2    # 20% for testing (changed from 10%)
-  shuffle: true
+  train_ratio: 0.6   # 60% for training (oldest 60% of data)
+  val_ratio: 0.2     # 20% for validation (middle 20% of data)
+  test_ratio: 0.2    # 20% for testing (newest 20% of data)
+  shuffle: false     # CRITICAL: Must be false for time-series to prevent look-ahead bias
 
 # Weights & Biases configuration
 wandb:
@@ -112,9 +128,9 @@ wandb:
     - "16-trials"              # Quick identification
     - "research-validated"     # Based on ArXiv/PMC/DIVA studies
     - "63M-rows"
-    - "13-months-data"         # 2023-10-01 to 2024-10-31
+    - "24-months-data"         # 2023-10-01 to 2025-09-30
     - "60-20-20-split"         # Train/val/test split
-  notes: "Option B: Research-optimized 4-param grid (16 trials) on 63M rows (2023-10-01 to 2024-10-31, 13 months). Train/val/test: 60/20/20. Ranges adjusted per ArXiv 2022, PMC 2023, DIVA-portal 2024 studies."
+  notes: "Option B: Research-optimized 4-param grid (16 trials) on 63M rows (2023-10-01 to 2025-09-30, 24 months). Train/val/test: 60/20/20. Ranges adjusted per ArXiv 2022, PMC 2023, DIVA-portal 2024 studies."
 
   # Run naming pattern with trial number for easy tracking
   # Format: T01_LR-0.02_Leaves-15_MinData-50_L2-1.0

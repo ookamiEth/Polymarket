@@ -379,6 +379,7 @@ def train_lightgbm_memory_optimized(
     train_file: str,
     val_file: str,
     config: dict[str, Any],
+    wandb_run=None,
 ) -> lgb.Booster:
     """
     Train LightGBM with memory optimizations.
@@ -388,6 +389,12 @@ def train_lightgbm_memory_optimized(
     - Faster training with leaf-wise growth
     - Better handling of categorical features
     - Native support for missing values
+
+    Args:
+        train_file: Path to training data parquet
+        val_file: Path to validation data parquet
+        config: Training configuration dictionary
+        wandb_run: Optional W&B run for logging training curves
     """
     monitor = MemoryMonitor()
     monitor.check_memory("Start training")
@@ -467,6 +474,16 @@ def train_lightgbm_memory_optimized(
         lgb.log_evaluation(10),
     ]
 
+    # Add W&B callback if run is active
+    if wandb_run is not None:
+        try:
+            from wandb.integration.lightgbm import wandb_callback
+
+            callbacks.append(wandb_callback())
+            logger.info("✓ W&B training curve logging enabled")
+        except ImportError:
+            logger.warning("wandb.integration.lightgbm not available - skipping W&B logging")
+
     # Train with validation
     model = lgb.train(
         params,
@@ -485,6 +502,16 @@ def train_lightgbm_memory_optimized(
     logger.info("\nTop 20 features by gain:")
     for i, (feat, imp) in enumerate(top_features, 1):
         logger.info(f"  {i:2d}. {feat:40s}: {imp:10.2f}")
+
+    # Log feature importance and model summary to W&B
+    if wandb_run is not None:
+        try:
+            from wandb.integration.lightgbm import log_summary
+
+            log_summary(model, save_model_checkpoint=True)
+            logger.info("✓ W&B model summary and artifacts logged")
+        except ImportError:
+            logger.warning("wandb.integration.lightgbm not available - skipping model summary")
 
     # Log residual metrics and implied Brier improvement
     best_score = model.best_score
@@ -709,6 +736,7 @@ def train_temporal_chunks(
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
     evaluate_test: bool = True,
+    wandb_run=None,
 ) -> dict[str, Any]:
     """
     Train model using temporal chunking for very large datasets with train/val/test splits.
@@ -722,6 +750,7 @@ def train_temporal_chunks(
         val_ratio: Proportion for validation set
         test_ratio: Proportion for test set
         evaluate_test: Whether to evaluate on test set after training
+        wandb_run: Optional W&B run for logging training curves
 
     Returns:
         Dictionary with test set metrics (if evaluate_test=True), empty dict otherwise
@@ -777,14 +806,14 @@ def train_temporal_chunks(
         val_ratio=val_ratio,
         test_ratio=test_ratio,
         output_dir=OUTPUT_DIR,
-        shuffle=True,  # Shuffle for better generalization
+        shuffle=False,  # CRITICAL: Maintain temporal order to prevent look-ahead bias (train on past, predict future)
         seed=config["hyperparameters"].get("seed", 42),
     )
 
     monitor.check_memory("After data preparation")
 
     # Train model
-    model = train_lightgbm_memory_optimized(train_file, val_file, config)
+    model = train_lightgbm_memory_optimized(train_file, val_file, config, wandb_run=wandb_run)
 
     # Save model
     model_file = OUTPUT_DIR / "lightgbm_model_optimized.txt"

@@ -141,3 +141,6 @@ temp/
 documentation/
 
 *.html 
+*.txt 
+*.wandb 
+*.yaml 

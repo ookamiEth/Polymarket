@@ -205,6 +205,7 @@ class GridSearchManager:
                 val_ratio=self.dataset_config["val_ratio"],
                 test_ratio=self.dataset_config["test_ratio"],
                 evaluate_test=True,
+                wandb_run=wandb_run,  # Pass W&B run for training curve logging
             )
 
             # Calculate training time
