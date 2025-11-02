@@ -86,8 +86,12 @@ def load_models(models_dir: Path, config: dict[str, Any], include_single: bool =
         if not model_file.exists():
             raise FileNotFoundError(f"Model not found: {model_file}. Run train_multi_horizon.py first.")
 
-        models["buckets"][bucket_name] = lgb.Booster(model_file=str(model_file))
-        logger.info(f"  ✓ Loaded {bucket_name} bucket model")
+        try:
+            models["buckets"][bucket_name] = lgb.Booster(model_file=str(model_file))
+            logger.info(f"  ✓ Loaded {bucket_name} bucket model")
+        except Exception as e:
+            msg = f"Failed to load model {model_file}: {e}"
+            raise ValueError(msg) from e
 
     # Load single model if requested
     if include_single:
@@ -326,12 +330,27 @@ def generate_summary_report(
     # Per-bucket summary
     logger.info("\nPer-Bucket Performance:")
     for metrics in bucket_metrics:
-        bucket_config = config["buckets"][metrics["bucket"]]
-        target_min = float(bucket_config["target_improvement"].split("-")[0])
-        improvement = metrics["brier_improvement_pct"]
+        # Validate bucket exists in metrics and config
+        bucket_name = metrics.get("bucket")
+        if not bucket_name or bucket_name not in config.get("buckets", {}):
+            logger.warning(f"Skipping metrics with invalid bucket: {bucket_name}")
+            continue
+
+        bucket_config = config["buckets"][bucket_name]
+
+        # Parse target improvement safely
+        target_improvement = bucket_config.get("target_improvement", "0-0")
+        try:
+            target_min = float(target_improvement.split("-")[0])
+        except (ValueError, IndexError, AttributeError):
+            logger.warning(f"Invalid target_improvement format for {bucket_name}: {target_improvement}")
+            target_min = 0.0
+
+        improvement = metrics.get("brier_improvement_pct", 0.0)
+        bucket_name_display = bucket_config.get("name", bucket_name)
 
         status = "✓" if improvement >= target_min else "⚠"
-        logger.info(f"  {status} {bucket_config['name']:25s}: {improvement:6.2f}% (target {target_min:4.1f}%+)")
+        logger.info(f"  {status} {bucket_name_display:25s}: {improvement:6.2f}% (target {target_min:4.1f}%+)")
 
     # Save to CSV
     output_dir.mkdir(parents=True, exist_ok=True)

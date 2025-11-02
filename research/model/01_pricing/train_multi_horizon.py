@@ -34,7 +34,6 @@ import gc
 import logging
 import sys
 import time
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -237,28 +236,17 @@ def train_bucket_model(
     residual_rmse = np.sqrt(residual_mse)
     residual_mae = val_metrics.get("mae", 0.0)
 
-    model_brier = baseline_brier_val - residual_mse
-    brier_improvement_pct = (residual_mse / baseline_brier_val) * 100
-
     training_time = (time.time() - start_time) / 60
 
     # Log results
     logger.info(f"\n{bucket_config['name']} Results:")
     logger.info(f"  Baseline Brier:      {baseline_brier_val:.6f}")
-    logger.info(f"  Model Brier:         {model_brier:.6f}")
     logger.info(f"  Residual MSE:        {residual_mse:.6f}")
     logger.info(f"  Residual RMSE:       {residual_rmse:.6f}")
     logger.info(f"  Residual MAE:        {residual_mae:.6f}")
-    logger.info(f"  Improvement:         {brier_improvement_pct:.3f}%")
     logger.info(f"  Training Time:       {training_time:.2f} min")
     logger.info(f"  Best Iteration:      {model.best_iteration}")
-
-    # Target check
-    target_min = float(bucket_config["target_improvement"].split("-")[0])
-    if brier_improvement_pct >= target_min:
-        logger.info(f"  ✓ Target achieved ({target_min}%+)")
-    else:
-        logger.warning(f"  ⚠ Below target (expected {target_min}%+)")
+    logger.info("\n  Note: Brier improvement will be computed in evaluation phase.")
 
     # Log feature importance
     importance = model.feature_importance(importance_type="gain")
@@ -268,6 +256,16 @@ def train_bucket_model(
     logger.info(f"\nTop 20 features for {bucket_name} bucket:")
     for i, (feat, imp) in enumerate(top_features, 1):
         logger.info(f"  {i:2d}. {feat:40s}: {imp:10.2f}")
+
+    # Log model artifacts and feature importance to W&B
+    if wandb_run is not None:
+        try:
+            from wandb.integration.lightgbm import log_summary
+
+            log_summary(model, save_model_checkpoint=True)
+            logger.info("✓ W&B model summary and artifacts logged")
+        except ImportError:
+            logger.warning("wandb.integration.lightgbm not available - skipping model summary")
 
     # Save model
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -282,11 +280,9 @@ def train_bucket_model(
         "hyperparameters": hyperparameters,
         "performance": {
             "baseline_brier": baseline_brier_val,
-            "model_brier": model_brier,
             "residual_mse": residual_mse,
             "residual_rmse": residual_rmse,
             "residual_mae": residual_mae,
-            "brier_improvement_pct": brier_improvement_pct,
             "training_time_minutes": training_time,
             "best_iteration": model.best_iteration,
         },
@@ -309,11 +305,9 @@ def train_bucket_model(
 
     metrics = {
         "baseline_brier": baseline_brier_val,
-        "model_brier": model_brier,
         "residual_mse": residual_mse,
         "residual_rmse": residual_rmse,
         "residual_mae": residual_mae,
-        "brier_improvement_pct": brier_improvement_pct,
         "training_time_minutes": training_time,
         "best_iteration": model.best_iteration,
         "n_train": n_train,
@@ -323,198 +317,177 @@ def train_bucket_model(
     return model, metrics
 
 
-def train_bucket_with_rolling_window(
+def train_bucket_walk_forward(
     bucket_name: str,
     bucket_config: dict[str, Any],
-    train_file: Path,
-    val_file: Path,
+    data_file: Path,
     hyperparameters: dict[str, Any],
     features: list[str],
     output_dir: Path,
-    rolling_config: dict[str, Any],
+    walk_forward_config: dict[str, Any],
     wandb_run: Any | None = None,
-) -> tuple[lgb.Booster | list[lgb.Booster], dict[str, float]]:
+) -> tuple[lgb.Booster, dict[str, Any]]:
     """
-    Train LightGBM model for a specific time bucket using rolling windows.
+    Train LightGBM model using walk-forward validation.
 
-    This function trains multiple models on successive temporal windows, useful for:
-    - Recency bias (focus on recent market regimes)
-    - Regime detection (identify when model performance changes)
-    - Walk-forward validation (natural temporal cross-validation)
+    True walk-forward validation: both training and validation periods advance chronologically.
+    This simulates real-world deployment where you always predict the future based on the past.
 
     Args:
         bucket_name: Bucket identifier (near/mid/far)
         bucket_config: Bucket-specific configuration
-        train_file: Training data file
-        val_file: Validation data file
+        data_file: Full dataset file (will be split temporally)
         hyperparameters: LightGBM hyperparameters
         features: Feature columns to use
         output_dir: Output directory for models
-        rolling_config: Rolling window configuration
+        walk_forward_config: Walk-forward configuration
         wandb_run: W&B run (optional)
 
     Returns:
-        Tuple of (model(s), aggregated metrics)
-        - If aggregation="latest": single model from most recent window
-        - If aggregation="ensemble": list of all window models
+        Tuple of (final model trained on all walk-forward data, aggregated metrics)
     """
     logger.info(f"\n{'=' * 80}")
-    logger.info(f"ROLLING WINDOW TRAINING: {bucket_config['name'].upper()}")
+    logger.info(f"WALK-FORWARD VALIDATION: {bucket_config['name'].upper()}")
     logger.info(f"{'=' * 80}")
 
-    window_months = rolling_config["window_months"]
-    step_months = rolling_config["step_months"]
-    min_samples = rolling_config["min_samples"]
-    aggregation = rolling_config["aggregation"]
-    save_all = rolling_config["save_all_models"]
-    log_window_metrics = rolling_config["log_window_metrics"]
+    train_months = walk_forward_config["train_months"]
+    val_months = walk_forward_config["val_months"]
+    step_months = walk_forward_config["step_months"]
+    holdout_months = walk_forward_config["holdout_months"]
 
-    logger.info(f"Window size: {window_months} months")
-    logger.info(f"Step size: {step_months} months")
-    logger.info(f"Minimum samples: {min_samples:,}")
-    logger.info(f"Aggregation: {aggregation}")
+    logger.info(f"Training window: {train_months} months")
+    logger.info(f"Validation window: {val_months} months")
+    logger.info(f"Step size: {step_months} month(s)")
+    logger.info(f"Holdout test: last {holdout_months} months")
 
-    # Load full dataset to get date range
+    monitor = MemoryMonitor()
+
+    # Load full dataset and get date range
     logger.info("\nAnalyzing data date range...")
-    df_lazy = pl.scan_parquet(train_file)
+    df_lazy = pl.scan_parquet(data_file)
 
-    # Get min/max dates from data
     date_stats = df_lazy.select(
-        [
-            pl.col("timestamp").min().alias("min_ts"),
-            pl.col("timestamp").max().alias("max_ts"),
-        ]
+        [pl.col("date").min().alias("min_date"), pl.col("date").max().alias("max_date")]
     ).collect()
 
-    # Convert Unix timestamps to datetime
-    min_ts = int(date_stats["min_ts"][0])
-    max_ts = int(date_stats["max_ts"][0])
-    start_date = datetime.fromtimestamp(min_ts)
-    end_date = datetime.fromtimestamp(max_ts)
+    from datetime import date
 
-    # Override with config if specified
-    if rolling_config["start_date"] is not None:
-        start_date = datetime.fromisoformat(rolling_config["start_date"])
-    if rolling_config["end_date"] is not None:
-        end_date = datetime.fromisoformat(rolling_config["end_date"])
+    min_date = date_stats["min_date"][0]
+    max_date = date_stats["max_date"][0]
 
-    logger.info(f"Data range: {start_date.date()} to {end_date.date()}")
+    # Calculate holdout test period (last N months)
+    from dateutil.relativedelta import relativedelta
 
-    # Generate rolling windows
-    windows: list[tuple[datetime, datetime]] = []
-    current_start = start_date
+    holdout_start = max_date - relativedelta(months=holdout_months - 1)
+    walk_forward_end = holdout_start - relativedelta(days=1)
 
-    while current_start < end_date:
-        current_end = current_start + timedelta(days=window_months * 30)  # Approx months
-        if current_end > end_date:
-            current_end = end_date
+    logger.info(f"Full data range: {min_date} to {max_date}")
+    logger.info(f"Walk-forward range: {min_date} to {walk_forward_end}")
+    logger.info(f"Holdout test: {holdout_start} to {max_date}")
 
-        windows.append((current_start, current_end))
+    # Generate walk-forward windows
+    windows: list[tuple[date, date, date, date]] = []
+    current_start = min_date
+
+    while True:
+        train_end = current_start + relativedelta(months=train_months) - relativedelta(days=1)
+        val_start = train_end + relativedelta(days=1)
+        val_end = val_start + relativedelta(months=val_months) - relativedelta(days=1)
+
+        # Stop if validation period would overlap with holdout
+        if val_end >= holdout_start:
+            break
+
+        windows.append((current_start, train_end, val_start, val_end))
 
         # Step forward
-        current_start += timedelta(days=step_months * 30)
+        current_start += relativedelta(months=step_months)
 
-    logger.info(f"Generated {len(windows)} rolling windows")
+    logger.info(f"Generated {len(windows)} walk-forward windows")
 
-    # Train model for each window
-    window_models: list[lgb.Booster] = []
+    # Train and validate on each window
     window_metrics: list[dict[str, Any]] = []
+    walk_forward_start_time = time.time()
 
-    for window_idx, (win_start, win_end) in enumerate(windows, 1):
+    for window_idx, (train_start, train_end, val_start, val_end) in enumerate(windows, 1):
         logger.info(f"\n{'─' * 80}")
-        logger.info(f"Window {window_idx}/{len(windows)}: {win_start.date()} to {win_end.date()}")
+        logger.info(f"Window {window_idx}/{len(windows)}")
+        logger.info(f"  Train: {train_start} to {train_end}")
+        logger.info(f"  Val:   {val_start} to {val_end}")
         logger.info(f"{'─' * 80}")
 
-        # Filter training data for this window
-        win_start_ts = int(win_start.timestamp())
-        win_end_ts = int(win_end.timestamp())
+        # Create temporal train/val splits
+        df_train = df_lazy.filter((pl.col("date") >= train_start) & (pl.col("date") <= train_end))
+        df_val = df_lazy.filter((pl.col("date") >= val_start) & (pl.col("date") <= val_end))
 
-        # Create temporary windowed dataset
-        windowed_train = output_dir / f"temp_{bucket_name}_window{window_idx}_train.parquet"
+        # Check sample counts
+        n_train = df_train.select(pl.len()).collect().item()
+        n_val = df_val.select(pl.len()).collect().item()
 
-        df_window = df_lazy.filter((pl.col("timestamp") >= win_start_ts) & (pl.col("timestamp") < win_end_ts))
+        logger.info(f"Train samples: {n_train:,}")
+        logger.info(f"Val samples:   {n_val:,}")
 
-        # Check sample count
-        n_samples = df_window.select(pl.len()).collect().item()
-
-        if n_samples < min_samples:
-            logger.warning(
-                f"⚠ Window {window_idx} has only {n_samples:,} samples (< {min_samples:,} minimum), skipping"
-            )
+        if n_train < 10000 or n_val < 1000:
+            logger.warning(f"⚠ Skipping window {window_idx}: insufficient samples")
             continue
 
-        logger.info(f"Window {window_idx} training samples: {n_samples:,}")
+        # Write temporary files
+        temp_train = output_dir / f"temp_{bucket_name}_window{window_idx}_train.parquet"
+        temp_val = output_dir / f"temp_{bucket_name}_window{window_idx}_val.parquet"
 
-        # Write windowed data to temporary file
-        df_window.sink_parquet(str(windowed_train))
+        df_train.sink_parquet(str(temp_train))
+        df_val.sink_parquet(str(temp_val))
 
-        # Train on this window
         try:
-            # Load windowed datasets
-            n_train_win = pl.scan_parquet(windowed_train).select(pl.len()).collect().item()
-
-            train_data_win, _ = create_lgb_dataset_from_parquet(str(windowed_train), features, free_raw_data=True)
-            val_data_win, baseline_brier_val_win = create_lgb_dataset_from_parquet(
-                str(val_file), features, reference=train_data_win, free_raw_data=True
+            # Create LightGBM datasets
+            train_data, _ = create_lgb_dataset_from_parquet(str(temp_train), features, free_raw_data=True)
+            val_data, baseline_brier_val = create_lgb_dataset_from_parquet(
+                str(temp_val), features, reference=train_data, free_raw_data=True
             )
 
-            if hasattr(baseline_brier_val_win, "__len__"):
-                baseline_brier_val_win = float(np.mean(baseline_brier_val_win))
+            if hasattr(baseline_brier_val, "__len__"):
+                baseline_brier_val = float(np.mean(baseline_brier_val))
 
-            # Train model on window
+            # Train model on this window
             callbacks = [
                 lgb.early_stopping(hyperparameters.get("early_stopping_rounds", 50)),
-                lgb.log_evaluation(50),  # Less verbose for windows
+                lgb.log_evaluation(100),  # Less verbose
             ]
 
-            model_win = lgb.train(
+            model = lgb.train(
                 hyperparameters,
-                train_data_win,
+                train_data,
                 num_boost_round=hyperparameters.get("n_estimators", 1000),
-                valid_sets=[train_data_win, val_data_win],
-                valid_names=["train", "val"],
+                valid_sets=[val_data],  # Only validate on out-of-sample validation period
+                valid_names=["val"],
                 callbacks=callbacks,
             )
 
-            # Calculate window metrics
-            best_score_win = model_win.best_score
-            val_metrics_win = best_score_win.get("val", {})
-            residual_mse_win = val_metrics_win.get("l2", 0.0)
-            residual_rmse_win = np.sqrt(residual_mse_win)
+            # Calculate metrics
+            best_score = model.best_score
+            val_metrics = best_score.get("val", {})
+            residual_mse = val_metrics.get("l2", 0.0)
 
-            model_brier_win = baseline_brier_val_win - residual_mse_win
-            brier_improvement_pct_win = (residual_mse_win / baseline_brier_val_win) * 100
+            logger.info(f"  Baseline Brier: {baseline_brier_val:.6f}")
+            logger.info(f"  Residual MSE:   {residual_mse:.6f}")
 
-            if log_window_metrics:
-                logger.info(f"  Baseline Brier: {baseline_brier_val_win:.6f}")
-                logger.info(f"  Model Brier:    {model_brier_win:.6f}")
-                logger.info(f"  Improvement:    {brier_improvement_pct_win:.2f}%")
-                logger.info(f"  Best Iteration: {model_win.best_iteration}")
-
-            # Save window model if requested
-            if save_all:
-                win_model_file = output_dir / f"lightgbm_{bucket_name}_window{window_idx}.txt"
-                model_win.save_model(str(win_model_file))
-                logger.info(f"  ✓ Saved window model to {win_model_file}")
-
-            window_models.append(model_win)
             window_metrics.append(
                 {
                     "window": window_idx,
-                    "start_date": win_start.isoformat(),
-                    "end_date": win_end.isoformat(),
-                    "n_train": n_train_win,
-                    "baseline_brier": baseline_brier_val_win,
-                    "model_brier": model_brier_win,
-                    "residual_mse": residual_mse_win,
-                    "residual_rmse": residual_rmse_win,
-                    "brier_improvement_pct": brier_improvement_pct_win,
-                    "best_iteration": model_win.best_iteration,
+                    "train_start": train_start.isoformat(),
+                    "train_end": train_end.isoformat(),
+                    "val_start": val_start.isoformat(),
+                    "val_end": val_end.isoformat(),
+                    "n_train": n_train,
+                    "n_val": n_val,
+                    "baseline_brier": baseline_brier_val,
+                    "residual_mse": residual_mse,
+                    "best_iteration": model.best_iteration,
                 }
             )
 
             # Clean up
-            del train_data_win, val_data_win
+            del train_data, val_data, model
             gc.collect()
 
         except Exception as e:
@@ -522,70 +495,162 @@ def train_bucket_with_rolling_window(
             continue
 
         finally:
-            # Remove temporary windowed file
-            if windowed_train.exists():
-                windowed_train.unlink()
+            # Remove temporary files
+            temp_train.unlink(missing_ok=True)
+            temp_val.unlink(missing_ok=True)
 
-    # Aggregate models based on strategy
-    if len(window_models) == 0:
+        monitor.check_memory(f"After window {window_idx}")
+
+    if len(window_metrics) == 0:
         msg = "No windows produced valid models"
         raise ValueError(msg)
 
+    # Aggregate validation metrics
     logger.info(f"\n{'=' * 80}")
-    logger.info(f"ROLLING WINDOW AGGREGATION: {aggregation.upper()}")
+    logger.info("WALK-FORWARD VALIDATION RESULTS")
     logger.info(f"{'=' * 80}")
 
-    if aggregation == "latest":
-        # Use most recent window model
-        final_model = window_models[-1]
-        final_metrics = window_metrics[-1]
-        logger.info(f"Using latest window model (window {len(window_models)})")
+    residual_mses = [m["residual_mse"] for m in window_metrics]
+    mean_mse = np.mean(residual_mses)
+    std_mse = np.std(residual_mses)
+    min_mse = np.min(residual_mses)
+    max_mse = np.max(residual_mses)
+
+    logger.info(f"Average Residual MSE: {mean_mse:.6f} ± {std_mse:.6f}")
+    logger.info(f"Range: {min_mse:.6f} to {max_mse:.6f}")
+    logger.info("\nWindow-by-window performance:")
+    for m in window_metrics:
+        logger.info(f"  Window {m['window']}: Residual MSE = {m['residual_mse']:.6f}")
+    logger.info("\nNote: Brier improvement will be computed in evaluation phase.")
+
+    # Train final production model on all walk-forward data (excluding holdout)
+    logger.info(f"\n{'=' * 80}")
+    logger.info("TRAINING FINAL MODEL ON ALL WALK-FORWARD DATA")
+    logger.info(f"{'=' * 80}")
+
+    df_final_train = df_lazy.filter((pl.col("date") >= min_date) & (pl.col("date") <= walk_forward_end))
+
+    # Split walk-forward data into 80/20 for final training
+    final_train_end = walk_forward_end - relativedelta(months=int(train_months * 0.2))
+
+    df_final_train_split = df_final_train.filter(pl.col("date") <= final_train_end)
+    df_final_val_split = df_final_train.filter(pl.col("date") > final_train_end)
+
+    temp_final_train = output_dir / f"temp_{bucket_name}_final_train.parquet"
+    temp_final_val = output_dir / f"temp_{bucket_name}_final_val.parquet"
+
+    df_final_train_split.sink_parquet(str(temp_final_train))
+    df_final_val_split.sink_parquet(str(temp_final_val))
+
+    try:
+        # Create final datasets
+        final_train_data, _ = create_lgb_dataset_from_parquet(str(temp_final_train), features, free_raw_data=True)
+        final_val_data, final_baseline_brier = create_lgb_dataset_from_parquet(
+            str(temp_final_val), features, reference=final_train_data, free_raw_data=True
+        )
+
+        if hasattr(final_baseline_brier, "__len__"):
+            final_baseline_brier = float(np.mean(final_baseline_brier))
+
+        # Train final model
+        callbacks = [
+            lgb.early_stopping(hyperparameters.get("early_stopping_rounds", 50)),
+            lgb.log_evaluation(25),
+        ]
+
+        if wandb_run is not None:
+            try:
+                from wandb.integration.lightgbm import wandb_callback
+
+                callbacks.append(wandb_callback())
+            except ImportError:
+                pass
+
+        final_model = lgb.train(
+            hyperparameters,
+            final_train_data,
+            num_boost_round=hyperparameters.get("n_estimators", 1000),
+            valid_sets=[final_train_data, final_val_data],
+            valid_names=["train", "val"],
+            callbacks=callbacks,
+        )
 
         # Save final model
         model_file = output_dir / f"lightgbm_{bucket_name}.txt"
         final_model.save_model(str(model_file))
         logger.info(f"✓ Saved final model to {model_file}")
 
-        return final_model, final_metrics
+        # Save config (matching structure from train_bucket_model)
+        config_file = output_dir / f"config_{bucket_name}.yaml"
 
-    elif aggregation == "ensemble":
-        # Return all models for ensemble prediction
-        logger.info(f"Returning ensemble of {len(window_models)} models")
+        # Get feature importance from final model
+        importance = final_model.feature_importance(importance_type="gain")
+        feature_names = final_model.feature_name()
+        top_features = sorted(zip(feature_names, importance), key=lambda x: x[1], reverse=True)[:20]
 
-        # Calculate average metrics
-        avg_metrics = {
-            "n_windows": len(window_models),
-            "baseline_brier": np.mean([m["baseline_brier"] for m in window_metrics]),
-            "model_brier": np.mean([m["model_brier"] for m in window_metrics]),
-            "residual_mse": np.mean([m["residual_mse"] for m in window_metrics]),
-            "residual_rmse": np.mean([m["residual_rmse"] for m in window_metrics]),
-            "brier_improvement_pct": np.mean([m["brier_improvement_pct"] for m in window_metrics]),
-            "avg_best_iteration": np.mean([m["best_iteration"] for m in window_metrics]),
+        # Count total samples across all windows
+        total_train_samples = sum(m.get("n_train", 0) for m in window_metrics)
+        total_val_samples = sum(m.get("n_val", 0) for m in window_metrics)
+
+        bucket_full_config = {
+            "bucket": bucket_config,
+            "hyperparameters": hyperparameters,
+            "performance": {
+                "baseline_brier": final_baseline_brier,
+                "residual_mse": mean_mse,  # Use walk-forward mean
+                "residual_rmse": np.sqrt(mean_mse),
+                "residual_mae": 0.0,  # Not tracked in walk-forward
+                "training_time_minutes": (time.time() - walk_forward_start_time) / 60,
+                "best_iteration": final_model.best_iteration,
+            },
+            "walk_forward": {
+                "enabled": True,
+                "n_windows": len(window_metrics),
+                "mean_mse": mean_mse,
+                "std_mse": std_mse,
+                "min_mse": min_mse,
+                "max_mse": max_mse,
+                "window_details": window_metrics,
+            },
+            "data": {
+                "train_samples": total_train_samples,
+                "val_samples": total_val_samples,
+            },
+            "top_features": [{"name": f, "importance": float(imp)} for f, imp in top_features],
         }
 
-        logger.info(f"  Average baseline Brier: {avg_metrics['baseline_brier']:.6f}")
-        logger.info(f"  Average model Brier:    {avg_metrics['model_brier']:.6f}")
-        logger.info(f"  Average improvement:    {avg_metrics['brier_improvement_pct']:.2f}%")
-
-        # Save ensemble metadata
-        ensemble_config = {
-            "aggregation": "ensemble",
-            "n_windows": len(window_models),
-            "window_metrics": window_metrics,
-            "avg_metrics": avg_metrics,
-        }
-
-        config_file = output_dir / f"config_{bucket_name}_ensemble.yaml"
         with open(config_file, "w") as f:
-            yaml.dump(ensemble_config, f, default_flow_style=False, sort_keys=False)
+            yaml.dump(bucket_full_config, f, default_flow_style=False, sort_keys=False)
 
-        logger.info(f"✓ Saved ensemble config to {config_file}")
+        logger.info(f"✓ Saved config to {config_file}")
 
-        return window_models, avg_metrics
+        # Clean up
+        del final_train_data, final_val_data
+        gc.collect()
 
-    else:
-        msg = f"Unknown aggregation strategy: {aggregation}"
-        raise ValueError(msg)
+    finally:
+        temp_final_train.unlink(missing_ok=True)
+        temp_final_val.unlink(missing_ok=True)
+
+    # Calculate total training time
+    total_training_time = (time.time() - walk_forward_start_time) / 60  # minutes
+
+    # Prepare aggregated metrics
+    aggregated_metrics = {
+        # Compatible keys for main() function
+        "residual_mse": mean_mse,  # Use mean MSE across windows
+        "baseline_brier": final_baseline_brier,
+        "training_time_minutes": total_training_time,
+        # Walk-forward specific diagnostics
+        "walk_forward_mean_mse": mean_mse,
+        "walk_forward_std_mse": std_mse,
+        "walk_forward_min_mse": min_mse,
+        "walk_forward_max_mse": max_mse,
+        "n_windows": len(window_metrics),
+        "window_metrics": window_metrics,
+    }
+
+    return final_model, aggregated_metrics
 
 
 def main() -> None:
@@ -606,14 +671,14 @@ def main() -> None:
         help="Path to multi-horizon config file",
     )
     parser.add_argument(
-        "--rolling-window",
+        "--walk-forward",
         action="store_true",
-        help="Enable rolling window training (overrides config)",
+        help="Enable walk-forward validation (overrides config)",
     )
     parser.add_argument(
-        "--no-rolling-window",
+        "--no-walk-forward",
         action="store_true",
-        help="Disable rolling window training (overrides config)",
+        help="Disable walk-forward validation (overrides config)",
     )
     args = parser.parse_args()
 
@@ -624,18 +689,18 @@ def main() -> None:
     # Load configuration
     config = load_config(args.config)
 
-    # Determine rolling window mode (CLI overrides config)
-    use_rolling_window = config.get("rolling_window", {}).get("enabled", False)
-    if args.rolling_window:
-        use_rolling_window = True
-        logger.info("Rolling window training ENABLED (CLI override)")
-    elif args.no_rolling_window:
-        use_rolling_window = False
-        logger.info("Rolling window training DISABLED (CLI override)")
-    elif use_rolling_window:
-        logger.info("Rolling window training ENABLED (config)")
+    # Determine walk-forward mode (CLI overrides config)
+    use_walk_forward = config.get("walk_forward_validation", {}).get("enabled", False)
+    if args.walk_forward:
+        use_walk_forward = True
+        logger.info("Walk-forward validation ENABLED (CLI override)")
+    elif args.no_walk_forward:
+        use_walk_forward = False
+        logger.info("Walk-forward validation DISABLED (CLI override)")
+    elif use_walk_forward:
+        logger.info("Walk-forward validation ENABLED (config)")
     else:
-        logger.info("Rolling window training DISABLED (config)")
+        logger.info("Walk-forward validation DISABLED (config)")
 
     # Load shared hyperparameters
     model_dir = Path(__file__).parent.parent
@@ -682,38 +747,48 @@ def main() -> None:
         logger.info(f"# Expected samples: {bucket_config['expected_samples']:,}")
         logger.info(f"{'#' * 80}")
 
-        # Stratify data for this bucket
-        train_file = stratify_data_by_time(
-            data_dir / Path(config["data"]["source_files"]["train"]).name,
-            output_dir,
-            bucket_name,
-            bucket_config["time_min"],
-            bucket_config["time_max"],
-        )
-
-        val_file = stratify_data_by_time(
-            data_dir / Path(config["data"]["source_files"]["val"]).name,
-            output_dir,
-            bucket_name,
-            bucket_config["time_min"],
-            bucket_config["time_max"],
-        )
-
         # Train model (choose strategy based on config)
-        if use_rolling_window:
-            rolling_config = config["rolling_window"]
-            model, metrics = train_bucket_with_rolling_window(
+        if use_walk_forward:
+            # Walk-forward validation: stratify full dataset by bucket, then do temporal splits
+            walk_forward_config = config["walk_forward_validation"]
+
+            # Stratify FULL dataset (train + val + test combined) by time bucket
+            full_data_file = stratify_data_by_time(
+                data_dir / Path(config["data"]["source_files"]["train"]).name,
+                output_dir,
+                bucket_name,
+                bucket_config["time_min"],
+                bucket_config["time_max"],
+            )
+
+            model, metrics = train_bucket_walk_forward(
                 bucket_name,
                 bucket_config,
-                train_file,
-                val_file,
+                full_data_file,
                 hyperparameters,
                 features,
                 models_dir,
-                rolling_config,
+                walk_forward_config,
                 wandb_run,
             )
         else:
+            # Standard training: use pre-split train/val files
+            train_file = stratify_data_by_time(
+                data_dir / Path(config["data"]["source_files"]["train"]).name,
+                output_dir,
+                bucket_name,
+                bucket_config["time_min"],
+                bucket_config["time_max"],
+            )
+
+            val_file = stratify_data_by_time(
+                data_dir / Path(config["data"]["source_files"]["val"]).name,
+                output_dir,
+                bucket_name,
+                bucket_config["time_min"],
+                bucket_config["time_max"],
+            )
+
             model, metrics = train_bucket_model(
                 bucket_name,
                 bucket_config,
@@ -731,8 +806,8 @@ def main() -> None:
         if wandb_run is not None:
             wandb_run.log(
                 {
-                    f"{bucket_name}/brier_improvement_pct": metrics["brier_improvement_pct"],
-                    f"{bucket_name}/model_brier": metrics["model_brier"],
+                    f"{bucket_name}/residual_mse": metrics["residual_mse"],
+                    f"{bucket_name}/baseline_brier": metrics["baseline_brier"],
                     f"{bucket_name}/training_time_min": metrics["training_time_minutes"],
                 }
             )
@@ -748,37 +823,15 @@ def main() -> None:
     for bucket_name in buckets_to_train:
         metrics = all_metrics[bucket_name]
         bucket_config = config["buckets"][bucket_name]
-        target_min = float(bucket_config["target_improvement"].split("-")[0])
 
-        status = "✓" if metrics["brier_improvement_pct"] >= target_min else "⚠"
         logger.info(
-            f"{status} {bucket_config['name']:25s}: {metrics['brier_improvement_pct']:6.2f}% "
-            f"(target {target_min:4.1f}%+, baseline {bucket_config['current_improvement']:5.1f}%)"
+            f"✓ {bucket_config['name']:25s}: "
+            f"Residual MSE = {metrics['residual_mse']:.6f} "
+            f"(Baseline Brier = {metrics['baseline_brier']:.6f})"
         )
 
-    # Calculate weighted average
-    if len(buckets_to_train) == 3:
-        total_samples = sum(all_metrics[b]["n_train"] for b in buckets_to_train)
-        weighted_improvement = (
-            sum(all_metrics[b]["brier_improvement_pct"] * all_metrics[b]["n_train"] for b in buckets_to_train)
-            / total_samples
-        )
-
-        logger.info(f"\nWeighted Overall Improvement: {weighted_improvement:.2f}%")
-        logger.info(f"Target (Phase 1):             {config['targets']['phase_1']['overall_improvement']:.1f}%")
-
-        if weighted_improvement >= config["targets"]["phase_1"]["overall_improvement"]:
-            logger.info("✓ PHASE 1 SUCCESS - Targets achieved!")
-        else:
-            logger.warning("⚠ Below Phase 1 target - May need hyperparameter tuning")
-
-        if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "overall_weighted_improvement": weighted_improvement,
-                    "phase_1_target": config["targets"]["phase_1"]["overall_improvement"],
-                }
-            )
+    logger.info("\nNote: Brier improvement will be computed in Phase 1 Step 2 (Evaluation).")
+    logger.info("      Run evaluate_multi_horizon.py to validate performance against targets.")
 
     # Finish W&B
     if wandb_run is not None:

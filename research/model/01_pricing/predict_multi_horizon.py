@@ -136,8 +136,9 @@ def apply_boundary_smoothing(
     logger.info("\nApplying boundary smoothing...")
 
     # Boundary 1: Near ↔ Mid (around 300s)
-    b1_center = smoothing_config["boundary_1"]["center"]
-    b1_width = smoothing_config["boundary_1"]["width"]
+    boundary_1 = smoothing_config.get("boundary_1", {})
+    b1_center = boundary_1.get("center", 300)
+    b1_width = boundary_1.get("width", 60)
     b1_lower = b1_center - b1_width // 2
     b1_upper = b1_center + b1_width // 2
 
@@ -157,8 +158,9 @@ def apply_boundary_smoothing(
         logger.info(f"  Smoothed {b1_count:,} predictions at 5-min boundary ({b1_lower}-{b1_upper}s)")
 
     # Boundary 2: Mid ↔ Far (around 600s)
-    b2_center = smoothing_config["boundary_2"]["center"]
-    b2_width = smoothing_config["boundary_2"]["width"]
+    boundary_2 = smoothing_config.get("boundary_2", {})
+    b2_center = boundary_2.get("center", 600)
+    b2_width = boundary_2.get("width", 60)
     b2_lower = b2_center - b2_width // 2
     b2_upper = b2_center + b2_width // 2
 
@@ -407,9 +409,19 @@ def main() -> None:
             )
 
             if len(bucket_data) > 0:
+                # Validate required columns exist
+                required_cols = ["outcome", "prob_mid", "residual_pred"]
+                missing_cols = [col for col in required_cols if col not in bucket_data.columns]
+
+                if missing_cols:
+                    logger.warning(
+                        f"  {bucket_config.get('name', bucket_name):25s}: Skipping (missing columns: {missing_cols})"
+                    )
+                    continue
+
                 bucket_metrics = evaluate_predictions(bucket_data)
                 logger.info(
-                    f"  {bucket_config['name']:25s}: {bucket_metrics['brier_improvement_pct']:6.2f}% "
+                    f"  {bucket_config.get('name', bucket_name):25s}: {bucket_metrics['brier_improvement_pct']:6.2f}% "
                     f"(n={len(bucket_data):,})"
                 )
 

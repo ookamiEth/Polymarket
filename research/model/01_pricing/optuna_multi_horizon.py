@@ -125,6 +125,9 @@ class OptunaObjective:
         self.val_data, _ = create_lgb_dataset_from_parquet(
             str(val_file), features, reference=self.train_data, free_raw_data=True
         )
+        # Construct datasets to enable num_data() access
+        self.train_data.construct()
+        self.val_data.construct()
         logger.info(f"  Train: {self.train_data.num_data():,} samples, Val: {self.val_data.num_data():,} samples")
 
     def __call__(self, trial: optuna.Trial) -> float:
@@ -259,9 +262,31 @@ def optimize_bucket(
     features = [col for col in FEATURE_COLS if col in schema.names()]
     logger.info(f"Using {len(features)} features")
 
-    # Calculate baseline Brier
-    _, baseline_brier_raw = create_lgb_dataset_from_parquet(str(val_file), features)
-    baseline_brier: float = float(baseline_brier_raw)
+    # Calculate baseline Brier from validation data
+    val_df = pl.read_parquet(val_file)
+
+    # Validate required columns exist
+    required_cols = ["prob_mid", "outcome"]
+    missing_cols = [col for col in required_cols if col not in val_df.columns]
+    if missing_cols:
+        msg = f"Missing required columns in {val_file}: {missing_cols}"
+        raise ValueError(msg)
+
+    # Validate DataFrame is not empty
+    if len(val_df) == 0:
+        msg = f"Validation file is empty: {val_file}"
+        raise ValueError(msg)
+
+    # Calculate Brier score
+    brier_series = ((val_df["prob_mid"] - val_df["outcome"]) ** 2).mean()
+    if brier_series is None:
+        msg = f"Failed to calculate baseline Brier from {val_file}"
+        raise ValueError(msg)
+
+    # Cast to Python float (Polars returns Python literals for scalar operations)
+    baseline_brier = float(brier_series)  # type: ignore[arg-type]
+    del val_df
+    gc.collect()
     logger.info(f"Baseline Brier score: {baseline_brier:.6f}")
 
     # Fixed parameters (from best single model config)
@@ -287,13 +312,13 @@ def optimize_bucket(
         study = optuna.load_study(study_name=study_name, storage=storage, sampler=optuna.samplers.TPESampler())
         logger.info(f"Loaded {len(study.trials)} existing trials")
     else:
-        logger.info(f"Creating new study: {study_name}")
+        logger.info(f"Creating/loading study: {study_name}")
         study = optuna.create_study(
             study_name=study_name,
             storage=storage,
             direction="minimize",
             sampler=optuna.samplers.TPESampler(),
-            load_if_exists=False,
+            load_if_exists=True,  # Load existing study if it exists, create new otherwise
         )
 
     # Create objective
@@ -487,13 +512,26 @@ def main() -> None:
         if config_file.exists():
             with open(config_file) as f:
                 bucket_results = yaml.safe_load(f)
-            improvement = bucket_results["performance"]["brier_improvement_pct"]
-            gain = bucket_results["performance"]["improvement_gain_pp"]
-            target_min = float(bucket_results["bucket"]["target_improvement"].split("-")[0])
+
+            # Safe dict access with validation
+            performance = bucket_results.get("performance", {})
+            bucket_config = bucket_results.get("bucket", {})
+
+            improvement = performance.get("brier_improvement_pct", 0.0)
+            gain = performance.get("improvement_gain_pp", 0.0)
+            bucket_name_display = bucket_config.get("name", bucket_name)
+
+            # Parse target improvement safely
+            target_improvement = bucket_config.get("target_improvement", "0-0")
+            try:
+                target_min = float(target_improvement.split("-")[0])
+            except (ValueError, IndexError, AttributeError):
+                logger.warning(f"Invalid target_improvement format for {bucket_name}: {target_improvement}")
+                target_min = 0.0
 
             status = "✓" if improvement >= target_min else "⚠"
             logger.info(
-                f"{status} {bucket_results['bucket']['name']:25s}: {improvement:6.2f}% "
+                f"{status} {bucket_name_display:25s}: {improvement:6.2f}% "
                 f"(+{gain:4.2f}pp gain, target {target_min:4.1f}%+)"
             )
 
