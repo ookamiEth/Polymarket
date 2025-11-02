@@ -218,6 +218,66 @@ def generate_html_report(
                     </div>
                     """
 
+    # Diagnostics section
+    if "diagnostics" in plots_summary:
+        html += """
+        <h2>🔬 Diagnostics & SHAP Analysis</h2>
+        <p>Model performance diagnostics, feature importance, and interpretability analysis.</p>
+        """
+
+        diag_summary = plots_summary["diagnostics"]
+
+        if diag_summary.get("plots"):
+            for plot_name, plot_path in diag_summary["plots"].items():
+                plot_path = Path(plot_path)
+                if plot_path.exists():
+                    html += f"""
+                    <div class="plot-container">
+                        <h3>{plot_name.replace("_", " ").title()}</h3>
+                        <img src="{plot_path.relative_to(Path(output_file).parent)}" alt="{plot_name}">
+                    </div>
+                    """
+
+    # Trading section
+    if "trading" in plots_summary:
+        html += """
+        <h2>💹 Trading Simulation</h2>
+        <p>Backtested trading strategy performance and P&L analysis.</p>
+        """
+
+        trading_summary = plots_summary["trading"]
+
+        if trading_summary.get("plots"):
+            for plot_name, plot_path in trading_summary["plots"].items():
+                plot_path = Path(plot_path)
+                if plot_path.exists():
+                    html += f"""
+                    <div class="plot-container">
+                        <h3>{plot_name.replace("_", " ").title()}</h3>
+                        <img src="{plot_path.relative_to(Path(output_file).parent)}" alt="{plot_name}">
+                    </div>
+                    """
+
+    # Simulation section
+    if "simulation" in plots_summary:
+        html += """
+        <h2>📊 Uncertainty Quantification</h2>
+        <p>Bootstrap confidence intervals for model performance metrics.</p>
+        """
+
+        sim_summary = plots_summary["simulation"]
+
+        if sim_summary.get("plots"):
+            for plot_name, plot_path in sim_summary["plots"].items():
+                plot_path = Path(plot_path)
+                if plot_path.exists():
+                    html += f"""
+                    <div class="plot-container">
+                        <h3>{plot_name.replace("_", " ").title()}</h3>
+                        <img src="{plot_path.relative_to(Path(output_file).parent)}" alt="{plot_name}">
+                    </div>
+                    """
+
     # Warnings section
     warnings = plots_summary.get("warnings", [])
     if warnings:
@@ -275,12 +335,12 @@ def main() -> None:
         "--output-dir",
         type=str,
         default="results/plots/",
-        help="Output directory for all plots",
+        help="Output directory for all plots (relative to 01_pricing/ directory, not model/ directory)",
     )
     parser.add_argument(
         "--no-wandb",
         action="store_true",
-        help="Disable W&B upload",
+        help="Disable W&B upload (W&B upload is ENABLED by default)",
     )
     parser.add_argument(
         "--wandb-project",
@@ -324,7 +384,7 @@ def main() -> None:
 
     plots_summary["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Check W&B availability
+    # Check W&B availability (enabled by default, disabled with --no-wandb flag)
     wandb_log = not args.no_wandb
     if wandb_log:
         if check_wandb_available():

@@ -31,8 +31,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# File paths
-RESULTS_DIR = Path("../results")
+# File paths (portable across any CWD)
+RESULTS_DIR = Path(__file__).parent.parent / "results"
 MODEL_FILE = RESULTS_DIR / "lightgbm_model_optimized.txt"
 TEST_FILE = RESULTS_DIR / "test_features_lgb.parquet"
 OUTPUT_FILE = RESULTS_DIR / "test_predictions.parquet"

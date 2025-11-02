@@ -11,6 +11,7 @@ Fixes:
 
 import logging
 import sys
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -18,8 +19,10 @@ import polars as pl
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-INPUT_FILE = "../results/test_predictions.parquet"
-OUTPUT_FILE = "../results/test_predictions_fixed.parquet"
+# File paths (portable across any CWD)
+RESULTS_DIR = Path(__file__).parent.parent / "results"
+INPUT_FILE = RESULTS_DIR / "test_predictions.parquet"
+OUTPUT_FILE = RESULTS_DIR / "test_predictions_fixed.parquet"
 
 
 def fix_predictions() -> None:

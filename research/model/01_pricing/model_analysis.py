@@ -23,8 +23,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Output directory
-OUTPUT_DIR = Path("../results")
+# Output directory (portable across any CWD)
+OUTPUT_DIR = Path(__file__).parent.parent / "results"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 
