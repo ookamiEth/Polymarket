@@ -421,6 +421,17 @@ def main() -> None:
         action="store_true",
         help="Skip visualization generation",
     )
+    parser.add_argument(
+        "--holdout-only",
+        action="store_true",
+        help="Evaluate only on holdout period (true out-of-sample test)",
+    )
+    parser.add_argument(
+        "--holdout-start",
+        type=str,
+        default=None,
+        help="Holdout start date (YYYY-MM-DD). If not specified, computed from config.",
+    )
     args = parser.parse_args()
 
     logger.info("=" * 80)
@@ -449,8 +460,52 @@ def main() -> None:
     data = pl.read_parquet(args.input)
     logger.info(f"  Loaded {len(data):,} samples")
 
+    # Filter to holdout period if requested
+    if args.holdout_only:
+        from datetime import date
+
+        from dateutil.relativedelta import relativedelta
+
+        # Determine holdout start date
+        if args.holdout_start:
+            holdout_start = date.fromisoformat(args.holdout_start)
+            logger.info(f"\n⚠ Using custom holdout start: {holdout_start}")
+        else:
+            # Compute from data range and config
+            walk_forward_config = config.get("walk_forward_validation", {})
+            holdout_months = walk_forward_config.get("holdout_months", 3)
+
+            # Get max date from data
+            max_date = data.select(pl.col("date").max()).item()
+            # FIXED: Correct holdout calculation (was off by one month)
+            # For 3 months holdout with max_date=2025-09-30, we want 2025-07-01
+            holdout_start = max_date - relativedelta(months=holdout_months) + relativedelta(days=1)
+
+            logger.info("\n⚠ HOLDOUT-ONLY MODE ENABLED")
+            logger.info(f"  Holdout period: Last {holdout_months} months")
+            logger.info(f"  Computed holdout start: {holdout_start}")
+            logger.info(f"  Data max date: {max_date}")
+
+        # Filter data
+        data_before = len(data)
+        data = data.filter(pl.col("date") >= holdout_start)
+        data_after = len(data)
+
+        logger.info(f"  Filtered: {data_before:,} → {data_after:,} samples ({data_after / data_before * 100:.1f}%)")
+        logger.info(
+            f"  Date range: {data.select(pl.col('date').min()).item()} to {data.select(pl.col('date').max()).item()}"
+        )
+
+        if data_after == 0:
+            raise ValueError(f"No samples in holdout period starting {holdout_start}")
+
+        logger.info("\n✓ This is a TRUE OUT-OF-SAMPLE evaluation (no data leakage)")
+    else:
+        logger.info("\n⚠ WARNING: Evaluating on full test set (may include training data)")
+        logger.info("  Use --holdout-only for true out-of-sample evaluation")
+
     # Verify required columns
-    required_cols = ["time_remaining", "outcome", "prob_mid"]
+    required_cols = ["time_remaining", "outcome", "prob_mid", "date"]
     missing_cols = [col for col in required_cols if col not in data.columns]
     if missing_cols:
         raise ValueError(f"Missing required columns: {missing_cols}")

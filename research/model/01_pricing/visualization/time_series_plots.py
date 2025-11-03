@@ -62,6 +62,9 @@ def plot_brier_over_time(
             pl.from_epoch(pl.col("date"), time_unit="s").alias("date")
         ])
 
+    # CRITICAL: Sort by date before group_by_dynamic
+    test_df = test_df.sort("date")
+
     # Aggregate by time window
     daily_metrics = (
         test_df.group_by_dynamic("date", every=window)

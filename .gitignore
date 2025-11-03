@@ -144,3 +144,5 @@ documentation/
 *.txt 
 *.wandb 
 *.yaml 
+*.db 
+.checkpoints/

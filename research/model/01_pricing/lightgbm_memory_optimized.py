@@ -644,11 +644,14 @@ def split_data_three_way(
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
     output_dir: Path = OUTPUT_DIR,
-    shuffle: bool = True,
+    shuffle: bool = False,  # CRITICAL: Maintain temporal order to prevent look-ahead bias
     seed: int = 42,
 ) -> tuple[str, str, str]:
     """
     Split data into train/validation/test sets.
+
+    IMPORTANT: For time series data, shuffle should be False to maintain temporal order
+    and prevent data leakage. Training on future data to predict past is invalid.
 
     Args:
         chunk_files: List of parquet files to combine and split
@@ -656,8 +659,8 @@ def split_data_three_way(
         val_ratio: Proportion for validation set
         test_ratio: Proportion for test set
         output_dir: Directory to save split files
-        shuffle: Whether to shuffle data before splitting
-        seed: Random seed for shuffling
+        shuffle: Whether to shuffle data before splitting (MUST be False for time series)
+        seed: Random seed for shuffling (only used if shuffle=True)
 
     Returns:
         Tuple of (train_file, val_file, test_file) paths

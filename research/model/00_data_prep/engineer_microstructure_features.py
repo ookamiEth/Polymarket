@@ -107,7 +107,7 @@ def calculate_price_range_features(df: pl.DataFrame) -> pl.DataFrame:
     for window in RANGE_WINDOWS:
         df = df.with_columns(
             [
-                # Rolling max and min
+                # Rolling max and min - CRITICAL: Polars uses trailing windows by default (no future data)
                 pl.col("high").rolling_max(window_size=window).alias(f"high_{window}s"),
                 pl.col("low").rolling_min(window_size=window).alias(f"low_{window}s"),
             ]
@@ -153,7 +153,7 @@ def calculate_reversal_features(df: pl.DataFrame) -> pl.DataFrame:
     df = df.with_columns([(pl.col("return_sign").diff() != 0).cast(pl.Int8).alias("reversal")])
 
     for window in REVERSAL_WINDOWS:
-        # Sum reversals in rolling window
+        # Sum reversals in rolling window - CRITICAL: Polars uses trailing windows by default (no future data)
         df = df.with_columns([pl.col("reversal").rolling_sum(window_size=window).alias(f"reversals_{window}s")])
 
         # Report statistics
@@ -186,6 +186,7 @@ def calculate_jump_features(df: pl.DataFrame) -> pl.DataFrame:
     if "rv_60s" not in df.columns:
         logger.warning("rv_60s not found. Calculating simple rolling volatility...")
         df = df.with_columns([pl.col("close").log().diff().alias("log_return")])
+        # CRITICAL: Polars uses trailing windows by default (no future data)
         df = df.with_columns([pl.col("log_return").rolling_std(window_size=60).alias("rv_60s_approx")])
         rv_col = "rv_60s_approx"
     else:
@@ -210,6 +211,7 @@ def calculate_jump_features(df: pl.DataFrame) -> pl.DataFrame:
     )
 
     # Jump intensity: rolling count of jumps in last 5 minutes
+    # CRITICAL: Polars uses trailing windows by default (no future data)
     df = df.with_columns([pl.col("jump_detected").rolling_sum(window_size=300).alias("jump_intensity_300s")])
 
     # Drop intermediate columns
@@ -249,6 +251,7 @@ def calculate_autocorrelation_features(df: pl.DataFrame) -> pl.DataFrame:
     # Lag-1 autocorrelation (rolling 300s window)
     df = df.with_columns([pl.col("log_return").shift(1).alias("log_return_lag1")])
 
+    # CRITICAL: Polars uses trailing windows by default (no future data)
     df = df.with_columns(
         [pl.rolling_corr(pl.col("log_return"), pl.col("log_return_lag1"), window_size=300).alias("autocorr_lag1_300s")]
     )
@@ -256,6 +259,7 @@ def calculate_autocorrelation_features(df: pl.DataFrame) -> pl.DataFrame:
     # Lag-5 autocorrelation (5-second lag)
     df = df.with_columns([pl.col("log_return").shift(5).alias("log_return_lag5")])
 
+    # CRITICAL: Polars uses trailing windows by default (no future data)
     df = df.with_columns(
         [pl.rolling_corr(pl.col("log_return"), pl.col("log_return_lag5"), window_size=300).alias("autocorr_lag5_300s")]
     )
@@ -303,6 +307,7 @@ def calculate_hurst_exponent_rolling(df: pl.DataFrame, window: int = 300) -> pl.
 
     if f"autocorr_lag1_{window}s" not in df.columns:
         df = df.with_columns([pl.col("log_return").shift(1).alias("log_return_lag1")])
+        # CRITICAL: Polars uses trailing windows by default (no future data)
         df = df.with_columns(
             [
                 pl.rolling_corr(pl.col("log_return"), pl.col("log_return_lag1"), window_size=window).alias(

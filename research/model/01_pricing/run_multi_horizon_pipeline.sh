@@ -3,13 +3,13 @@
 # ==========================================
 #
 # Features:
-#   - Pilot mode: Quick smoke test (~5 min) - 3 buckets without walk-forward
-#   - Full mode: Production training (~5-8 hours) - 3 buckets with 14-window walk-forward + Optuna
+#   - Production training (~5-8 hours) - 3 buckets with 14-window walk-forward + Optuna
+#   - Walk-forward validation is MANDATORY (no data leakage for time series)
 #   - Phase checkpointing for resumability
 #   - Separate logs per step
 #   - Stop on first error
 #
-# Pipeline Structure (Full Mode):
+# Pipeline Structure:
 #   PHASE 1: BASELINE TRAINING & VALIDATION (~77 min)
 #     Step 1: Training with walk-forward validation (~72 min)
 #     Step 2: Baseline evaluation (~5 min)
@@ -18,17 +18,11 @@
 #     Step 1: Per-bucket Optuna tuning (~4-6 hours, 50 trials)
 #     Step 2: Final re-evaluation (~5 min)
 #
-# Pipeline Structure (Pilot Mode):
-#   PHASE 1: QUICK SMOKE TEST (~5 min)
-#     Step 1: Training without walk-forward (~3 min)
-#     Step 2: Quick evaluation, no plots (~30 sec)
-#
 # Usage:
-#   ./run_multi_horizon_pipeline.sh pilot
-#   ./run_multi_horizon_pipeline.sh full
-#   ./run_multi_horizon_pipeline.sh full --resume-from-phase 2
-#   ./run_multi_horizon_pipeline.sh full --skip-phase2
-#   ./run_multi_horizon_pipeline.sh --clean  # Remove all checkpoints and logs
+#   ./run_multi_horizon_pipeline.sh                    # Run full pipeline
+#   ./run_multi_horizon_pipeline.sh --resume-from-phase 2
+#   ./run_multi_horizon_pipeline.sh --skip-phase2
+#   ./run_multi_horizon_pipeline.sh --clean            # Remove all checkpoints and logs
 #
 # Author: BT Research Team
 # Date: 2025-11-02
@@ -150,31 +144,27 @@ clean_checkpoints() {
 
 show_usage() {
     cat << EOF
-Usage: $0 <mode> [options]
+Usage: $0 [options]
 
-Modes:
-  pilot           Quick smoke test (~5 min)
-                  - Phase 1 Step 1: Train 3 buckets without walk-forward
-                  - Phase 1 Step 2: Quick evaluation without plots
+Production Training Pipeline (~5-8 hours):
+  - Phase 1 Step 1: Train 3 buckets with 14-window walk-forward (~72 min)
+  - Phase 1 Step 2: Baseline evaluation (~5 min)
+  - Phase 2 Step 1: Optuna per-bucket tuning (~4-6 hours)
+  - Phase 2 Step 2: Final re-evaluation (~5 min)
 
-  full            Production training (~5-8 hours)
-                  - Phase 1 Step 1: Train 3 buckets with 14-window walk-forward (~72 min)
-                  - Phase 1 Step 2: Baseline evaluation (~5 min)
-                  - Phase 2 Step 1: Optuna per-bucket tuning (~4-6 hours)
-                  - Phase 2 Step 2: Final re-evaluation (~5 min)
+Note: Walk-forward validation is MANDATORY. This ensures zero data leakage.
 
 Options:
   --resume-from-phase N    Resume from Phase N (1 or 2)
-  --skip-phase2            Skip Phase 2 (Optuna optimization) in full mode
+  --skip-phase2            Skip Phase 2 (Optuna optimization)
   --clean                  Remove all checkpoints and logs (no execution)
   --help                   Show this help message
 
 Examples:
-  $0 pilot
-  $0 full
-  $0 full --skip-phase2
-  $0 full --resume-from-phase 2
-  $0 --clean
+  $0                            # Run full pipeline
+  $0 --skip-phase2              # Run Phase 1 only
+  $0 --resume-from-phase 2      # Resume from Phase 2
+  $0 --clean                    # Clean checkpoints
 
 EOF
 }
@@ -183,22 +173,11 @@ EOF
 # ARGUMENT PARSING
 # ============================================================================
 
-MODE=""
 RESUME_FROM_PHASE=1
 SKIP_PHASE2=false
 
-if [[ $# -eq 0 ]]; then
-    log_error "No mode specified"
-    show_usage
-    exit 1
-fi
-
 while [[ $# -gt 0 ]]; do
     case $1 in
-        pilot|full)
-            MODE=$1
-            shift
-            ;;
         --resume-from-phase)
             RESUME_FROM_PHASE=$2
             shift 2
@@ -223,13 +202,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Validate mode
-if [[ "$MODE" != "pilot" && "$MODE" != "full" ]]; then
-    log_error "Invalid mode: $MODE"
-    show_usage
-    exit 1
-fi
-
 # ============================================================================
 # MAIN PIPELINE
 # ============================================================================
@@ -237,7 +209,6 @@ fi
 print_double_separator
 log_info "MULTI-HORIZON LIGHTGBM TRAINING PIPELINE"
 print_double_separator
-log_info "Mode: $MODE"
 log_info "Resume from phase: $RESUME_FROM_PHASE"
 log_info "Skip Phase 2: $SKIP_PHASE2"
 log_info "Working directory: $SCRIPT_DIR"
@@ -247,99 +218,71 @@ echo ""
 
 PIPELINE_START=$(date +%s)
 
-if [[ "$MODE" == "pilot" ]]; then
-    # ========================================================================
-    # PILOT MODE (~5 minutes)
-    # ========================================================================
+# ========================================================================
+# PRODUCTION TRAINING (~5-8 hours)
+# ========================================================================
 
-    log_info "PILOT MODE: Quick smoke test"
-    log_info "Expected runtime: ~5 minutes"
-    echo ""
+log_info "Production training with walk-forward validation (MANDATORY)"
+if [[ "$SKIP_PHASE2" == "true" ]]; then
+    log_info "Expected runtime: ~77 minutes (Phase 2 skipped)"
+else
+    log_info "Expected runtime: ~5-8 hours (includes Phase 2 optimization)"
+fi
+echo ""
 
+# ========================================================================
+# PHASE 1: BASELINE TRAINING & VALIDATION (~77 min)
+# ========================================================================
+
+if [[ $RESUME_FROM_PHASE -le 1 ]]; then
     print_double_separator
-    log_info "PHASE 1: QUICK SMOKE TEST"
+    log_info "PHASE 1: BASELINE TRAINING & VALIDATION"
     print_double_separator
+    log_info "Expected runtime: ~77 minutes"
     echo ""
 
-    # Phase 1 Step 1: Train 3 buckets without walk-forward
-    if [[ $RESUME_FROM_PHASE -le 1 ]]; then
-        run_step 1 1 "training_no_walkforward" \
-            "uv run python train_multi_horizon.py --bucket all --no-walk-forward"
-    fi
+    # Phase 1 Step 1: Training with walk-forward validation
+    run_step 1 1 "training_walkforward" \
+        "uv run python train_multi_horizon.py --bucket all"
 
-    # Phase 1 Step 2: Quick evaluation without plots
-    if [[ $RESUME_FROM_PHASE -le 1 ]]; then
-        run_step 1 2 "evaluation_quick" \
-            "uv run python evaluate_multi_horizon.py --no-plots"
-    fi
+    # Phase 1 Step 2: Baseline evaluation (on holdout period only - no data leakage)
+    run_step 1 2 "evaluation_baseline" \
+        "uv run python evaluate_multi_horizon.py --holdout-only"
 
-elif [[ "$MODE" == "full" ]]; then
-    # ========================================================================
-    # FULL MODE (~5-8 hours)
-    # ========================================================================
-
-    log_info "FULL MODE: Production training with walk-forward validation"
-    if [[ "$SKIP_PHASE2" == "true" ]]; then
-        log_info "Expected runtime: ~77 minutes (Phase 2 skipped)"
-    else
-        log_info "Expected runtime: ~5-8 hours (includes Phase 2 optimization)"
-    fi
+    print_separator
+    log_success "PHASE 1 COMPLETE"
+    print_separator
     echo ""
+fi
 
-    # ========================================================================
-    # PHASE 1: BASELINE TRAINING & VALIDATION (~77 min)
-    # ========================================================================
+# ========================================================================
+# PHASE 2: HYPERPARAMETER OPTIMIZATION (~4-6 hours)
+# ========================================================================
 
-    if [[ $RESUME_FROM_PHASE -le 1 ]]; then
+if [[ "$SKIP_PHASE2" == "false" ]]; then
+    if [[ $RESUME_FROM_PHASE -le 2 ]]; then
         print_double_separator
-        log_info "PHASE 1: BASELINE TRAINING & VALIDATION"
+        log_info "PHASE 2: HYPERPARAMETER OPTIMIZATION"
         print_double_separator
-        log_info "Expected runtime: ~77 minutes"
+        log_info "Expected runtime: ~4-6 hours"
         echo ""
 
-        # Phase 1 Step 1: Training with walk-forward validation
-        run_step 1 1 "training_walkforward" \
-            "uv run python train_multi_horizon.py --bucket all --walk-forward"
+        # Phase 2 Step 1: Optuna per-bucket optimization
+        run_step 2 1 "optuna_optimization" \
+            "uv run python optuna_multi_horizon.py --bucket all --n-trials 50"
 
-        # Phase 1 Step 2: Baseline evaluation
-        run_step 1 2 "evaluation_baseline" \
-            "uv run python evaluate_multi_horizon.py"
+        # Phase 2 Step 2: Final re-evaluation (on holdout period only - no data leakage)
+        run_step 2 2 "evaluation_optimized" \
+            "uv run python evaluate_multi_horizon.py --holdout-only"
 
         print_separator
-        log_success "PHASE 1 COMPLETE"
+        log_success "PHASE 2 COMPLETE"
         print_separator
         echo ""
     fi
-
-    # ========================================================================
-    # PHASE 2: HYPERPARAMETER OPTIMIZATION (~4-6 hours)
-    # ========================================================================
-
-    if [[ "$SKIP_PHASE2" == "false" ]]; then
-        if [[ $RESUME_FROM_PHASE -le 2 ]]; then
-            print_double_separator
-            log_info "PHASE 2: HYPERPARAMETER OPTIMIZATION"
-            print_double_separator
-            log_info "Expected runtime: ~4-6 hours"
-            echo ""
-
-            # Phase 2 Step 1: Optuna per-bucket optimization
-            run_step 2 1 "optuna_optimization" \
-                "uv run python optuna_multi_horizon.py --bucket all --n-trials 50"
-
-            # Phase 2 Step 2: Final re-evaluation
-            run_step 2 2 "evaluation_optimized" \
-                "uv run python evaluate_multi_horizon.py"
-
-            print_separator
-            log_success "PHASE 2 COMPLETE"
-            print_separator
-            echo ""
-        fi
-    else
-        log_info "Skipping Phase 2 (Optuna optimization)"
-        echo ""
-    fi
+else
+    log_info "Skipping Phase 2 (Optuna optimization)"
+    echo ""
 fi
 
 # ============================================================================
@@ -354,7 +297,6 @@ PIPELINE_SECONDS=$((PIPELINE_DURATION % 60))
 print_double_separator
 log_success "PIPELINE COMPLETE"
 print_double_separator
-log_info "Mode: $MODE"
 log_info "Total time: ${PIPELINE_MINUTES}m ${PIPELINE_SECONDS}s"
 log_info "Logs saved to: $LOG_DIR/"
 log_info "Checkpoints saved to: $CHECKPOINT_DIR/"
@@ -363,28 +305,20 @@ print_double_separator
 # Show next steps
 echo ""
 log_info "NEXT STEPS:"
-if [[ "$MODE" == "pilot" ]]; then
-    echo "  1. Review pilot results:"
-    echo "     tail -100 logs/phase1_step2_evaluation_quick_*.log"
+if [[ "$SKIP_PHASE2" == "true" ]]; then
+    echo "  1. Review Phase 1 baseline results:"
+    echo "     tail -100 logs/phase1_step2_evaluation_baseline_*.log"
     echo ""
-    echo "  2. If successful, run full pipeline:"
-    echo "     ./run_multi_horizon_pipeline.sh full"
-elif [[ "$MODE" == "full" ]]; then
-    if [[ "$SKIP_PHASE2" == "true" ]]; then
-        echo "  1. Review Phase 1 baseline results:"
-        echo "     tail -100 logs/phase1_step2_evaluation_baseline_*.log"
-        echo ""
-        echo "  2. If baseline looks good (≥15% improvement), run Phase 2:"
-        echo "     ./run_multi_horizon_pipeline.sh full --resume-from-phase 2"
-    else
-        echo "  1. Compare baseline (Phase 1) vs optimized (Phase 2) performance:"
-        echo "     echo 'Baseline:'"
-        echo "     grep 'improvement' logs/phase1_step2_evaluation_baseline_*.log"
-        echo "     echo 'Optimized:'"
-        echo "     grep 'improvement' logs/phase2_step2_evaluation_optimized_*.log"
-        echo ""
-        echo "  2. Deploy best models to production"
-    fi
+    echo "  2. If baseline looks good (≥15% improvement), run Phase 2:"
+    echo "     ./run_multi_horizon_pipeline.sh --resume-from-phase 2"
+else
+    echo "  1. Compare baseline (Phase 1) vs optimized (Phase 2) performance:"
+    echo "     echo 'Baseline:'"
+    echo "     grep 'improvement' logs/phase1_step2_evaluation_baseline_*.log"
+    echo "     echo 'Optimized:'"
+    echo "     grep 'improvement' logs/phase2_step2_evaluation_optimized_*.log"
+    echo ""
+    echo "  2. Deploy best models to production"
 fi
 echo ""
 

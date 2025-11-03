@@ -14,7 +14,7 @@ Rationale:
 - Expected +3-5pp improvement with specialized models
 
 Usage:
-  # Train all buckets
+  # Train all buckets (always uses walk-forward validation)
   uv run python train_multi_horizon.py
 
   # Train specific bucket
@@ -22,6 +22,9 @@ Usage:
 
   # With custom config
   uv run python train_multi_horizon.py --config config/custom_config.yaml
+
+Note: Walk-forward validation is MANDATORY for production use.
+      This ensures zero data leakage for time series forecasting.
 
 Author: BT Research Team
 Date: 2025-11-02
@@ -670,16 +673,6 @@ def main() -> None:
         default=Path(__file__).parent / "config" / "multi_horizon_config.yaml",
         help="Path to multi-horizon config file",
     )
-    parser.add_argument(
-        "--walk-forward",
-        action="store_true",
-        help="Enable walk-forward validation (overrides config)",
-    )
-    parser.add_argument(
-        "--no-walk-forward",
-        action="store_true",
-        help="Disable walk-forward validation (overrides config)",
-    )
     args = parser.parse_args()
 
     logger.info("\n" + "=" * 80)
@@ -689,18 +682,11 @@ def main() -> None:
     # Load configuration
     config = load_config(args.config)
 
-    # Determine walk-forward mode (CLI overrides config)
-    use_walk_forward = config.get("walk_forward_validation", {}).get("enabled", False)
-    if args.walk_forward:
-        use_walk_forward = True
-        logger.info("Walk-forward validation ENABLED (CLI override)")
-    elif args.no_walk_forward:
-        use_walk_forward = False
-        logger.info("Walk-forward validation DISABLED (CLI override)")
-    elif use_walk_forward:
-        logger.info("Walk-forward validation ENABLED (config)")
-    else:
-        logger.info("Walk-forward validation DISABLED (config)")
+    # Walk-forward validation is MANDATORY for production (no data leakage)
+    logger.info("Walk-forward validation: ENABLED (mandatory for time series)")
+    if not config.get("walk_forward_validation", {}).get("enabled", True):
+        logger.warning("⚠️  Config has walk_forward_validation.enabled=false, but this is IGNORED")
+        logger.warning("    Walk-forward is MANDATORY to prevent data leakage in time series")
 
     # Load shared hyperparameters
     model_dir = Path(__file__).parent.parent
@@ -747,58 +733,28 @@ def main() -> None:
         logger.info(f"# Expected samples: {bucket_config['expected_samples']:,}")
         logger.info(f"{'#' * 80}")
 
-        # Train model (choose strategy based on config)
-        if use_walk_forward:
-            # Walk-forward validation: stratify full dataset by bucket, then do temporal splits
-            walk_forward_config = config["walk_forward_validation"]
+        # Train model with walk-forward validation (mandatory)
+        walk_forward_config = config["walk_forward_validation"]
 
-            # Stratify FULL dataset (train + val + test combined) by time bucket
-            full_data_file = stratify_data_by_time(
-                data_dir / Path(config["data"]["source_files"]["train"]).name,
-                output_dir,
-                bucket_name,
-                bucket_config["time_min"],
-                bucket_config["time_max"],
-            )
+        # Stratify FULL dataset (train + val + test combined) by time bucket
+        full_data_file = stratify_data_by_time(
+            data_dir / Path(config["data"]["source_files"]["train"]).name,
+            output_dir,
+            bucket_name,
+            bucket_config["time_min"],
+            bucket_config["time_max"],
+        )
 
-            model, metrics = train_bucket_walk_forward(
-                bucket_name,
-                bucket_config,
-                full_data_file,
-                hyperparameters,
-                features,
-                models_dir,
-                walk_forward_config,
-                wandb_run,
-            )
-        else:
-            # Standard training: use pre-split train/val files
-            train_file = stratify_data_by_time(
-                data_dir / Path(config["data"]["source_files"]["train"]).name,
-                output_dir,
-                bucket_name,
-                bucket_config["time_min"],
-                bucket_config["time_max"],
-            )
-
-            val_file = stratify_data_by_time(
-                data_dir / Path(config["data"]["source_files"]["val"]).name,
-                output_dir,
-                bucket_name,
-                bucket_config["time_min"],
-                bucket_config["time_max"],
-            )
-
-            model, metrics = train_bucket_model(
-                bucket_name,
-                bucket_config,
-                train_file,
-                val_file,
-                hyperparameters,
-                features,
-                models_dir,
-                wandb_run,
-            )
+        model, metrics = train_bucket_walk_forward(
+            bucket_name,
+            bucket_config,
+            full_data_file,
+            hyperparameters,
+            features,
+            models_dir,
+            walk_forward_config,
+            wandb_run,
+        )
 
         all_metrics[bucket_name] = metrics
 

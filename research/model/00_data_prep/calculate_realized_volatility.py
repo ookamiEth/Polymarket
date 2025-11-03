@@ -111,6 +111,8 @@ def calculate_realized_volatility(df: pl.DataFrame, window_seconds: int, column_
 
     # Rolling standard deviation of log returns
     # Note: Polars rolling_std uses sample std (N-1 denominator) by default
+    # CRITICAL: Polars uses trailing windows by default (includes current + past N-1 rows)
+    # This is correct for time series - NO FUTURE DATA LEAKAGE
     df = df.with_columns([pl.col("log_return").rolling_std(window_size=window_seconds).alias(f"{column_name}_raw")])
 
     # Annualize
@@ -214,9 +216,7 @@ def validate_output(df: pl.DataFrame) -> None:
             logger.warning(f"{col} has {null_pct:.1f}% nulls (expected <10%)")
 
     # Cross-features (can be negative, e.g., inverted term structure)
-    cross_feature_cols = [
-        col for col in df.columns if col.startswith("rv_") and col not in base_rv_cols
-    ]
+    cross_feature_cols = [col for col in df.columns if col.startswith("rv_") and col not in base_rv_cols]
 
     for col in cross_feature_cols:
         # Check null percentage only
