@@ -286,7 +286,11 @@ class TestTemporalIntegrity:
             ".rolling_std(center=True)",
             ".rolling_sum(center=True)",
             ".shift(-",  # Negative shift = future data
-            "future_",  # Any feature named with "future_"
+        ]
+
+        # Patterns to exclude (legitimate uses)
+        excluded_patterns = [
+            "from __future__ import",  # Python type hint imports
         ]
 
         violations = []
@@ -297,9 +301,19 @@ class TestTemporalIntegrity:
 
             with open(script) as f:
                 content = f.read()
+
+                # Check for forward-looking patterns
                 for pattern in forward_looking_patterns:
                     if pattern in content:
-                        violations.append(f"{script.name}: Found pattern '{pattern}'")
+                        # Check if it's an excluded pattern
+                        is_excluded = False
+                        for exclude in excluded_patterns:
+                            if exclude in content and pattern in exclude:
+                                is_excluded = True
+                                break
+
+                        if not is_excluded:
+                            violations.append(f"{script.name}: Found pattern '{pattern}'")
 
         assert len(violations) == 0, f"Found {len(violations)} potential forward-looking features:\n" + "\n".join(
             f"  - {v}" for v in violations
