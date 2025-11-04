@@ -74,23 +74,29 @@ This thesis proposes a systematic approach to binary option pricing for predicti
 
 \subsection{Task description}
 
-This thesis involves seven main tasks to build and test a pricing model for prediction markets:
+This thesis involves ten main tasks to build and test a pricing model for prediction markets:
 
 \begin{itemize}
 
-\item \textbf{Task I: Data Collection} Build three data collection systems. First, collect historical trade data from 14,874 closed markets. Second, run four real-time streaming services that capture orderbook snapshots every second. Third, download options data from Deribit covering October 2023 to September 2025. Store all data efficiently for fast querying (90GB total).
+\item \textbf{Task I: Data Infrastructure} Build and deploy data collection systems for three sources: historical trade data from closed prediction market contracts, real-time orderbook streaming services capturing live market data, and options market data from cryptocurrency derivatives exchanges. Implement efficient storage and querying systems to support large-scale empirical analysis.
 
-\item \textbf{Task II: Data Processing} Process large datasets using efficient code that can handle over 200 million rows. Use optimized techniques to keep memory usage low on limited hardware. Final datasets include 204.7 million options quotes, 63 million BTC prices at 1-second intervals, and 70,000 contract schedules.
+\item \textbf{Task II: Data Processing} Develop processing pipelines to handle large datasets using memory-optimized techniques suitable for resource-constrained environments. Construct cleaned datasets including options quotes with computed implied volatilities, high-frequency spot price data resampled at one-second intervals, and contract schedules mapping prediction market trading periods.
 
-\item \textbf{Task III: Feature Engineering} Create 24 input features computed every second for each 15-minute contract. These include 8 volatility measures at different time scales, 13 market microstructure signals (momentum, price jumps, reversals, etc.), and 3 context variables (time remaining, data freshness, distance from strike price).
+\item \textbf{Task III: Feature Engineering} Design and implement a comprehensive feature space for model training. Features will include multi-scale realized volatility measures computed at different time horizons, market microstructure signals capturing momentum, price jumps, reversals, and statistical properties of price dynamics, and contextual variables such as time remaining until contract expiry and data staleness indicators.
 
-\item \textbf{Task IV: Baseline Model} Implement a Black-Scholes pricing model for binary options using implied volatility from Deribit. Test on 2 years of data, generating 62.3 million predictions. Baseline performance: Brier Score 0.162 (where 0.25 is random and 0.10 is excellent). Key finding: performance is 5.7$\times$ worse at the start of each contract compared to near expiration, caused by stale implied volatility.
+\item \textbf{Task IV: Baseline Model} Implement a Black-Scholes pricing framework adapted for binary options, using implied volatilities from options markets as volatility estimates. Evaluate baseline model performance on historical data and conduct diagnostic analysis to identify primary sources of pricing error and model limitations at ultra-short time scales.
 
-\item \textbf{Task V: First Improvement} Fix the stale volatility problem by using recent realized volatility computed from 1-second price data. Blend this with implied volatility, giving more weight to realized volatility when Deribit data is old. Target: 15--25\% improvement to Brier Score 0.120--0.135.
+\item \textbf{Task V: Volatility Integration} Investigate approaches to address temporal mismatches between options market implied volatilities and ultra-short-dated binary pricing. Develop blending methodologies that combine implied volatility with recent realized volatility computed from high-frequency price data, with adaptive weighting based on data freshness and market conditions.
 
-\item \textbf{Task VI: Advanced Models} Train machine learning models to correct remaining errors. Use Ridge regression for interpretable linear corrections, then gradient-boosted trees to capture complex patterns. All models use the 24 features. Target: 35--45\% total improvement to Brier Score 0.090--0.100.
+\item \textbf{Task VI: Machine Learning Enhancement} Train statistical and machine learning models to capture systematic pricing errors not addressed by classical theory. Implement Ridge regression for interpretable linear corrections, followed by gradient-boosted tree models to capture non-linear relationships and regime-dependent effects. Evaluate incremental improvements from each modeling approach.
 
-\item \textbf{Task VII: Testing and Analysis} Validate all models thoroughly. Check calibration (do predicted probabilities match actual outcomes?), test performance in different market conditions (calm vs volatile periods), and identify which features matter most. Create clear visualizations and document results.
+\item \textbf{Task VII: Validation and Analysis} Conduct comprehensive model validation including calibration analysis to assess probability forecast quality, performance evaluation across different market regimes, and feature importance analysis to identify key drivers of pricing accuracy. Document results with clear visualizations and statistical tests.
+
+\item \textbf{Task VIII: Event Volatility Decomposition} Address the challenge that near-term options (expiring 1--2 days ahead) incorporate upcoming macro event risk rather than base structural volatility. Integrate a traditional macro event schedule covering Fed meetings, CPI releases, employment reports, and GDP announcements. Develop methodology to decompose implied volatility into base volatility and event premium components, extracting the structural volatility signal by filtering event-driven spikes. Integrate base volatility estimates into the pricing model to improve accuracy.
+
+\item \textbf{Task IX: Multi-Asset Expansion} Extend the complete modeling framework from Bitcoin to Ethereum, Solana, and XRP, all of which have 15-minute binary contracts on Polymarket. Adapt data collection pipelines for multi-asset spot prices and options data, retrain and calibrate models for each asset's unique characteristics, and conduct cross-asset validation. Identify asset-specific considerations versus universal pricing patterns that generalize across cryptocurrencies.
+
+\item \textbf{Task X: Live Market Making System} Deploy the pricing model into a live execution system for real-world validation. Build trading infrastructure connecting model probability outputs to Polymarket order placement, implement market making strategies that provide liquidity at model-fair prices, and incorporate basic risk management and position limits. Monitor and document all trading activity including executed trades, profit and loss, and model performance under live market conditions.
 
 \end{itemize}
 
@@ -98,17 +104,23 @@ This thesis involves seven main tasks to build and test a pricing model for pred
 
 \begin{enumerate}
 
-\item \textbf{M1 (Tasks I \& II):} Data collection and processing systems complete. All three data pipelines operational: 14,874 historical markets collected, four real-time streams running 24/7, and 204 million Deribit options quotes processed. Total: 90GB of cleaned data ready for analysis.
+\item \textbf{M1 (Tasks I \& II):} Data infrastructure operational and validated. All three data collection pipelines deployed: historical trade data collection, real-time orderbook streaming services, and options market data acquisition. Processed datasets ready for empirical analysis.
 
-\item \textbf{M2 (Task III):} Feature engineering complete. All 24 features working correctly and computed at 1-second intervals. Features tested on sample contracts and validated for quality.
+\item \textbf{M2 (Task III):} Feature engineering framework implemented and tested. Multi-scale volatility measures, microstructure signals, and contextual features computed at high frequency and validated for quality and correctness on sample contracts.
 
-\item \textbf{M3 (Task IV):} Baseline model tested. Black-Scholes model run on full 2-year dataset with 62.3 million predictions. Performance measured: Brier Score 0.162. Main problem identified: stale implied volatility causes 5.7$\times$ worse performance early in each contract period.
+\item \textbf{M3 (Task IV):} Baseline pricing model implemented and benchmarked. Black-Scholes binary option framework evaluated on historical data. Diagnostic analysis performed to identify primary error sources and model limitations.
 
-\item \textbf{M4 (Task V):} First improvement tested. Realized volatility successfully integrated with multiple blending approaches. Target met: 15--25\% improvement, reaching Brier Score 0.120--0.135. Analysis confirms realized volatility helps most at the start of contracts.
+\item \textbf{M4 (Task V):} Volatility integration approach implemented and evaluated. Blending methodologies combining implied and realized volatility tested across different market conditions. Improvements over baseline quantified and documented.
 
-\item \textbf{M5 (Task VI):} Advanced ML models trained. Both Ridge regression and gradient-boosted models trained on all 24 features. Full backtest complete. Final target achieved: Brier Score 0.090--0.100, representing 35--45\% improvement over baseline.
+\item \textbf{M5 (Task VI):} Machine learning models trained and validated. Ridge regression and gradient-boosted tree models implemented. Incremental performance gains evaluated and compared against baseline and intermediate approaches.
 
-\item \textbf{M6 (Task VII):} Thesis completed. All validation analysis done: calibration plots, performance across different market conditions, and feature importance analysis. Final report written, presentation delivered, and code documented.
+\item \textbf{M6 (Task VII):} Comprehensive validation of core pricing models completed. Calibration analysis, regime-dependent performance evaluation, and feature importance studies documented for baseline and enhanced models.
+
+\item \textbf{M7 (Task VIII):} Event volatility decomposition framework implemented and validated. Macro event schedule integrated, base volatility extraction methodology developed and tested on historical data. Improvements over raw implied volatility quantified and documented.
+
+\item \textbf{M8 (Task IX):} Multi-asset modeling framework operational. Data pipelines extended to Ethereum, Solana, and XRP. Models trained and benchmarked for all assets. Cross-asset performance comparison and asset-specific findings documented.
+
+\item \textbf{M9 (Task X):} Live market making system deployed and evaluated, thesis completed. Trading infrastructure operational with model-driven order placement on Polymarket. Live trading results documented including execution statistics, profit and loss, and real-time model performance metrics. Final thesis report written, presentation delivered, and reproducible code provided.
 
 \end{enumerate}
 
