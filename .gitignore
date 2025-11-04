@@ -146,3 +146,6 @@ documentation/
 *.yaml 
 *.db 
 .checkpoints/
+*.aux 
+*.lock 
+*.out 

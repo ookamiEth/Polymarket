@@ -1,0 +1,115 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{setspace}
+
+% Spacing settings to match baseline style
+\setstretch{1.3}
+\setlength{\parskip}{6pt plus 2pt minus 1pt}
+
+\begin{document}
+
+\vspace*{0.5cm}
+
+\begin{center}
+\Large \textsc{Bachelor Thesis at the Department of\\
+Information Technology and Electrical\\
+Engineering}
+
+\vspace{0.6cm}
+
+\Large \textsc{Fall Semester 2025}
+
+\vspace{1.8cm}
+
+\LARGE Leo Gierhake
+
+\vspace{2cm}
+
+\Large \textbf{Machine Learning-Based Binary Options Pricing\\
+Model for Prediction Markets}
+
+\vspace{2cm}
+
+\large September 1, 2025
+
+\end{center}
+
+\vspace{1.2cm}
+
+\noindent
+\begin{tabular}{@{}ll@{}}
+Advisors: & [TBD] \\
+Supervisor: & [TBD] \\
+\\
+\end{tabular}
+
+\vspace{0.3cm}
+
+\noindent
+\begin{tabular}{@{}ll@{}}
+Handout: & [TBD] \\
+Due: & [TBD] \\
+\end{tabular}
+
+\vspace{0.8cm}
+
+\noindent The final report will be submitted in electronic format. All copies remain property of the Distributed Computing Group.
+
+\newpage
+
+\section{Introduction}
+
+Prediction markets have emerged as powerful information aggregation mechanisms, allowing participants to trade contracts whose payoffs depend on future events. Polymarket, one of the largest decentralized prediction market platforms, offers ultra-short-dated binary options on cryptocurrency and equity price movements with durations as brief as 15 minutes. These instruments function as continuous probability estimates: a contract paying \$1 if the underlying closes higher than its opening price should theoretically trade at the market's consensus probability of that outcome. However, these instruments lack the rigorous pricing frameworks that exist for traditional derivatives, and the applicability of established models like Black-Scholes to 15-minute binary contracts remains unexplored.
+
+The central question of this thesis is: can we develop a theoretically rigorous and practically applicable pricing model for ultra-short-dated binary options in prediction markets? While classical derivatives pricing theory provides a foundation, the extreme time scales involved pose unique challenges. To inform model development, this work leverages implied volatility data from liquid cryptocurrency derivatives exchanges such as Deribit, which capture sophisticated market participants' expectations of future price uncertainty. However, fundamental differences in market microstructure and potential temporal mismatches between longer-dated options markets and ultra-short binaries must be addressed.
+
+This thesis proposes a systematic approach to binary option pricing for prediction markets. Beginning with a Black-Scholes framework adapted for binary payoffs, the work will investigate the integration of multi-scale realized volatility to address potential temporal signal staleness. Machine learning techniques will be explored to capture non-linear relationships and market microstructure effects that classical models cannot represent. Beyond demonstrating technical feasibility, this work aims to quantify fundamental limits: How much information can traditional options markets provide to prediction market pricing? What role does machine learning play in bridging the gap between theoretical pricing and market reality? The answers have implications for market efficiency, information aggregation, and the design of next-generation forecasting systems.
+
+\section{Project Description}
+
+\subsection{Task description}
+
+This thesis involves seven main tasks to build and test a pricing model for prediction markets:
+
+\begin{itemize}
+
+\item \textbf{Task I: Data Collection} Build three data collection systems. First, collect historical trade data from 14,874 closed markets. Second, run four real-time streaming services that capture orderbook snapshots every second. Third, download options data from Deribit covering October 2023 to September 2025. Store all data efficiently for fast querying (90GB total).
+
+\item \textbf{Task II: Data Processing} Process large datasets using efficient code that can handle over 200 million rows. Use optimized techniques to keep memory usage low on limited hardware. Final datasets include 204.7 million options quotes, 63 million BTC prices at 1-second intervals, and 70,000 contract schedules.
+
+\item \textbf{Task III: Feature Engineering} Create 24 input features computed every second for each 15-minute contract. These include 8 volatility measures at different time scales, 13 market microstructure signals (momentum, price jumps, reversals, etc.), and 3 context variables (time remaining, data freshness, distance from strike price).
+
+\item \textbf{Task IV: Baseline Model} Implement a Black-Scholes pricing model for binary options using implied volatility from Deribit. Test on 2 years of data, generating 62.3 million predictions. Baseline performance: Brier Score 0.162 (where 0.25 is random and 0.10 is excellent). Key finding: performance is 5.7$\times$ worse at the start of each contract compared to near expiration, caused by stale implied volatility.
+
+\item \textbf{Task V: First Improvement} Fix the stale volatility problem by using recent realized volatility computed from 1-second price data. Blend this with implied volatility, giving more weight to realized volatility when Deribit data is old. Target: 15--25\% improvement to Brier Score 0.120--0.135.
+
+\item \textbf{Task VI: Advanced Models} Train machine learning models to correct remaining errors. Use Ridge regression for interpretable linear corrections, then gradient-boosted trees to capture complex patterns. All models use the 24 features. Target: 35--45\% total improvement to Brier Score 0.090--0.100.
+
+\item \textbf{Task VII: Testing and Analysis} Validate all models thoroughly. Check calibration (do predicted probabilities match actual outcomes?), test performance in different market conditions (calm vs volatile periods), and identify which features matter most. Create clear visualizations and document results.
+
+\end{itemize}
+
+\section{Milestones}
+
+\begin{enumerate}
+
+\item \textbf{M1 (Tasks I \& II):} Data collection and processing systems complete. All three data pipelines operational: 14,874 historical markets collected, four real-time streams running 24/7, and 204 million Deribit options quotes processed. Total: 90GB of cleaned data ready for analysis.
+
+\item \textbf{M2 (Task III):} Feature engineering complete. All 24 features working correctly and computed at 1-second intervals. Features tested on sample contracts and validated for quality.
+
+\item \textbf{M3 (Task IV):} Baseline model tested. Black-Scholes model run on full 2-year dataset with 62.3 million predictions. Performance measured: Brier Score 0.162. Main problem identified: stale implied volatility causes 5.7$\times$ worse performance early in each contract period.
+
+\item \textbf{M4 (Task V):} First improvement tested. Realized volatility successfully integrated with multiple blending approaches. Target met: 15--25\% improvement, reaching Brier Score 0.120--0.135. Analysis confirms realized volatility helps most at the start of contracts.
+
+\item \textbf{M5 (Task VI):} Advanced ML models trained. Both Ridge regression and gradient-boosted models trained on all 24 features. Full backtest complete. Final target achieved: Brier Score 0.090--0.100, representing 35--45\% improvement over baseline.
+
+\item \textbf{M6 (Task VII):} Thesis completed. All validation analysis done: calibration plots, performance across different market conditions, and feature importance analysis. Final report written, presentation delivered, and code documented.
+
+\end{enumerate}
+
+\end{document}
