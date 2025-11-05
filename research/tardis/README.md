@@ -129,6 +129,149 @@ uv run python scripts/03_analyze/analyze_trading_insights.py
 - `compare_exchange_ivs.py`: Cross-exchange IV comparison
 - `analyze_gaps.py`: Gap analysis in quote data
 
+## 💰 Binance Funding Rate Data Collection
+
+**NEW:** Download historical funding rate data for Binance futures markets (USDT and COIN-margined).
+
+### Quick Start
+
+```bash
+# 1. Test the setup (downloads 1-2 days for validation)
+cd research/tardis
+uv run python scripts/01_download/test_funding_rate_download.py
+
+# 2. Download historical funding rates
+uv run python scripts/01_download/download_binance_funding_rates.py \
+    --from-date 2024-01-01 \
+    --to-date 2024-01-31 \
+    --symbols BTCUSDT,ETHUSDT \
+    --exchanges binance-futures \
+    --workers 5
+```
+
+### Data Details
+
+**Available Exchanges:**
+- `binance-futures`: USDT-margined perpetual swaps (e.g., BTCUSDT, ETHUSDT)
+- `binance-delivery`: COIN-margined quarterly futures (e.g., BTCUSD_PERP)
+
+**Data Fields:**
+- `funding_rate`: Current funding rate
+- `predicted_funding_rate`: Predicted rate for next period
+- `funding_timestamp`: Next funding event time
+- `mark_price`: Mark price (used for liquidations)
+- `index_price`: Underlying index price
+- `open_interest`: Total open interest
+- `last_price`: Last traded price
+
+**Granularity:** 1-second updates (from Tardis `derivative_ticker` data)
+
+**Output Structure:**
+```
+data/raw/binance_funding_rates/
+├── binance-futures/
+│   ├── BTCUSDT/
+│   │   ├── 2024-01-01.parquet
+│   │   └── 2024-01-02.parquet
+│   └── ETHUSDT/
+└── binance-delivery/
+    └── BTCUSD_PERP/
+```
+
+### Usage Options
+
+```bash
+# Download both USDT and COIN futures
+uv run python scripts/01_download/download_binance_funding_rates.py \
+    --from-date 2024-01-01 \
+    --to-date 2024-01-31 \
+    --symbols BTCUSDT,BTCUSD_PERP \
+    --exchanges binance-futures,binance-delivery \
+    --workers 5
+
+# Sequential processing (slower but uses less memory)
+uv run python scripts/01_download/download_binance_funding_rates.py \
+    --from-date 2024-01-01 \
+    --to-date 2024-01-31 \
+    --symbols BTCUSDT \
+    --exchanges binance-futures \
+    --workers 1
+
+# Resume interrupted download
+uv run python scripts/01_download/download_binance_funding_rates.py \
+    --from-date 2024-01-01 \
+    --to-date 2024-01-31 \
+    --symbols BTCUSDT \
+    --exchanges binance-futures \
+    --resume
+```
+
+### Data Processing: Resampling to 1-Second Intervals
+
+The downloaded funding rate data is event-driven (~1.47 updates/second), so we resample to fixed 1-second intervals for consistent analysis.
+
+**Single File Resampling:**
+```bash
+# Basic resampling (last value per second)
+uv run python scripts/02_process/resample_funding_rates_to_1s.py \
+    --input-file data/raw/binance_funding_rates/binance-futures/BTCUSDT/2024-01-01.parquet \
+    --output-file data/processed/binance_funding_rates_1s/binance-futures/BTCUSDT/2024-01-01_1s.parquet
+
+# With forward-fill (creates continuous time series)
+uv run python scripts/02_process/resample_funding_rates_to_1s.py \
+    --input-file data/raw/binance_funding_rates/binance-futures/BTCUSDT/2024-01-01.parquet \
+    --output-file data/processed/binance_funding_rates_1s/binance-futures/BTCUSDT/2024-01-01_1s.parquet \
+    --method forward_fill \
+    --max-fill-gap 60
+```
+
+**Batch Processing (All Files):**
+```bash
+# Process all downloaded files with parallel workers
+uv run python scripts/02_process/batch_resample_funding_rates.py \
+    --input-dir data/raw/binance_funding_rates \
+    --output-dir data/processed/binance_funding_rates_1s \
+    --method forward_fill \
+    --max-fill-gap 60 \
+    --workers 5
+
+# Resume interrupted batch processing
+uv run python scripts/02_process/batch_resample_funding_rates.py \
+    --input-dir data/raw/binance_funding_rates \
+    --output-dir data/processed/binance_funding_rates_1s \
+    --method forward_fill \
+    --max-fill-gap 60 \
+    --workers 5 \
+    --resume
+```
+
+**Test Resampling Scripts:**
+```bash
+# Validate resampling functionality
+uv run python scripts/02_process/test_resample_funding_rates.py
+```
+
+**Resampling Methods:**
+- `last`: Take last value per second (sparse output, ~79K-86K rows/day)
+- `forward_fill`: Fill gaps with last known value (continuous output, ~86K rows/day)
+  - `--max-fill-gap`: Maximum gap to fill in seconds (default: 60s)
+
+**Output Structure:**
+```
+data/processed/binance_funding_rates_1s/
+├── binance-futures/
+│   ├── BTCUSDT/
+│   │   ├── 2024-01-01_1s.parquet
+│   │   └── 2024-01-02_1s.parquet
+│   └── ETHUSDT/
+└── binance-delivery/
+    └── BTCUSD_PERP/
+```
+
+### Documentation
+
+See detailed Binance data documentation: `docs/reports/binance_data_available_via_tardis.md`
+
 ## 📊 Performance Considerations
 
 - Uses Polars for efficient data processing (5-10x faster than Pandas)
