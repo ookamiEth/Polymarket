@@ -272,6 +272,145 @@ data/processed/binance_funding_rates_1s/
 
 See detailed Binance data documentation: `docs/reports/binance_data_available_via_tardis.md`
 
+---
+
+## 📖 Binance Orderbook Snapshot Data Collection
+
+**NEW:** Download historical orderbook snapshot data for Binance markets at two depth levels.
+
+### Available Depth Levels
+
+- **book_snapshot_5**: Top 5 price levels (22 columns total)
+  - 5 ask levels + 5 bid levels
+  - Lightweight for spread and top-of-book analysis
+  - ~2-3× data volume vs funding rates
+
+- **book_snapshot_25**: Top 25 price levels (102 columns total)
+  - 25 ask levels + 25 bid levels
+  - Deep orderbook for liquidity analysis
+  - ~10× data volume vs funding rates
+
+### Quick Start
+
+```bash
+# 1. Download book_snapshot_5 data (recommended for most use cases)
+cd research/tardis
+uv run python scripts/01_download/download_binance_orderbook_5.py \
+    --from-date 2024-10-01 \
+    --to-date 2024-10-01 \
+    --symbols BTCUSDT \
+    --exchanges binance-futures
+
+# 2. Resample to 1-second intervals
+uv run python scripts/02_process/batch_resample_orderbook_5.py \
+    --input-dir data/raw/binance_orderbook_5 \
+    --output-dir data/processed/binance_orderbook_5_1s \
+    --workers 5
+
+# 3. (Optional) Download book_snapshot_25 for deep orderbook analysis
+uv run python scripts/01_download/download_binance_orderbook_25.py \
+    --from-date 2024-10-01 \
+    --to-date 2024-10-01 \
+    --symbols BTCUSDT \
+    --exchanges binance-futures
+```
+
+### Data Details
+
+**Fields (book_snapshot_5):**
+- `exchange`, `symbol`, `timestamp`, `local_timestamp`
+- `ask_price_0` to `ask_price_4`: Best ask down to 5th level
+- `ask_amount_0` to `ask_amount_4`: Amounts at each ask level
+- `bid_price_0` to `bid_price_4`: Best bid down to 5th level
+- `bid_amount_0` to `bid_amount_4`: Amounts at each bid level
+
+**Fields (book_snapshot_25):**
+- Same structure but with levels 0-24 (50 price columns + 50 amount columns)
+
+**Granularity:** Real-time event-driven updates (multiple per second during active trading)
+
+**Output Structure:**
+```
+data/
+├── raw/
+│   ├── binance_orderbook_5/           # Top 5 levels
+│   │   └── binance-futures/
+│   │       └── BTCUSDT/
+│   │           └── 2024-10-01.parquet
+│   └── binance_orderbook_25/          # Top 25 levels
+│       └── binance-futures/
+│           └── BTCUSDT/
+│               └── 2024-10-01.parquet
+└── processed/
+    ├── binance_orderbook_5_1s/        # Resampled to 1s
+    │   └── binance-futures/
+    │       └── BTCUSDT/
+    │           └── 2024-10-01_1s.parquet
+    └── binance_orderbook_25_1s/
+        └── binance-futures/
+            └── BTCUSDT/
+                └── 2024-10-01_1s.parquet
+```
+
+### Resampling to 1-Second Intervals
+
+Orderbook snapshots are event-driven (multiple updates per second). Resample to fixed 1-second intervals for:
+- Consistent time-series analysis
+- Alignment with other 1s datasets (funding rates, trades)
+- Data reduction (50-90% fewer rows)
+- Machine learning features
+
+**Single File:**
+```bash
+# book_snapshot_5
+uv run python scripts/02_process/resample_orderbook_5_to_1s.py \
+    --input-file data/raw/binance_orderbook_5/binance-futures/BTCUSDT/2024-10-01.parquet \
+    --output-file data/processed/binance_orderbook_5_1s/binance-futures/BTCUSDT/2024-10-01_1s.parquet
+
+# book_snapshot_25
+uv run python scripts/02_process/resample_orderbook_25_to_1s.py \
+    --input-file data/raw/binance_orderbook_25/binance-futures/BTCUSDT/2024-10-01.parquet \
+    --output-file data/processed/binance_orderbook_25_1s/binance-futures/BTCUSDT/2024-10-01_1s.parquet
+```
+
+**Batch Processing:**
+```bash
+# book_snapshot_5 (all files)
+uv run python scripts/02_process/batch_resample_orderbook_5.py \
+    --input-dir data/raw/binance_orderbook_5 \
+    --output-dir data/processed/binance_orderbook_5_1s \
+    --workers 5 \
+    --resume
+
+# book_snapshot_25 (all files)
+uv run python scripts/02_process/batch_resample_orderbook_25.py \
+    --input-dir data/raw/binance_orderbook_25 \
+    --output-dir data/processed/binance_orderbook_25_1s \
+    --workers 5 \
+    --resume
+```
+
+**Test Scripts:**
+```bash
+# Validate resampling works correctly
+uv run python scripts/02_process/test_resample_orderbook_5.py
+uv run python scripts/02_process/test_resample_orderbook_25.py
+```
+
+### When to Use Each Depth Level
+
+| Use Case | Recommended Depth |
+|----------|-------------------|
+| **Spread analysis** | book_snapshot_5 |
+| **Top-of-book dynamics** | book_snapshot_5 |
+| **Order flow imbalance** | book_snapshot_5 |
+| **Market impact modeling** | book_snapshot_5 or 25 |
+| **Deep liquidity analysis** | book_snapshot_25 |
+| **Large order execution** | book_snapshot_25 |
+| **Order book shape research** | book_snapshot_25 |
+
+**General Recommendation:** Start with `book_snapshot_5`. It's sufficient for most microstructure research and requires significantly less storage.
+
 ## 📊 Performance Considerations
 
 - Uses Polars for efficient data processing (5-10x faster than Pandas)
