@@ -70,6 +70,76 @@ def resample_to_1s_last(df: pl.DataFrame) -> pl.DataFrame:
     return df_1s
 
 
+def forward_fill_gaps(df_1s: pl.DataFrame) -> pl.DataFrame:
+    """Fill gaps in orderbook time series by forward-filling last known state.
+
+    For orderbook data, an unchanged state is ground truth - if no update occurred,
+    the orderbook genuinely stayed the same.
+
+    Args:
+        df_1s: DataFrame with 1-second data (sparse)
+
+    Returns:
+        DataFrame with filled gaps (continuous)
+    """
+    if len(df_1s) == 0:
+        return df_1s
+
+    # Get time range
+    min_ts = df_1s["timestamp_seconds"].min()
+    max_ts = df_1s["timestamp_seconds"].max()
+
+    if min_ts is None or max_ts is None:
+        logger.warning("Empty timestamp range, skipping forward-fill")
+        return df_1s
+
+    min_ts_int = int(min_ts)  # type: ignore[arg-type]
+    max_ts_int = int(max_ts)  # type: ignore[arg-type]
+
+    # Create complete time grid
+    logger.info(
+        f"Creating continuous time series from {min_ts_int} to {max_ts_int} ({max_ts_int - min_ts_int + 1} seconds)"
+    )
+    time_grid = pl.DataFrame({"timestamp_seconds": pl.arange(min_ts_int, max_ts_int + 1, 1, eager=True)})
+
+    # Left join actual data onto time grid
+    filled = time_grid.join(df_1s, on="timestamp_seconds", how="left")
+
+    # Reconstruct timestamp from timestamp_seconds (ensure no nulls)
+    filled = filled.with_columns([(pl.col("timestamp_seconds") * 1_000_000).alias("timestamp")])
+
+    # Forward-fill all columns
+    fill_cols = [
+        # Metadata
+        pl.col("exchange").forward_fill(),
+        pl.col("symbol").forward_fill(),
+        pl.col("local_timestamp").forward_fill(),
+    ]
+
+    # All price levels (5 ask + 5 bid = 10 levels × 2 = 20 columns)
+    for i in range(5):
+        fill_cols.extend(
+            [
+                pl.col(f"ask_price_{i}").forward_fill(),
+                pl.col(f"ask_amount_{i}").forward_fill(),
+            ]
+        )
+    for i in range(5):
+        fill_cols.extend(
+            [
+                pl.col(f"bid_price_{i}").forward_fill(),
+                pl.col(f"bid_amount_{i}").forward_fill(),
+            ]
+        )
+
+    filled = filled.with_columns(fill_cols)
+
+    # Fill snapshot_count=0 for forward-filled rows (no actual update)
+    filled = filled.with_columns([pl.col("snapshot_count").fill_null(pl.lit(0))])
+
+    return filled
+
+
 def resample_file(
     input_file: str,
     output_file: str,
@@ -99,8 +169,13 @@ def resample_file(
 
     # Resample to 1-second
     df_1s = resample_to_1s_last(df)
+    output_rows_sparse = len(df_1s)
+    logger.info(f"  Resampled: {output_rows_sparse:,} rows (1-second, sparse)")
+
+    # Forward-fill gaps to create continuous series
+    df_1s = forward_fill_gaps(df_1s)
     output_rows = len(df_1s)
-    logger.info(f"  Resampled: {output_rows:,} rows (1-second, last snapshot per second)")
+    logger.info(f"  Forward-filled: {output_rows:,} rows (continuous)")
 
     # Drop helper column
     if "timestamp_seconds" in df_1s.columns:

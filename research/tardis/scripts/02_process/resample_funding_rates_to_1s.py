@@ -118,13 +118,19 @@ def forward_fill_gaps(df_1s: pl.DataFrame, max_fill_gap: Optional[int] = 60) -> 
     # Left join actual data onto time grid
     filled = time_grid.join(df_1s, on="timestamp_seconds", how="left")
 
+    # Reconstruct timestamp column from timestamp_seconds (ensure no nulls)
+    filled = filled.with_columns([(pl.col("timestamp_seconds") * 1_000_000).alias("timestamp")])
+
     # Forward-fill values
     logger.info("Forward-filling values...")
     filled = filled.with_columns(
         [
             pl.col("exchange").forward_fill(),
             pl.col("symbol").forward_fill(),
+            pl.col("local_timestamp").forward_fill(),
+            pl.col("funding_timestamp").forward_fill(),
             pl.col("funding_rate").forward_fill(),
+            pl.col("predicted_funding_rate").forward_fill(),
             pl.col("mark_price").forward_fill(),
             pl.col("index_price").forward_fill(),
             pl.col("open_interest").forward_fill(),

@@ -429,7 +429,9 @@ Examples:
     stats = {"total_downloads": 0, "total_rows": 0}
 
     if args.resume:
-        completed_dates, stats = load_checkpoint(checkpoint_file)
+        completed_dates, loaded_stats = load_checkpoint(checkpoint_file)
+        # Merge loaded stats with default stats (in case of missing keys)
+        stats.update(loaded_stats)
         date_range = [d for d in date_range if d not in completed_dates]
         logger.info(f"Resuming: {len(date_range)} dates remaining")
 
