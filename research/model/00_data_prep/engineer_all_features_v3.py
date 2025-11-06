@@ -14,19 +14,25 @@ Philosophy Shift (V2 → V3):
 
 Standard Time Windows: 60s, 300s, 900s, 1800s, 3600s
 
-Feature Count: 163 total
-- Existing features (kept as-is): 33
+Feature Count: 221 total
+- Existing features (kept as-is): 26
 - Funding rate: 11 (1 raw + 5 EMAs + 5 SMAs)
 - Orderbook L0: 32 (spread + imbalance with EMAs/SMAs/volatility)
 - Orderbook 5-levels: 31 (depth, volumes, ratios)
 - Price basis: 34 (3 bases × EMAs/SMAs + ratios)
 - Open interest: 6 (1 raw + 5 EMAs)
-- RV/Momentum/Range: 37 (raw + EMAs/SMAs with 1800s window added)
+- RV/Momentum/Range/EMA: 79 (raw + EMAs/SMAs + EMA ratios)
 
-Output: consolidated_features_v3.parquet (~10-12 GB, 163 features, 60M rows)
+Memory Architecture: TEMPORAL CHUNKING
+- Module 8 uses 3-month chunking optimized for 256GB RAM
+- Processes 63M rows in ~12 quarterly chunks (~5.25M rows each)
+- Joins all 6 feature sources per chunk, then concatenates
+- Proven pattern from tardis/analysis/compare_iv_chunked.py
+
+Output: consolidated_features_v3.parquet (~10-12 GB, 221 features, 63M rows)
 
 Author: BT Research Team
-Date: 2025-11-05
+Date: 2025-01-06 (Updated to 3-month chunks for 256GB RAM)
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import polars as pl
@@ -179,23 +186,29 @@ def load_and_write_existing_features(memory_monitor: MemoryMonitor) -> Path:
     logger.info("\n[Stage 1a] Processing baseline features...")
     logger.info(f"  Input: {BASELINE_FILE}")
 
-    baseline = pl.scan_parquet(BASELINE_FILE).select([
-        "timestamp",
-        "time_remaining",
-        "S",  # Spot price
-        "K",  # Strike price
-        "iv_staleness_seconds",
-    ])
+    baseline = pl.scan_parquet(BASELINE_FILE).select(
+        [
+            "timestamp",
+            "time_remaining",
+            "S",  # Spot price
+            "K",  # Strike price
+            "iv_staleness_seconds",
+        ]
+    )
 
-    baseline = baseline.with_columns([
-        (pl.col("timestamp") / 1_000_000).cast(pl.Int64).alias("timestamp_seconds"),
-        (pl.col("S") / pl.col("K")).alias("moneyness"),
-    ]).select([
-        "timestamp_seconds",
-        "time_remaining",
-        "moneyness",
-        "iv_staleness_seconds",
-    ])
+    baseline = baseline.with_columns(
+        [
+            pl.col("timestamp").alias("timestamp_seconds"),
+            (pl.col("S") / pl.col("K")).alias("moneyness"),
+        ]
+    ).select(
+        [
+            "timestamp_seconds",
+            "time_remaining",
+            "moneyness",
+            "iv_staleness_seconds",
+        ]
+    )
 
     baseline_temp = INTERMEDIATE_DIR / "01a_baseline_temp.parquet"
     logger.info(f"  Writing to: {baseline_temp.name}")
@@ -208,19 +221,33 @@ def load_and_write_existing_features(memory_monitor: MemoryMonitor) -> Path:
     logger.info(f"  Input: {ADVANCED_FILE}")
 
     advanced_keep = [
-        "high_15m", "low_15m", "drawdown_from_high_15m", "runup_from_low_15m",
-        "time_since_high_15m", "time_since_low_15m",
-        "skewness_300s", "kurtosis_300s", "downside_vol_300s", "upside_vol_300s",
-        "vol_asymmetry_300s", "tail_risk_300s",
-        "hour_of_day_utc", "hour_sin", "hour_cos",
-        "vol_persistence_ar1", "vol_acceleration_300s", "vol_of_vol_300s",
-        "garch_forecast_simple", "autocorr_decay", "reversals_300s",
+        "high_15m",
+        "low_15m",
+        "drawdown_from_high_15m",
+        "runup_from_low_15m",
+        "time_since_high_15m",
+        "time_since_low_15m",
+        "skewness_300s",
+        "kurtosis_300s",
+        "downside_vol_300s",
+        "upside_vol_300s",
+        "vol_asymmetry_300s",
+        "tail_risk_300s",
+        "hour_of_day_utc",
+        "hour_sin",
+        "hour_cos",
+        "vol_persistence_ar1",
+        "vol_acceleration_300s",
+        "vol_of_vol_300s",
+        "garch_forecast_simple",
+        "autocorr_decay",
+        "reversals_300s",
     ]
 
     advanced = pl.scan_parquet(ADVANCED_FILE).select(["timestamp"] + advanced_keep)
-    advanced = advanced.with_columns([
-        (pl.col("timestamp") / 1_000_000).cast(pl.Int64).alias("timestamp_seconds")
-    ]).select(["timestamp_seconds"] + advanced_keep)
+    advanced = advanced.with_columns([pl.col("timestamp").alias("timestamp_seconds")]).select(
+        ["timestamp_seconds"] + advanced_keep
+    )
 
     advanced_temp = INTERMEDIATE_DIR / "01b_advanced_temp.parquet"
     logger.info(f"  Writing to: {advanced_temp.name}")
@@ -242,76 +269,55 @@ def load_and_write_existing_features(memory_monitor: MemoryMonitor) -> Path:
     logger.info(f"  ✓ Microstructure written ({micro_temp.stat().st_size / (1024**3):.2f} GB)")
 
     # =========================
-    # STAGE 2: Progressive joins (join + write + join + write)
+    # STAGE 2: Single lazy join chain (no intermediate writes)
     # =========================
 
-    logger.info("\n[Stage 2a] Joining baseline + advanced (progressive)...")
+    logger.info("\n[Stage 2] Joining all sources (single lazy chain)...")
 
     baseline_df = pl.scan_parquet(baseline_temp)
     advanced_df = pl.scan_parquet(advanced_temp)
-
-    # First join: baseline + advanced
-    logger.info("  Joining baseline + advanced...")
-    df_partial = baseline_df.join(advanced_df, on="timestamp_seconds", how="left")
-    memory_monitor.log_memory("After baseline-advanced join")
-
-    # Write partial result
-    partial_output = INTERMEDIATE_DIR / "01_partial_baseline_advanced.parquet"
-    logger.info(f"  Writing partial result: {partial_output.name}")
-    logger.info("  (This reduces memory pressure for next join)")
-
-    start_stage2a = time.time()
-    df_partial.sink_parquet(partial_output, compression="snappy")
-    elapsed_stage2a = time.time() - start_stage2a
-    logger.info(f"  ✓ Partial join written in {elapsed_stage2a:.1f}s ({partial_output.stat().st_size / (1024**3):.2f} GB)")
-
-    memory_monitor.log_memory("After partial write")
-
-    # Clean up baseline and advanced temps (no longer needed)
-    baseline_temp.unlink()
-    advanced_temp.unlink()
-    logger.info("  ✓ Cleaned up baseline and advanced temp files")
-
-    # Stage 2b: Join partial + micro
-    logger.info("\n[Stage 2b] Joining partial + microstructure...")
-
-    df_final = pl.scan_parquet(partial_output)
     micro_df = pl.scan_parquet(micro_temp)
 
-    logger.info("  Joining partial + microstructure...")
-    df = df_final.join(micro_df, on="timestamp_seconds", how="left")
-    memory_monitor.log_memory("After micro join")
+    # Chain all joins together (lazy - no materialization yet)
+    logger.info("  Building join chain: baseline → advanced → micro...")
+    df = baseline_df.join(advanced_df, on="timestamp_seconds", how="left").join(
+        micro_df, on="timestamp_seconds", how="left"
+    )
+    memory_monitor.log_memory("After join chain (lazy)")
 
-    # Write final output
+    # Single streaming write (materializes and writes in one pass)
     output_file = INTERMEDIATE_DIR / "01_existing_features.parquet"
-    logger.info(f"\n  Writing final output: {output_file.name}")
-    logger.info("  (Final streaming write in progress...)")
+    logger.info(f"  Writing joined output: {output_file.name}")
+    logger.info("  (Streaming write - materializing join chain...)")
 
-    start_stage2b = time.time()
+    start_write = time.time()
     df.sink_parquet(output_file, compression="snappy")
-    elapsed_stage2b = time.time() - start_stage2b
+    elapsed_write = time.time() - start_write
 
-    memory_monitor.log_memory("After final write")
-    logger.info(f"  ✓ Final output written in {elapsed_stage2b:.1f}s")
+    memory_monitor.log_memory("After write")
+    logger.info(
+        f"  ✓ Joined features written in {elapsed_write:.1f}s ({output_file.stat().st_size / (1024**3):.2f} GB)"
+    )
 
-    # Cleanup remaining temporary files
-    logger.info("\n  Cleaning up remaining temporary files...")
-    partial_output.unlink()
+    # Cleanup temp files
+    logger.info("\n  Cleaning up temporary files...")
+    baseline_temp.unlink()
+    advanced_temp.unlink()
     micro_temp.unlink()
     logger.info("  ✓ All temporary files removed")
 
-    total_stage2_time = elapsed_stage2a + elapsed_stage2b
+    total_stage2_time = elapsed_write
 
     # Verify output
     logger.info("\nValidating output...")
     output_rows = pl.scan_parquet(output_file).select(pl.len()).collect().item()
     output_cols = len(pl.scan_parquet(output_file).collect_schema().names())
 
-    logger.info(f"✓ Module 1 completed")
+    logger.info("✓ Module 1 completed")
     logger.info(f"  Stage 2 total time: {total_stage2_time:.1f}s")
     logger.info(f"  Output: {output_rows:,} rows × {output_cols} columns")
     logger.info(f"  File size: {output_file.stat().st_size / (1024**3):.2f} GB")
-    logger.info(f"  Expected: ~63M rows, 27 columns")
+    logger.info("  Expected: ~63M rows, 27 columns")
 
     # Check output quality on sample
     logger.info("\nChecking data quality on sample (10K rows)...")
@@ -351,6 +357,10 @@ def engineer_and_write_funding_features() -> Path:
             "funding_rate",
         ]
     )
+
+    # Deduplicate source data (9 duplicate timestamps in source)
+    logger.info("  Deduplicating source data...")
+    df = df.unique(subset=["timestamp"], maintain_order=True)
 
     # Convert timestamp to seconds for join key
     df = df.with_columns([(pl.col("timestamp") / 1_000_000).cast(pl.Int64).alias("timestamp_seconds")])
@@ -819,6 +829,14 @@ def engineer_and_write_price_basis_features() -> Path:
         ]
     )
 
+    # Deduplicate source data (9 duplicate timestamps in source)
+    logger.info("  Deduplicating source data...")
+    df = df.unique(subset=["timestamp"], maintain_order=True)
+
+    # Forward-fill last_price nulls (1,104 missing values)
+    logger.info("  Forward-filling last_price nulls...")
+    df = df.with_columns([pl.col("last_price").fill_null(strategy="forward")])
+
     # Convert timestamp to seconds
     df = df.with_columns([(pl.col("timestamp") / 1_000_000).cast(pl.Int64).alias("timestamp_seconds")])
 
@@ -1003,6 +1021,10 @@ def engineer_and_write_oi_features() -> Path:
             "open_interest",
         ]
     )
+
+    # Deduplicate source data (9 duplicate timestamps in source)
+    logger.info("  Deduplicating source data...")
+    df = df.unique(subset=["timestamp"], maintain_order=True)
 
     # Convert timestamp to seconds
     df = df.with_columns([(pl.col("timestamp") / 1_000_000).cast(pl.Int64).alias("timestamp_seconds")])
@@ -1218,9 +1240,7 @@ def engineer_and_write_rv_momentum_range_features() -> Path:
     )
 
     # Convert timestamp to seconds
-    advanced = advanced.with_columns(
-        [(pl.col("timestamp") / 1_000_000).cast(pl.Int64).alias("timestamp_seconds")]
-    ).select(
+    advanced = advanced.with_columns([pl.col("timestamp").alias("timestamp_seconds")]).select(
         [
             "timestamp_seconds",
             "ema_12s",
@@ -1243,9 +1263,9 @@ def engineer_and_write_rv_momentum_range_features() -> Path:
     )
 
     # Convert timestamp to seconds
-    baseline = baseline.with_columns(
-        [(pl.col("timestamp") / 1_000_000).cast(pl.Int64).alias("timestamp_seconds")]
-    ).select(["timestamp_seconds", "S"])
+    baseline = baseline.with_columns([pl.col("timestamp").alias("timestamp_seconds")]).select(
+        ["timestamp_seconds", "S"]
+    )
 
     df = df.join(baseline, on="timestamp_seconds", how="left")
 
@@ -1362,7 +1382,7 @@ def engineer_and_write_rv_momentum_range_features() -> Path:
     return output_file
 
 
-def join_all_features_lazy(
+def join_all_features_temporal_chunking(
     existing_file: Path,
     funding_file: Path,
     orderbook_l0_file: Path,
@@ -1370,10 +1390,20 @@ def join_all_features_lazy(
     basis_file: Path,
     oi_file: Path,
     rv_momentum_range_file: Path,
-) -> pl.LazyFrame:
+    memory_monitor: MemoryMonitor,
+) -> Path:
     """
-    Join all feature sources on timestamp_seconds from intermediate parquet files.
-    All joins performed lazily from disk (no memory spike).
+    Join all feature sources using temporal (3-month) chunking optimized for 256GB RAM.
+
+    MEMORY-OPTIMIZED APPROACH:
+    - Processes data in 3-month chunks (63M rows → ~5.25M rows/chunk, ~12 chunks total)
+    - Joins all 6 sources within each chunk
+    - Writes temporal chunks to disk
+    - Concatenates chunks lazily at end
+
+    This avoids Polars hash table memory explosion (100GB+) from chaining
+    6 joins on 63M rows. 3-month chunking reduces hash table size by 12x while
+    maintaining good performance (fewer disk I/O operations than daily chunking).
 
     Args:
         existing_file: Path to existing features (26 features)
@@ -1383,59 +1413,149 @@ def join_all_features_lazy(
         basis_file: Path to basis features (34 features)
         oi_file: Path to OI features (6 features)
         rv_momentum_range_file: Path to RV/momentum/range features (79 features)
+        memory_monitor: Memory monitor instance
 
     Returns:
-        Lazy frame with all 219 features + timestamp_seconds (220 columns)
+        Path to final consolidated features file
     """
     logger.info("=" * 80)
-    logger.info("MODULE 8: Joining All Features from Intermediate Files")
+    logger.info("MODULE 8: Joining All Features (Temporal Chunking)")
     logger.info("=" * 80)
 
-    # Scan all intermediate files lazily (no data loaded into memory yet)
-    logger.info(f"Scanning intermediate files from {INTERMEDIATE_DIR}...")
-    existing = pl.scan_parquet(existing_file)
-    funding = pl.scan_parquet(funding_file)
-    orderbook_l0 = pl.scan_parquet(orderbook_l0_file)
-    orderbook_5level = pl.scan_parquet(orderbook_5level_file)
-    basis = pl.scan_parquet(basis_file)
-    oi = pl.scan_parquet(oi_file)
-    rv_momentum_range = pl.scan_parquet(rv_momentum_range_file)
+    # Get date range from existing features file
+    logger.info("Determining date range from existing features...")
+    existing_df = pl.scan_parquet(existing_file)
+    date_range_df = (
+        existing_df.select([pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date).alias("date")])
+        .unique()
+        .sort("date")
+        .collect()
+    )
 
-    # Sequential joins on timestamp_seconds (all lazy)
-    logger.info("Joining funding features...")
-    df = existing.join(funding, on="timestamp_seconds", how="left")
+    dates = date_range_df["date"].to_list()
+    start_date = dates[0]
+    end_date = dates[-1]
+    logger.info(f"  Date range: {start_date} to {end_date} ({len(dates)} unique days)")
 
-    logger.info("Joining orderbook L0 features...")
-    df = df.join(orderbook_l0, on="timestamp_seconds", how="left")
+    # Generate 3-month chunks
+    chunk_ranges = []
+    current_start = start_date
+    while current_start <= end_date:
+        # Add 3 months (approximately 90 days)
+        current_end = current_start + timedelta(days=90)
+        chunk_ranges.append((current_start, min(current_end, end_date + timedelta(days=1))))
+        current_start = current_end
 
-    logger.info("Joining orderbook 5-level features...")
-    df = df.join(orderbook_5level, on="timestamp_seconds", how="left")
+    logger.info(f"  Processing in {len(chunk_ranges)} chunks of ~3 months each")
+    memory_monitor.log_memory("After date range computation")
 
-    logger.info("Joining basis features...")
-    df = df.join(basis, on="timestamp_seconds", how="left")
+    # Create temporary directory for temporal chunks
+    temporal_chunks_dir = INTERMEDIATE_DIR / "temporal_chunks"
+    temporal_chunks_dir.mkdir(exist_ok=True)
 
-    logger.info("Joining OI features...")
-    df = df.join(oi, on="timestamp_seconds", how="left")
+    # Process each 3-month chunk
+    chunk_files = []
+    logger.info(f"\nProcessing {len(chunk_ranges)} chunks (~3 months each)...")
 
-    logger.info("Joining RV/momentum/range features...")
-    df = df.join(rv_momentum_range, on="timestamp_seconds", how="left")
+    for idx, (chunk_start, chunk_end) in enumerate(chunk_ranges, 1):
+        # Filter each source to this 3-month period
+        # Create date filter expression (must be repeated for each scan due to Polars lazy evaluation)
+        existing_chunk = pl.scan_parquet(existing_file).filter(
+            (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) >= chunk_start)
+            & (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) < chunk_end)
+        )
+        funding_chunk = pl.scan_parquet(funding_file).filter(
+            (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) >= chunk_start)
+            & (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) < chunk_end)
+        )
+        orderbook_l0_chunk = pl.scan_parquet(orderbook_l0_file).filter(
+            (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) >= chunk_start)
+            & (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) < chunk_end)
+        )
+        orderbook_5level_chunk = pl.scan_parquet(orderbook_5level_file).filter(
+            (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) >= chunk_start)
+            & (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) < chunk_end)
+        )
+        basis_chunk = pl.scan_parquet(basis_file).filter(
+            (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) >= chunk_start)
+            & (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) < chunk_end)
+        )
+        oi_chunk = pl.scan_parquet(oi_file).filter(
+            (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) >= chunk_start)
+            & (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) < chunk_end)
+        )
+        rv_chunk = pl.scan_parquet(rv_momentum_range_file).filter(
+            (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) >= chunk_start)
+            & (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) < chunk_end)
+        )
 
-    logger.info("✓ All features joined (lazy - no data in memory yet)")
+        # Chain joins for this chunk (fits in memory with 256GB)
+        chunk_df = (
+            existing_chunk.join(funding_chunk, on="timestamp_seconds", how="left")
+            .join(orderbook_l0_chunk, on="timestamp_seconds", how="left")
+            .join(orderbook_5level_chunk, on="timestamp_seconds", how="left")
+            .join(basis_chunk, on="timestamp_seconds", how="left")
+            .join(oi_chunk, on="timestamp_seconds", how="left")
+            .join(rv_chunk, on="timestamp_seconds", how="left")
+        )
 
-    return df
+        # Collect and write chunk
+        chunk_result = chunk_df.collect()
+        chunk_file = (
+            temporal_chunks_dir
+            / f"features_v3_chunk_{idx:03d}_{chunk_start.isoformat()}_to_{chunk_end.isoformat()}.parquet"
+        )
+        chunk_result.write_parquet(chunk_file, compression="snappy")
+        chunk_files.append(chunk_file)
+
+        # Progress logging
+        logger.info(
+            f"  Processed chunk {idx}/{len(chunk_ranges)} ({chunk_start} to {chunk_end}): {len(chunk_result):,} rows"
+        )
+        memory_monitor.log_memory(f"After chunk {idx}")
+
+    logger.info(f"\n✓ All {len(chunk_ranges)} temporal chunks written")
+    logger.info(f"  Total chunks: {len(chunk_files)}")
+    logger.info(f"  Chunk dir size: {sum(f.stat().st_size for f in chunk_files) / (1024**3):.2f} GB")
+
+    # Concatenate all temporal chunks lazily
+    logger.info("\nConcatenating all temporal chunks...")
+    output_file = DATA_DIR / "consolidated_features_v3.parquet"
+
+    lazy_chunks = [pl.scan_parquet(f) for f in chunk_files]
+    combined = pl.concat(lazy_chunks)
+
+    logger.info(f"Writing final consolidated features to {output_file}...")
+    combined.sink_parquet(output_file, compression="snappy")
+
+    memory_monitor.log_memory("After concatenation")
+
+    # Cleanup temporal chunks
+    logger.info("\nCleaning up temporal chunk files...")
+    for f in chunk_files:
+        f.unlink()
+    temporal_chunks_dir.rmdir()
+    logger.info("✓ Temporal chunks cleaned up")
+
+    return output_file
 
 
-def validate_and_write_output(df: pl.LazyFrame, memory_monitor: MemoryMonitor) -> None:
+def validate_final_output(output_file: Path, memory_monitor: MemoryMonitor) -> None:
     """
-    Validate feature quality and write to parquet.
+    Validate final consolidated features file.
 
     Args:
-        df: Lazy frame with all features
+        output_file: Path to consolidated features parquet
         memory_monitor: Memory monitor instance
     """
     logger.info("=" * 80)
-    logger.info("MODULE 9: Validation and Output")
+    logger.info("MODULE 9: Validation")
     logger.info("=" * 80)
+
+    logger.info(f"Validating output file: {output_file}")
+
+    # Scan output lazily
+    df = pl.scan_parquet(output_file)
 
     # Validation on sample (1M rows - reduced for memory safety)
     logger.info("Validating feature quality on 1M row sample...")
@@ -1466,25 +1586,16 @@ def validate_and_write_output(df: pl.LazyFrame, memory_monitor: MemoryMonitor) -
         logger.warning(f"Feature count mismatch: expected {expected_features}, got {feature_count}")
         logger.warning("This may indicate missing or duplicate features.")
 
-    # Write output (streaming for memory safety)
-    logger.info(f"Writing consolidated features to: {OUTPUT_FILE}")
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    df.sink_parquet(
-        OUTPUT_FILE,
-        compression="snappy",
-    )
-
-    memory_monitor.log_memory("After write")
+    memory_monitor.log_memory("After validation")
 
     # Verify output file
-    output_size_gb = OUTPUT_FILE.stat().st_size / (1024**3)
+    output_size_gb = output_file.stat().st_size / (1024**3)
     logger.info(f"✓ Output file size: {output_size_gb:.2f} GB")
 
     logger.info("=" * 80)
     logger.info("FEATURE ENGINEERING V3 COMPLETE")
     logger.info("=" * 80)
-    logger.info(f"Output: {OUTPUT_FILE}")
+    logger.info(f"Output: {output_file}")
     logger.info(f"Rows: {row_count:,}")
     logger.info(f"Features: {feature_count}")
     logger.info(f"Size: {output_size_gb:.2f} GB")
@@ -1492,17 +1603,22 @@ def validate_and_write_output(df: pl.LazyFrame, memory_monitor: MemoryMonitor) -
 
 def main() -> None:
     """
-    Main execution pipeline (memory-safe write-to-disk architecture).
+    Main execution pipeline (memory-optimized 3-month chunking for 256GB RAM).
 
     Pipeline:
-    1. Each module (1-7) writes intermediate parquet file to disk
-    2. Module 8 scans all intermediate files and joins lazily
-    3. Module 9 validates and streams final output to disk
+    1. Modules 1-7: Write intermediate feature files to disk (~13GB total)
+    2. Module 8: Join all features using 3-month temporal chunking
+       - Processes 63M rows in ~12 quarterly chunks (~5.25M rows/chunk)
+       - Joins all 6 feature sources within each chunk
+       - Writes temporal chunks, then concatenates
+       - Avoids Polars hash table memory explosion (100GB+ → ~25GB peak per chunk)
+    3. Module 9: Validates final consolidated output
 
-    Peak memory usage: <10 GB (vs 109.45 GB in previous version)
+    Peak memory usage: ~25-30 GB per chunk (safe for 256GB system)
+    Runtime: ~10-15 minutes (optimized for 256GB RAM)
     """
     logger.info("=" * 80)
-    logger.info("Consolidated Feature Engineering V3 (Write-to-Disk Architecture)")
+    logger.info("Consolidated Feature Engineering V3 (3-Month Chunking for 256GB RAM)")
     logger.info("=" * 80)
 
     memory_monitor = MemoryMonitor()
@@ -1536,8 +1652,8 @@ def main() -> None:
     rv_momentum_range_file = engineer_and_write_rv_momentum_range_features()
     memory_monitor.log_memory("After Module 7 (RV/momentum/range)")
 
-    # Module 8: Join all features lazily from disk
-    all_features = join_all_features_lazy(
+    # Module 8: Join all features using temporal chunking (writes output directly)
+    output_file = join_all_features_temporal_chunking(
         existing_file,
         funding_file,
         orderbook_l0_file,
@@ -1545,11 +1661,12 @@ def main() -> None:
         basis_file,
         oi_file,
         rv_momentum_range_file,
+        memory_monitor,
     )
-    memory_monitor.log_memory("After Module 8 (join - lazy)")
+    memory_monitor.log_memory("After Module 8 (temporal chunking)")
 
-    # Module 9: Validate and write final output
-    validate_and_write_output(all_features, memory_monitor)
+    # Module 9: Validate final output
+    validate_final_output(output_file, memory_monitor)
 
     logger.info("✓ Feature engineering V3 pipeline completed successfully")
 
