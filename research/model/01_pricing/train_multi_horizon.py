@@ -115,9 +115,8 @@ def stratify_data_by_time(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine output filename
-    # Extract train/val/test from filename like "train_features_lgb.parquet"
-    split_name = input_file.stem.split("_")[0]  # First part: train/val/test
-    output_file = output_dir / f"{bucket_name}_{split_name}.parquet"
+    # For consolidated file, use bucket name without split prefix
+    output_file = output_dir / f"{bucket_name}_consolidated.parquet"
 
     # Check if already exists
     if output_file.exists():
@@ -133,6 +132,16 @@ def stratify_data_by_time(
     df = pl.scan_parquet(input_file).filter(
         (pl.col("time_remaining") >= time_min) & (pl.col("time_remaining") < time_max)
     )
+
+    # V3: Add date column if missing (derived from timestamp_seconds)
+    schema = df.collect_schema()
+    if "date" not in schema.names():
+        logger.info("  Adding 'date' column from timestamp_seconds...")
+        df = df.with_columns(
+            [
+                (pl.from_epoch(pl.col("timestamp_seconds"), time_unit="s").cast(pl.Date).alias("date"))
+            ]
+        )
 
     # Stream to output
     df.sink_parquet(output_file, compression="snappy", statistics=True)
@@ -706,15 +715,30 @@ def main() -> None:
         logger.info("✓ W&B run initialized")
 
     # Setup paths
-    data_dir = model_dir / "results"
     output_dir = model_dir / Path(config["data"]["output_dir"])
     models_dir = model_dir / Path(config["models"]["output_dir"])
 
-    # Get features
-    train_file_full = data_dir / Path(config["data"]["source_files"]["train"]).name
-    schema = pl.scan_parquet(train_file_full).collect_schema()
+    # Get consolidated features file (V3)
+    consolidated_file = model_dir / Path(config["data"]["source_file"])
+
+    if not consolidated_file.exists():
+        msg = f"Consolidated features file not found: {consolidated_file}"
+        raise FileNotFoundError(msg)
+
+    logger.info(f"\nLoading consolidated features from: {consolidated_file}")
+
+    # Get features from consolidated file schema
+    schema = pl.scan_parquet(consolidated_file).collect_schema()
     features = [col for col in FEATURE_COLS if col in schema.names()]
-    logger.info(f"\nUsing {len(features)} features")
+    logger.info(f"Using {len(features)} features (out of {len(FEATURE_COLS)} in FEATURE_COLS)")
+
+    if len(features) < len(FEATURE_COLS):
+        missing_features = set(FEATURE_COLS) - set(features)
+        logger.warning(f"⚠️  {len(missing_features)} features not found in consolidated file:")
+        for feat in list(missing_features)[:10]:  # Show first 10
+            logger.warning(f"    - {feat}")
+        if len(missing_features) > 10:
+            logger.warning(f"    ... and {len(missing_features) - 10} more")
 
     # Determine which buckets to train
     buckets_to_train = ["near", "mid", "far"] if args.bucket == "all" else [args.bucket]
@@ -736,9 +760,10 @@ def main() -> None:
         # Train model with walk-forward validation (mandatory)
         walk_forward_config = config["walk_forward_validation"]
 
-        # Stratify FULL dataset (train + val + test combined) by time bucket
-        full_data_file = stratify_data_by_time(
-            data_dir / Path(config["data"]["source_files"]["train"]).name,
+        # Stratify consolidated dataset by time bucket
+        # This creates bucket-specific file filtered by time_remaining
+        stratified_file = stratify_data_by_time(
+            consolidated_file,
             output_dir,
             bucket_name,
             bucket_config["time_min"],
@@ -748,7 +773,7 @@ def main() -> None:
         model, metrics = train_bucket_walk_forward(
             bucket_name,
             bucket_config,
-            full_data_file,
+            stratified_file,  # V3: Use bucket-stratified consolidated file
             hyperparameters,
             features,
             models_dir,

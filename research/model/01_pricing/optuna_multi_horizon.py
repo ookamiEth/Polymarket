@@ -169,6 +169,13 @@ class OptunaObjective:
             log=True,
         )
 
+        # V3: Add feature_fraction for automatic feature selection
+        params["feature_fraction"] = trial.suggest_float(
+            "feature_fraction",
+            0.5,  # Use at least 50% of features
+            1.0,  # Up to 100% of features
+        )
+
         # Train model
         callbacks = [
             lgb.early_stopping(50),
@@ -189,10 +196,18 @@ class OptunaObjective:
         residual_mse = val_metrics.get("l2", 0.0)
         brier_improvement_pct = (residual_mse / self.baseline_brier) * 100
 
+        # V3: Track feature importance for analysis
+        importance = model.feature_importance(importance_type="gain")
+        feature_names = model.feature_name()
+        # Get top 20 most important features
+        feature_importance = sorted(zip(feature_names, importance), key=lambda x: x[1], reverse=True)[:20]
+        top_20_features = [f[0] for f in feature_importance]
+
         # Log intermediate values
         trial.set_user_attr("residual_mse", residual_mse)
         trial.set_user_attr("brier_improvement_pct", brier_improvement_pct)
         trial.set_user_attr("best_iteration", model.best_iteration)
+        trial.set_user_attr("top_20_features", top_20_features)  # V3: Track important features
 
         logger.info(
             f"  Trial {trial.number:3d}: MSE={residual_mse:.6f}, Improvement={brier_improvement_pct:.2f}%, "
@@ -290,11 +305,12 @@ def optimize_bucket(
     logger.info(f"Baseline Brier score: {baseline_brier:.6f}")
 
     # Fixed parameters (from best single model config)
+    # V3: feature_fraction moved to search space for automatic feature selection
     fixed_params = {
         "objective": "regression",
         "metric": ["l2", "mae"],
         "verbosity": -1,
-        "feature_fraction": 0.8,
+        # feature_fraction: now optimized by Optuna (0.5-1.0)
         "bagging_fraction": 0.8,
         "bagging_freq": 1,
         "n_jobs": -1,

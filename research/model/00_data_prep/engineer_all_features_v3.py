@@ -10,16 +10,16 @@ Philosophy Shift (V2 → V3):
 - Use raw metrics + EMAs/SMAs at standard time windows
 - Let GBT model learn optimal relationships and thresholds
 - Focus on orderbook spread/imbalance dynamics (not slopes)
-- Emphasize price basis features (mark-index, mark-last, index-last)
+- Emphasize mark-index basis (funding rate signal, settlement-relevant)
 
 Standard Time Windows: 60s, 300s, 900s, 1800s, 3600s
 
-Feature Count: 221 total
+Feature Count: 196 total
 - Existing features (kept as-is): 26
 - Funding rate: 11 (1 raw + 5 EMAs + 5 SMAs)
 - Orderbook L0: 32 (spread + imbalance with EMAs/SMAs/volatility)
 - Orderbook 5-levels: 31 (depth, volumes, ratios)
-- Price basis: 34 (3 bases × EMAs/SMAs + ratios)
+- Price basis: 11 (mark-index only: 1 raw + 5 EMAs + 5 SMAs)
 - Open interest: 6 (1 raw + 5 EMAs)
 - RV/Momentum/Range/EMA: 79 (raw + EMAs/SMAs + EMA ratios)
 
@@ -29,7 +29,7 @@ Memory Architecture: TEMPORAL CHUNKING
 - Joins all 6 feature sources per chunk, then concatenates
 - Proven pattern from tardis/analysis/compare_iv_chunked.py
 
-Output: consolidated_features_v3.parquet (~10-12 GB, 221 features, 63M rows)
+Output: consolidated_features_v3.parquet (~10-12 GB, 196 features, 63M rows)
 
 Author: BT Research Team
 Date: 2025-01-06 (Updated to 3-month chunks for 256GB RAM)
@@ -825,17 +825,12 @@ def engineer_and_write_price_basis_features() -> Path:
             "timestamp",
             "mark_price",
             "index_price",
-            "last_price",
         ]
     )
 
     # Deduplicate source data (9 duplicate timestamps in source)
     logger.info("  Deduplicating source data...")
     df = df.unique(subset=["timestamp"], maintain_order=True)
-
-    # Forward-fill last_price nulls (1,104 missing values)
-    logger.info("  Forward-filling last_price nulls...")
-    df = df.with_columns([pl.col("last_price").fill_null(strategy="forward")])
 
     # Convert timestamp to seconds
     df = df.with_columns([(pl.col("timestamp") / 1_000_000).cast(pl.Int64).alias("timestamp_seconds")])
@@ -869,89 +864,11 @@ def engineer_and_write_price_basis_features() -> Path:
         ]
     )
 
-    logger.info("Computing mark-last basis features...")
-
-    # Mark-last basis (execution quality)
-    df = df.with_columns(
-        [((pl.col("mark_price") - pl.col("last_price")) / pl.col("last_price") * 10000).alias("mark_last_basis_bps")]
-    )
-
-    # Mark-last EMAs (skip 60s to save features)
-    df = df.with_columns(
-        [
-            pl.col("mark_last_basis_bps").ewm_mean(span=300).alias("mark_last_ema_300s"),
-            pl.col("mark_last_basis_bps").ewm_mean(span=900).alias("mark_last_ema_900s"),
-            pl.col("mark_last_basis_bps").ewm_mean(span=1800).alias("mark_last_ema_1800s"),
-            pl.col("mark_last_basis_bps").ewm_mean(span=3600).alias("mark_last_ema_3600s"),
-        ]
-    )
-
-    # Mark-last SMAs
-    df = df.with_columns(
-        [
-            pl.col("mark_last_basis_bps").rolling_mean(window_size=300).alias("mark_last_sma_300s"),
-            pl.col("mark_last_basis_bps").rolling_mean(window_size=900).alias("mark_last_sma_900s"),
-            pl.col("mark_last_basis_bps").rolling_mean(window_size=1800).alias("mark_last_sma_1800s"),
-            pl.col("mark_last_basis_bps").rolling_mean(window_size=3600).alias("mark_last_sma_3600s"),
-        ]
-    )
-
-    logger.info("Computing index-last basis features...")
-
-    # Index-last basis (arbitrage opportunity)
-    df = df.with_columns(
-        [((pl.col("index_price") - pl.col("last_price")) / pl.col("last_price") * 10000).alias("index_last_basis_bps")]
-    )
-
-    # Index-last EMAs (skip 60s to save features)
-    df = df.with_columns(
-        [
-            pl.col("index_last_basis_bps").ewm_mean(span=300).alias("index_last_ema_300s"),
-            pl.col("index_last_basis_bps").ewm_mean(span=900).alias("index_last_ema_900s"),
-            pl.col("index_last_basis_bps").ewm_mean(span=1800).alias("index_last_ema_1800s"),
-            pl.col("index_last_basis_bps").ewm_mean(span=3600).alias("index_last_ema_3600s"),
-        ]
-    )
-
-    # Index-last SMAs
-    df = df.with_columns(
-        [
-            pl.col("index_last_basis_bps").rolling_mean(window_size=300).alias("index_last_sma_300s"),
-            pl.col("index_last_basis_bps").rolling_mean(window_size=900).alias("index_last_sma_900s"),
-            pl.col("index_last_basis_bps").rolling_mean(window_size=1800).alias("index_last_sma_1800s"),
-            pl.col("index_last_basis_bps").rolling_mean(window_size=3600).alias("index_last_sma_3600s"),
-        ]
-    )
-
-    logger.info("Computing basis ratios...")
-
-    # Basis ratios (normalized relationships)
-    df = df.with_columns(
-        [
-            (pl.col("mark_index_basis_bps") / (pl.col("mark_last_basis_bps").abs() + 1e-6)).alias(
-                "mark_index_vs_mark_last"
-            ),
-            (pl.col("mark_index_basis_bps") / (pl.col("index_last_basis_bps").abs() + 1e-6)).alias(
-                "mark_index_vs_index_last"
-            ),
-            (pl.col("mark_last_basis_bps") / (pl.col("index_last_basis_bps").abs() + 1e-6)).alias(
-                "mark_last_vs_index_last"
-            ),
-            (
-                pl.col("mark_index_basis_bps").abs()
-                / (pl.col("mark_last_basis_bps").abs() + pl.col("index_last_basis_bps").abs() + 1e-6)
-            ).alias("mark_index_dominance"),
-            (
-                (pl.col("mark_index_basis_bps") + pl.col("mark_last_basis_bps") + pl.col("index_last_basis_bps")) / 3
-            ).alias("avg_basis_bps"),
-        ]
-    )
-
-    # Select final columns
+    # Select final columns (mark-index only)
     df = df.select(
         [
             "timestamp_seconds",
-            # Mark-index (11)
+            # Mark-index (11 features)
             "mark_index_basis_bps",
             "mark_index_ema_60s",
             "mark_index_ema_300s",
@@ -963,32 +880,6 @@ def engineer_and_write_price_basis_features() -> Path:
             "mark_index_sma_900s",
             "mark_index_sma_1800s",
             "mark_index_sma_3600s",
-            # Mark-last (9)
-            "mark_last_basis_bps",
-            "mark_last_ema_300s",
-            "mark_last_ema_900s",
-            "mark_last_ema_1800s",
-            "mark_last_ema_3600s",
-            "mark_last_sma_300s",
-            "mark_last_sma_900s",
-            "mark_last_sma_1800s",
-            "mark_last_sma_3600s",
-            # Index-last (9)
-            "index_last_basis_bps",
-            "index_last_ema_300s",
-            "index_last_ema_900s",
-            "index_last_ema_1800s",
-            "index_last_ema_3600s",
-            "index_last_sma_300s",
-            "index_last_sma_900s",
-            "index_last_sma_1800s",
-            "index_last_sma_3600s",
-            # Ratios (5)
-            "mark_index_vs_mark_last",
-            "mark_index_vs_index_last",
-            "mark_last_vs_index_last",
-            "mark_index_dominance",
-            "avg_basis_bps",
         ]
     )
 
@@ -997,7 +888,7 @@ def engineer_and_write_price_basis_features() -> Path:
     logger.info(f"Writing price basis features to {output_file}...")
     df.sink_parquet(output_file, compression="snappy")
 
-    logger.info("✓ Wrote 34 price basis features")
+    logger.info("✓ Wrote 11 price basis features (mark-index only)")
 
     return output_file
 
@@ -1580,8 +1471,8 @@ def validate_final_output(output_file: Path, memory_monitor: MemoryMonitor) -> N
     feature_count = len(schema.names()) - 1  # Exclude timestamp_seconds
     logger.info(f"✓ Total features: {feature_count}")
 
-    # Expected: 221 features + timestamp_seconds = 222 columns
-    expected_features = 221
+    # Expected: 196 features + timestamp_seconds = 197 columns
+    expected_features = 196
     if feature_count != expected_features:
         logger.warning(f"Feature count mismatch: expected {expected_features}, got {feature_count}")
         logger.warning("This may indicate missing or duplicate features.")

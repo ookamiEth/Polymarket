@@ -402,8 +402,8 @@ def main() -> None:
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path(__file__).parent.parent / "results" / "test_features_lgb.parquet",
-        help="Input test data file",
+        default=Path(__file__).parent.parent / "data" / "consolidated_features_v3.parquet",
+        help="Input test data file (V3: consolidated features with temporal filtering via --holdout-only)",
     )
     parser.add_argument(
         "--config",
