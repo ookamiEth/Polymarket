@@ -17,7 +17,7 @@ import polars as pl
 from dotenv import load_dotenv
 
 DEFAULT_BATCH_SIZE = 50
-DEFAULT_MAX_WORKERS = 5
+DEFAULT_MAX_WORKERS = 16  # Optimized for 32 vCPUs (async I/O bound)
 DEFAULT_TARDIS_MACHINE_URL = "http://localhost:8000"
 HTTP_TIMEOUT_SECONDS = 1800.0
 SERVER_CHECK_TIMEOUT = 10.0

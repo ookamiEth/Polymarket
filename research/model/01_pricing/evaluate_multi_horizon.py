@@ -45,7 +45,7 @@ import polars as pl
 import yaml
 
 # Import from existing modules
-from lightgbm_memory_optimized import FEATURE_COLS, MemoryMonitor
+from lightgbm_memory_optimized import FEATURE_COLS, MemoryMonitor, calculate_ic
 
 # Setup logging
 logging.basicConfig(
@@ -182,41 +182,69 @@ def calculate_metrics(
     # Calculate model probabilities
     prob_pred = np.clip(prob_baseline + predictions, 0.0, 1.0)
 
-    # Brier scores
-    brier_baseline = np.mean((outcomes - prob_baseline) ** 2)
-    brier_model = np.mean((outcomes - prob_pred) ** 2)
+    # Filter out NaN values (consistent with calculate_ic behavior)
+    # This handles cases where prob_mid is null in the baseline data
+    mask = ~(np.isnan(predictions) | np.isnan(outcomes) | np.isnan(prob_baseline))
+    predictions_clean = predictions[mask]
+    outcomes_clean = outcomes[mask]
+    prob_baseline_clean = prob_baseline[mask]
+    prob_pred_clean = prob_pred[mask]
+
+    n_total = len(predictions)
+    n_valid = len(predictions_clean)
+    n_filtered = n_total - n_valid
+
+    if n_filtered > 0:
+        logger.info(f"  Filtered {n_filtered:,} rows with NaN values ({n_filtered / n_total * 100:.1f}%)")
+        logger.info(f"  Valid samples for metrics: {n_valid:,}")
+
+    if n_valid == 0:
+        raise ValueError("No valid samples after NaN filtering")
+
+    # Brier scores (using filtered data)
+    brier_baseline = np.mean((outcomes_clean - prob_baseline_clean) ** 2)
+    brier_model = np.mean((outcomes_clean - prob_pred_clean) ** 2)
     brier_improvement_pct = ((brier_baseline - brier_model) / brier_baseline) * 100
 
-    # Residual metrics
-    residual_true = outcomes - prob_baseline
-    residual_mse = np.mean((residual_true - predictions) ** 2)
+    # Residual metrics (using filtered data)
+    residual_true = outcomes_clean - prob_baseline_clean
+    residual_mse = np.mean((residual_true - predictions_clean) ** 2)
     residual_rmse = np.sqrt(residual_mse)
-    residual_mae = np.mean(np.abs(residual_true - predictions))
+    residual_mae = np.mean(np.abs(residual_true - predictions_clean))
 
-    # Calibration error (binned)
+    # Information Coefficient (IC) - signal quality metric
+    ic_metrics = calculate_ic(predictions, outcomes)
+    spearman_ic = ic_metrics["spearman_ic"]
+    pearson_ic = ic_metrics["pearson_ic"]
+    ic_pvalue = ic_metrics["ic_pvalue"]
+
+    # Calibration error (binned) - using filtered data
     n_bins = 10
     bin_edges = np.linspace(0, 1, n_bins + 1)
-    bin_indices = np.digitize(prob_pred, bin_edges[1:-1])
+    bin_indices = np.digitize(prob_pred_clean, bin_edges[1:-1])
 
     calibration_error = 0.0
     for i in range(n_bins):
-        mask = bin_indices == i
-        if mask.sum() > 0:
-            mean_pred = prob_pred[mask].mean()
-            mean_outcome = outcomes[mask].mean()
-            calibration_error += mask.sum() * (mean_pred - mean_outcome) ** 2
+        bin_mask = bin_indices == i
+        if bin_mask.sum() > 0:
+            mean_pred = prob_pred_clean[bin_mask].mean()
+            mean_outcome = outcomes_clean[bin_mask].mean()
+            calibration_error += bin_mask.sum() * (mean_pred - mean_outcome) ** 2
 
-    calibration_error = np.sqrt(calibration_error / len(outcomes))
+    calibration_error = np.sqrt(calibration_error / len(outcomes_clean))
 
     metrics = {
         "label": label,
-        "n_samples": len(outcomes),
+        "n_samples": n_valid,  # Use valid sample count after NaN filtering
         "brier_baseline": brier_baseline,
         "brier_model": brier_model,
         "brier_improvement_pct": brier_improvement_pct,
         "residual_mse": residual_mse,
         "residual_rmse": residual_rmse,
         "residual_mae": residual_mae,
+        "spearman_ic": spearman_ic,  # NEW: IC tracking
+        "pearson_ic": pearson_ic,  # NEW: IC tracking
+        "ic_pvalue": ic_pvalue,  # NEW: IC p-value
         "calibration_error": calibration_error,
     }
 
@@ -227,6 +255,8 @@ def calculate_metrics(
     logger.info(f"  Improvement:    {metrics['brier_improvement_pct']:6.2f}%")
     logger.info(f"  Residual MSE:   {metrics['residual_mse']:.6f}")
     logger.info(f"  Residual MAE:   {metrics['residual_mae']:.6f}")
+    logger.info(f"  Spearman IC:    {metrics['spearman_ic']:.4f} (p={metrics['ic_pvalue']:.4f})")
+    logger.info(f"  Pearson IC:     {metrics['pearson_ic']:.4f}")
     logger.info(f"  Calib. Error:   {metrics['calibration_error']:.6f}")
 
     return metrics
@@ -453,12 +483,39 @@ def main() -> None:
     models = load_models(models_dir, config, include_single=not args.no_single)
 
     # Load test data
-    logger.info(f"\nLoading test data: {args.input}")
-    if not args.input.exists():
-        raise FileNotFoundError(f"Test data not found: {args.input}")
+    # Priority 1: Load bucket files if they exist (they have outcome/prob_mid)
+    # Priority 2: Fall back to user-provided input file
+    data_dir = model_dir / Path(config["data"]["output_dir"])
+    bucket_files = [
+        data_dir / "near_consolidated.parquet",
+        data_dir / "mid_consolidated.parquet",
+        data_dir / "far_consolidated.parquet",
+    ]
 
-    data = pl.read_parquet(args.input)
-    logger.info(f"  Loaded {len(data):,} samples")
+    if all(f.exists() for f in bucket_files):
+        logger.info(f"\nLoading bucket files from Phase 1: {data_dir}")
+        bucket_dfs = []
+        for bucket_file in bucket_files:
+            df = pl.read_parquet(bucket_file)
+            logger.info(f"  Loaded {bucket_file.name}: {len(df):,} samples")
+            bucket_dfs.append(df)
+
+        data = pl.concat(bucket_dfs)
+        logger.info(f"  Total samples: {len(data):,}")
+    else:
+        # Fall back to user-provided input
+        logger.info(f"\nLoading test data: {args.input}")
+        if not args.input.exists():
+            raise FileNotFoundError(f"Test data not found: {args.input}")
+
+        data = pl.read_parquet(args.input)
+        logger.info(f"  Loaded {len(data):,} samples")
+
+        # Derive date from timestamp_seconds if not present (raw features file)
+        if "date" not in data.columns:
+            data = data.with_columns(
+                [pl.col("timestamp_seconds").cast(pl.Int64).truediv(86400).cast(pl.Date).alias("date")]
+            )
 
     # Filter to holdout period if requested
     if args.holdout_only:
@@ -504,8 +561,8 @@ def main() -> None:
         logger.info("\n⚠ WARNING: Evaluating on full test set (may include training data)")
         logger.info("  Use --holdout-only for true out-of-sample evaluation")
 
-    # Verify required columns
-    required_cols = ["time_remaining", "outcome", "prob_mid", "date"]
+    # Verify required columns (date is derived, not required in input)
+    required_cols = ["time_remaining", "outcome", "prob_mid"]
     missing_cols = [col for col in required_cols if col not in data.columns]
     if missing_cols:
         raise ValueError(f"Missing required columns: {missing_cols}")

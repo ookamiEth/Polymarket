@@ -395,8 +395,8 @@ Examples:
     parser.add_argument(
         "--workers",
         type=int,
-        default=5,
-        help="Number of parallel workers (default: 5, use 1 for sequential)",
+        default=20,  # Optimized for 32 vCPUs
+        help="Number of parallel workers (default: 20, use 1 for sequential)",
     )
     parser.add_argument(
         "--resume",

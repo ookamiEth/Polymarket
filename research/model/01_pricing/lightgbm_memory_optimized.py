@@ -42,6 +42,7 @@ import polars as pl
 import psutil
 import yaml
 from dateutil.relativedelta import relativedelta
+from scipy.stats import pearsonr, spearmanr
 
 # Setup logging
 logging.basicConfig(
@@ -51,10 +52,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Memory constraints - Updated for 128GB RAM EC2 instance
-MAX_MEMORY_GB = 120  # Soft limit for 128GB RAM (leaving 8GB for OS)
-BATCH_SIZE = 20_000_000  # 20M rows per batch (optimized for 128GB RAM)
-CHUNK_MONTHS = 6  # 6-month chunks for memory safety (can handle 2-year with 128GB RAM)
+# Memory constraints - Updated for 256GB RAM EC2 instance
+MAX_MEMORY_GB = 250  # Soft limit for 256GB RAM (leaving 6GB for OS)
+BATCH_SIZE = 20_000_000  # 20M rows per batch (optimized for 256GB RAM)
+CHUNK_MONTHS = 6  # 6-month chunks for memory safety (can handle 2-year with 256GB RAM)
 
 # File paths
 MODEL_DIR = Path(__file__).parent.parent
@@ -326,9 +327,9 @@ class MemoryMonitor:
         """Warn if memory limit exceeded but don't fail unless critical."""
         gc.collect()
         mem_gb = self.get_memory_gb()
-        # Only fail if we're approaching system limits (>120GB on 128GB system)
-        if mem_gb > 120.0:
-            raise MemoryError(f"Critical memory limit: {mem_gb:.2f} GB > 120.0 GB (system limit)")
+        # Only fail if we're approaching system limits (>250GB on 256GB system)
+        if mem_gb > 250.0:
+            raise MemoryError(f"Critical memory limit: {mem_gb:.2f} GB > 250.0 GB (system limit)")
         elif mem_gb > self.max_gb:
             logger.warning(f"Soft limit exceeded: {mem_gb:.2f} GB > {self.max_gb:.2f} GB (continuing)")
 
@@ -1190,6 +1191,61 @@ def compare_with_xgboost(
                 logger.info("  Winner: LightGBM (lower is better)")
             else:
                 logger.info("  Winner: XGBoost (lower is better)")
+
+
+def calculate_ic(predictions: np.ndarray, outcomes: np.ndarray) -> dict[str, float]:
+    """
+    Calculate Information Coefficient (IC) metrics.
+
+    IC measures rank correlation between predictions and outcomes.
+    Used in quantitative finance to evaluate signal quality.
+
+    From "The Elements of Quantitative Investing" (Section 8.3.1):
+    - For strategies: Use Sharpe Ratio (z-scored returns by volatility)
+    - For signals: Use IC (Spearman rank correlation)
+
+    Args:
+        predictions: Predicted residuals (continuous values)
+        outcomes: Actual outcomes (binary 0/1 for BTC options)
+
+    Returns:
+        Dictionary with IC metrics:
+        - spearman_ic: Spearman rank correlation (robust to outliers)
+        - pearson_ic: Pearson correlation (for comparison)
+        - ic_pvalue: Statistical significance of Spearman IC
+        - n_samples: Number of valid samples used
+    """
+    # Remove any NaN values
+    mask = ~(np.isnan(predictions) | np.isnan(outcomes))
+    pred_clean = predictions[mask]
+    outcome_clean = outcomes[mask]
+
+    n_samples = len(pred_clean)
+
+    if n_samples < 100:
+        logger.warning(f"Only {n_samples} samples for IC calculation (minimum 100 recommended)")
+        return {
+            "spearman_ic": 0.0,
+            "pearson_ic": 0.0,
+            "ic_pvalue": 1.0,
+            "n_samples": n_samples,
+        }
+
+    # Spearman IC (primary metric - robust to outliers, measures monotonic relationship)
+    spearman_result = spearmanr(pred_clean, outcome_clean)
+    spearman_ic = float(spearman_result.statistic)  # type: ignore[attr-defined]
+    ic_pvalue = float(spearman_result.pvalue)  # type: ignore[attr-defined]
+
+    # Pearson IC (for comparison - sensitive to outliers, measures linear relationship)
+    pearson_result = pearsonr(pred_clean, outcome_clean)
+    pearson_ic = float(pearson_result.statistic)  # type: ignore[attr-defined]
+
+    return {
+        "spearman_ic": spearman_ic,
+        "pearson_ic": pearson_ic,
+        "ic_pvalue": ic_pvalue,
+        "n_samples": n_samples,
+    }
 
 
 def main():

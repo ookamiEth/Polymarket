@@ -49,6 +49,7 @@ import yaml
 from lightgbm_memory_optimized import (
     FEATURE_COLS,
     MemoryMonitor,
+    calculate_ic,
     calculate_residual_metrics,  # noqa: F401
     create_lgb_dataset_from_parquet,
     evaluate_brier_score,  # noqa: F401
@@ -96,17 +97,24 @@ def stratify_data_by_time(
     time_max: int,
 ) -> Path:
     """
-    Stratify dataset by time_remaining bucket.
+    Stratify dataset by time_remaining bucket and join with baseline file to add target columns.
+
+    This function:
+    1. Loads baseline file (contains outcome, prob_mid, K, S)
+    2. Joins with consolidated features on timestamp
+    3. Calculates residual = outcome - prob_mid
+    4. Filters by time_remaining bucket
+    5. Saves complete training file with features + targets
 
     Args:
-        input_file: Source parquet file
+        input_file: Source parquet file (consolidated features)
         output_dir: Output directory for stratified file
         bucket_name: Bucket identifier (near/mid/far)
         time_min: Minimum time_remaining (seconds)
         time_max: Maximum time_remaining (seconds)
 
     Returns:
-        Path to stratified output file
+        Path to stratified output file with all required columns
     """
     logger.info(f"\nStratifying {bucket_name} bucket ({time_min}-{time_max}s)...")
     logger.info(f"  Source: {input_file}")
@@ -126,24 +134,38 @@ def stratify_data_by_time(
         logger.info(f"  Rows: {row_count:,}")
         return output_file
 
-    # Lazy load and filter
+    # Define baseline file path (contains outcome, prob_mid, K, S)
+    model_dir = Path(__file__).parent.parent
+    baseline_file = model_dir / "results/production_backtest_results.parquet"
+
+    if not baseline_file.exists():
+        msg = f"Baseline file not found: {baseline_file}"
+        raise FileNotFoundError(msg)
+
+    logger.info(f"  Loading baseline file: {baseline_file}")
     logger.info(f"  Filtering time_remaining: [{time_min}, {time_max})")
 
-    df = pl.scan_parquet(input_file).filter(
-        (pl.col("time_remaining") >= time_min) & (pl.col("time_remaining") < time_max)
+    # Load baseline file (outcome, prob_mid, timestamp, contract_id)
+    # Select only the columns we need for joining and target calculation
+    baseline_df = pl.scan_parquet(baseline_file).select(
+        ["timestamp", "outcome", "prob_mid", "K", "S", "contract_id", "date"]
     )
 
-    # V3: Add date column if missing (derived from timestamp_seconds)
-    schema = df.collect_schema()
-    if "date" not in schema.names():
-        logger.info("  Adding 'date' column from timestamp_seconds...")
-        df = df.with_columns(
-            [
-                (pl.from_epoch(pl.col("timestamp_seconds"), time_unit="s").cast(pl.Date).alias("date"))
-            ]
-        )
+    # Load consolidated features
+    features_df = pl.scan_parquet(input_file)
 
-    # Stream to output
+    # Join baseline with features on timestamp
+    # baseline.timestamp ↔ features.timestamp_seconds
+    df = baseline_df.join(features_df, left_on="timestamp", right_on="timestamp_seconds", how="inner")
+
+    # Calculate residual = outcome - prob_mid
+    df = df.with_columns([(pl.col("outcome") - pl.col("prob_mid")).alias("residual")])
+
+    # Filter by time_remaining bucket
+    df = df.filter((pl.col("time_remaining") >= time_min) & (pl.col("time_remaining") < time_max))
+
+    # Stream to output (sink_parquet on LazyFrame automatically streams)
+    logger.info("  Joining baseline with features and calculating residual...")
     df.sink_parquet(output_file, compression="snappy", statistics=True)
 
     # Get row count
@@ -362,15 +384,22 @@ def train_bucket_walk_forward(
     logger.info(f"WALK-FORWARD VALIDATION: {bucket_config['name'].upper()}")
     logger.info(f"{'=' * 80}")
 
+    # Create output directory for temporary files (matches pattern from stratify_bucket_data)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
+
     train_months = walk_forward_config["train_months"]
     val_months = walk_forward_config["val_months"]
     step_months = walk_forward_config["step_months"]
     holdout_months = walk_forward_config["holdout_months"]
+    embargo_days = walk_forward_config.get("embargo_days", 0)  # Default 0 for backward compatibility
 
     logger.info(f"Training window: {train_months} months")
     logger.info(f"Validation window: {val_months} months")
     logger.info(f"Step size: {step_months} month(s)")
     logger.info(f"Holdout test: last {holdout_months} months")
+    if embargo_days > 0:
+        logger.info(f"Embargo period: {embargo_days} day(s) between train/val")
 
     monitor = MemoryMonitor()
 
@@ -397,20 +426,33 @@ def train_bucket_walk_forward(
     logger.info(f"Walk-forward range: {min_date} to {walk_forward_end}")
     logger.info(f"Holdout test: {holdout_start} to {max_date}")
 
-    # Generate walk-forward windows
-    windows: list[tuple[date, date, date, date]] = []
+    # Generate walk-forward windows with embargo period
+    windows: list[
+        tuple[date, date, date, date, date, date]
+    ] = []  # (train_start, train_end, embargo_start, embargo_end, val_start, val_end)
     current_start = min_date
 
     while True:
         train_end = current_start + relativedelta(months=train_months) - relativedelta(days=1)
-        val_start = train_end + relativedelta(days=1)
+
+        # Add embargo period (gap between train and val)
+        if embargo_days > 0:
+            embargo_start = train_end + relativedelta(days=1)
+            embargo_end = embargo_start + relativedelta(days=embargo_days - 1)
+            val_start = embargo_end + relativedelta(days=1)
+        else:
+            # No embargo: val starts immediately after train
+            embargo_start = train_end + relativedelta(days=1)
+            embargo_end = train_end  # Empty embargo period
+            val_start = train_end + relativedelta(days=1)
+
         val_end = val_start + relativedelta(months=val_months) - relativedelta(days=1)
 
         # Stop if validation period would overlap with holdout
         if val_end >= holdout_start:
             break
 
-        windows.append((current_start, train_end, val_start, val_end))
+        windows.append((current_start, train_end, embargo_start, embargo_end, val_start, val_end))
 
         # Step forward
         current_start += relativedelta(months=step_months)
@@ -421,11 +463,13 @@ def train_bucket_walk_forward(
     window_metrics: list[dict[str, Any]] = []
     walk_forward_start_time = time.time()
 
-    for window_idx, (train_start, train_end, val_start, val_end) in enumerate(windows, 1):
+    for window_idx, (train_start, train_end, embargo_start, embargo_end, val_start, val_end) in enumerate(windows, 1):
         logger.info(f"\n{'─' * 80}")
         logger.info(f"Window {window_idx}/{len(windows)}")
-        logger.info(f"  Train: {train_start} to {train_end}")
-        logger.info(f"  Val:   {val_start} to {val_end}")
+        logger.info(f"  Train:   {train_start} to {train_end}")
+        if embargo_days > 0:
+            logger.info(f"  Embargo: {embargo_start} to {embargo_end} ({embargo_days} day(s))")
+        logger.info(f"  Val:     {val_start} to {val_end}")
         logger.info(f"{'─' * 80}")
 
         # Create temporal train/val splits
@@ -480,20 +524,39 @@ def train_bucket_walk_forward(
             val_metrics = best_score.get("val", {})
             residual_mse = val_metrics.get("l2", 0.0)
 
+            # Calculate Information Coefficient (IC) for signal quality
+            # Read validation data to get predictions and outcomes
+            val_df_for_ic = pl.read_parquet(temp_val, columns=features + ["outcome"])
+            val_features_array = val_df_for_ic.select(features).to_numpy().astype(np.float32)
+            val_outcomes = val_df_for_ic["outcome"].to_numpy().astype(np.float32)
+            val_predictions_raw = model.predict(val_features_array, num_iteration=model.best_iteration)
+            val_predictions = np.asarray(val_predictions_raw, dtype=np.float32)
+
+            ic_metrics = calculate_ic(val_predictions, val_outcomes)
+            spearman_ic = ic_metrics["spearman_ic"]
+            pearson_ic = ic_metrics["pearson_ic"]
+            ic_pvalue = ic_metrics["ic_pvalue"]
+
             logger.info(f"  Baseline Brier: {baseline_brier_val:.6f}")
             logger.info(f"  Residual MSE:   {residual_mse:.6f}")
+            logger.info(f"  Spearman IC:    {spearman_ic:.4f} (p={ic_pvalue:.4f})")
+            logger.info(f"  Pearson IC:     {pearson_ic:.4f}")
 
             window_metrics.append(
                 {
                     "window": window_idx,
                     "train_start": train_start.isoformat(),
                     "train_end": train_end.isoformat(),
+                    "embargo_days": embargo_days,  # NEW: Embargo period tracking
                     "val_start": val_start.isoformat(),
                     "val_end": val_end.isoformat(),
                     "n_train": n_train,
                     "n_val": n_val,
                     "baseline_brier": baseline_brier_val,
                     "residual_mse": residual_mse,
+                    "spearman_ic": spearman_ic,  # NEW: IC tracking
+                    "pearson_ic": pearson_ic,  # NEW: IC tracking
+                    "ic_pvalue": ic_pvalue,  # NEW: IC p-value
                     "best_iteration": model.best_iteration,
                 }
             )
@@ -528,11 +591,25 @@ def train_bucket_walk_forward(
     min_mse = np.min(residual_mses)
     max_mse = np.max(residual_mses)
 
+    # Aggregate IC metrics (NEW: Information Coefficient tracking)
+    spearman_ics = [m["spearman_ic"] for m in window_metrics]
+    mean_ic = np.mean(spearman_ics)
+    std_ic = np.std(spearman_ics)
+    min_ic = np.min(spearman_ics)
+    max_ic = np.max(spearman_ics)
+
+    # Count statistically significant ICs (p < 0.05)
+    sig_ics = sum(1 for m in window_metrics if m["ic_pvalue"] < 0.05)
+
     logger.info(f"Average Residual MSE: {mean_mse:.6f} ± {std_mse:.6f}")
     logger.info(f"Range: {min_mse:.6f} to {max_mse:.6f}")
+    logger.info(f"\nAverage Spearman IC:  {mean_ic:.4f} ± {std_ic:.4f}")
+    logger.info(f"IC Range: {min_ic:.4f} to {max_ic:.4f}")
+    logger.info(f"Significant ICs: {sig_ics}/{len(window_metrics)} windows (p<0.05)")
     logger.info("\nWindow-by-window performance:")
     for m in window_metrics:
-        logger.info(f"  Window {m['window']}: Residual MSE = {m['residual_mse']:.6f}")
+        ic_sig = "✓" if m["ic_pvalue"] < 0.05 else " "
+        logger.info(f"  Window {m['window']}: MSE={m['residual_mse']:.6f}, IC={m['spearman_ic']:.4f} {ic_sig}")
     logger.info("\nNote: Brier improvement will be computed in evaluation phase.")
 
     # Train final production model on all walk-forward data (excluding holdout)
@@ -622,6 +699,11 @@ def train_bucket_walk_forward(
                 "std_mse": std_mse,
                 "min_mse": min_mse,
                 "max_mse": max_mse,
+                "mean_ic": mean_ic,  # NEW: IC tracking
+                "std_ic": std_ic,  # NEW: IC tracking
+                "min_ic": min_ic,  # NEW: IC tracking
+                "max_ic": max_ic,  # NEW: IC tracking
+                "significant_ics": sig_ics,  # NEW: Count of significant ICs
                 "window_details": window_metrics,
             },
             "data": {
@@ -658,6 +740,11 @@ def train_bucket_walk_forward(
         "walk_forward_std_mse": std_mse,
         "walk_forward_min_mse": min_mse,
         "walk_forward_max_mse": max_mse,
+        "walk_forward_mean_ic": mean_ic,  # NEW: IC tracking
+        "walk_forward_std_ic": std_ic,  # NEW: IC tracking
+        "walk_forward_min_ic": min_ic,  # NEW: IC tracking
+        "walk_forward_max_ic": max_ic,  # NEW: IC tracking
+        "walk_forward_significant_ics": sig_ics,  # NEW: IC tracking
         "n_windows": len(window_metrics),
         "window_metrics": window_metrics,
     }

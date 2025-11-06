@@ -94,6 +94,9 @@ def get_search_space(bucket_name: str, config: dict[str, Any]) -> dict[str, tupl
     logger.info(f"  Num leaves:         {bucket_space['num_leaves']}")
     logger.info(f"  Min data in leaf:   {bucket_space['min_data_in_leaf']}")
     logger.info(f"  L2 regularization:  {bucket_space['lambda_l2']}")
+    logger.info(f"  Max depth:          {bucket_space['max_depth']}")
+    logger.info(f"  L1 regularization:  {bucket_space['lambda_l1']}")
+    logger.info("  Feature fraction:   [0.5, 1.0]")
 
     return bucket_space
 
@@ -176,6 +179,21 @@ class OptunaObjective:
             1.0,  # Up to 100% of features
         )
 
+        # V3 Enhanced: Add max_depth to prevent overfitting
+        params["max_depth"] = trial.suggest_int(
+            "max_depth",
+            self.search_space["max_depth"][0],
+            self.search_space["max_depth"][1],
+        )
+
+        # V3 Enhanced: Add lambda_l1 (L1 regularization for feature sparsity)
+        params["lambda_l1"] = trial.suggest_float(
+            "lambda_l1",
+            self.search_space["lambda_l1"][0],
+            self.search_space["lambda_l1"][1],
+            log=True,  # Log scale like lambda_l2
+        )
+
         # Train model
         callbacks = [
             lgb.early_stopping(50),
@@ -185,7 +203,7 @@ class OptunaObjective:
         model = lgb.train(
             params,
             self.train_data,
-            num_boost_round=1000,
+            num_boost_round=3000,  # Increased from 1000 to allow better convergence (early stop at 50)
             valid_sets=[self.val_data],
             valid_names=["val"],
             callbacks=callbacks,
@@ -211,7 +229,8 @@ class OptunaObjective:
 
         logger.info(
             f"  Trial {trial.number:3d}: MSE={residual_mse:.6f}, Improvement={brier_improvement_pct:.2f}%, "
-            f"Iter={model.best_iteration}"
+            f"Iter={model.best_iteration}, Depth={params['max_depth']}, "
+            f"L1={params['lambda_l1']:.3f}, FF={params['feature_fraction']:.2f}"
         )
 
         # Clean up
@@ -263,44 +282,66 @@ def optimize_bucket(
     # Setup paths
     model_dir = Path(__file__).parent.parent
     data_dir = model_dir / Path(config["data"]["output_dir"])
-    train_file = data_dir / config["data"]["bucket_files"][bucket_name]["train"]
-    val_file = data_dir / config["data"]["bucket_files"][bucket_name]["val"]
+    consolidated_file = data_dir / f"{bucket_name}_consolidated.parquet"
 
-    # Verify files exist
-    if not train_file.exists():
-        raise FileNotFoundError(f"Train file not found: {train_file}. Run train_multi_horizon.py first.")
-    if not val_file.exists():
-        raise FileNotFoundError(f"Val file not found: {val_file}. Run train_multi_horizon.py first.")
+    # Verify consolidated file exists
+    if not consolidated_file.exists():
+        raise FileNotFoundError(
+            f"Consolidated file not found: {consolidated_file}. Run train_multi_horizon.py --bucket {bucket_name} first."
+        )
+
+    # Load consolidated data and split temporally (80/20 train/val)
+    logger.info(f"Loading consolidated data: {consolidated_file}")
+    data = pl.read_parquet(consolidated_file)
+    logger.info(f"  Loaded {len(data):,} samples")
+
+    # Sort by date for temporal split (prevents data leakage)
+    data = data.sort("date")
+    split_idx = int(len(data) * 0.8)
+
+    # Split into train/val
+    train_data = data[:split_idx]
+    val_data = data[split_idx:]
+    logger.info(f"  Split: {len(train_data):,} train, {len(val_data):,} val (80/20)")
+
+    # Write temporary files for Optuna (will be cleaned up at end)
+    train_file = data_dir / f"{bucket_name}_optuna_train.parquet"
+    val_file = data_dir / f"{bucket_name}_optuna_val.parquet"
+    train_data.write_parquet(train_file)
+    val_data.write_parquet(val_file)
+    logger.info(f"  Created temporary files: {train_file.name}, {val_file.name}")
+
+    # Free memory
+    del data, train_data
+    gc.collect()
 
     # Get features
     schema = pl.scan_parquet(train_file).collect_schema()
     features = [col for col in FEATURE_COLS if col in schema.names()]
     logger.info(f"Using {len(features)} features")
 
-    # Calculate baseline Brier from validation data
-    val_df = pl.read_parquet(val_file)
-
+    # Calculate baseline Brier from validation data (use val_data we already loaded)
     # Validate required columns exist
     required_cols = ["prob_mid", "outcome"]
-    missing_cols = [col for col in required_cols if col not in val_df.columns]
+    missing_cols = [col for col in required_cols if col not in val_data.columns]
     if missing_cols:
-        msg = f"Missing required columns in {val_file}: {missing_cols}"
+        msg = f"Missing required columns in validation data: {missing_cols}"
         raise ValueError(msg)
 
     # Validate DataFrame is not empty
-    if len(val_df) == 0:
-        msg = f"Validation file is empty: {val_file}"
+    if len(val_data) == 0:
+        msg = "Validation data is empty after temporal split"
         raise ValueError(msg)
 
     # Calculate Brier score
-    brier_series = ((val_df["prob_mid"] - val_df["outcome"]) ** 2).mean()
+    brier_series = ((val_data["prob_mid"] - val_data["outcome"]) ** 2).mean()
     if brier_series is None:
-        msg = f"Failed to calculate baseline Brier from {val_file}"
+        msg = "Failed to calculate baseline Brier from validation data"
         raise ValueError(msg)
 
     # Cast to Python float (Polars returns Python literals for scalar operations)
     baseline_brier = float(brier_series)  # type: ignore[arg-type]
-    del val_df
+    del val_data
     gc.collect()
     logger.info(f"Baseline Brier score: {baseline_brier:.6f}")
 
@@ -349,9 +390,9 @@ def optimize_bucket(
     )
 
     # Run optimization
-    logger.info(f"\nRunning {n_trials} trials...")
+    logger.info(f"\nRunning {n_trials} trials in parallel (4 jobs)...")
     try:
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+        study.optimize(objective, n_trials=n_trials, n_jobs=4, show_progress_bar=True)
     finally:
         objective.cleanup()
 
@@ -427,6 +468,17 @@ def optimize_bucket(
         )
 
     monitor.check_memory("After optimization")
+
+    # Cleanup temporary train/val files
+    try:
+        if train_file.exists():
+            train_file.unlink()
+            logger.info(f"  Cleaned up {train_file.name}")
+        if val_file.exists():
+            val_file.unlink()
+            logger.info(f"  Cleaned up {val_file.name}")
+    except Exception as e:
+        logger.warning(f"Failed to cleanup temporary files: {e}")
 
     return best_config["hyperparameters"]
 
