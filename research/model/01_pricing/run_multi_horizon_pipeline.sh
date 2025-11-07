@@ -3,19 +3,19 @@
 # ==========================================
 #
 # Features:
-#   - Production training (~5-8 hours) - 3 buckets with 14-window walk-forward + Optuna
+#   - Production training (~8-12 hours) - 3 buckets with 10-window walk-forward + Optuna
 #   - Walk-forward validation is MANDATORY (no data leakage for time series)
 #   - Phase checkpointing for resumability
 #   - Separate logs per step
 #   - Stop on first error
 #
 # Pipeline Structure:
-#   PHASE 1: BASELINE TRAINING & VALIDATION (~77 min)
-#     Step 1: Training with walk-forward validation (~72 min)
+#   PHASE 1: BASELINE TRAINING & VALIDATION (~20 min)
+#     Step 1: Training with walk-forward validation (10 windows × 9-month data, ~20 min)
 #     Step 2: Baseline evaluation (~5 min)
 #
-#   PHASE 2: HYPERPARAMETER OPTIMIZATION (~4-6 hours)
-#     Step 1: Per-bucket Optuna tuning (~4-6 hours, 50 trials)
+#   PHASE 2: HYPERPARAMETER OPTIMIZATION (~8-12 hours)
+#     Step 1: Per-bucket Optuna tuning (~8-12 hours, 100 trials per bucket)
 #     Step 2: Final re-evaluation (~5 min)
 #
 # Usage:
@@ -146,10 +146,10 @@ show_usage() {
     cat << EOF
 Usage: $0 [options]
 
-Production Training Pipeline (~5-8 hours):
-  - Phase 1 Step 1: Train 3 buckets with 14-window walk-forward (~72 min)
+Production Training Pipeline (~8-12 hours):
+  - Phase 1 Step 1: Train 3 buckets with 10-window walk-forward (9-month windows, ~20 min)
   - Phase 1 Step 2: Baseline evaluation (~5 min)
-  - Phase 2 Step 1: Optuna per-bucket tuning (~4-6 hours)
+  - Phase 2 Step 1: Optuna per-bucket tuning (100 trials per bucket, ~8-12 hours)
   - Phase 2 Step 2: Final re-evaluation (~5 min)
 
 Note: Walk-forward validation is MANDATORY. This ensures zero data leakage.
@@ -219,26 +219,26 @@ echo ""
 PIPELINE_START=$(date +%s)
 
 # ========================================================================
-# PRODUCTION TRAINING (~5-8 hours)
+# PRODUCTION TRAINING (~8-12 hours)
 # ========================================================================
 
 log_info "Production training with walk-forward validation (MANDATORY)"
 if [[ "$SKIP_PHASE2" == "true" ]]; then
-    log_info "Expected runtime: ~77 minutes (Phase 2 skipped)"
+    log_info "Expected runtime: ~25 minutes (Phase 2 skipped)"
 else
-    log_info "Expected runtime: ~5-8 hours (includes Phase 2 optimization)"
+    log_info "Expected runtime: ~8-12 hours (includes Phase 2 optimization with 100 trials)"
 fi
 echo ""
 
 # ========================================================================
-# PHASE 1: BASELINE TRAINING & VALIDATION (~77 min)
+# PHASE 1: BASELINE TRAINING & VALIDATION (~25 min)
 # ========================================================================
 
 if [[ $RESUME_FROM_PHASE -le 1 ]]; then
     print_double_separator
     log_info "PHASE 1: BASELINE TRAINING & VALIDATION"
     print_double_separator
-    log_info "Expected runtime: ~77 minutes"
+    log_info "Expected runtime: ~25 minutes (10 windows × 9-month data)"
     echo ""
 
     # Phase 1 Step 1: Training with walk-forward validation
@@ -256,7 +256,7 @@ if [[ $RESUME_FROM_PHASE -le 1 ]]; then
 fi
 
 # ========================================================================
-# PHASE 2: HYPERPARAMETER OPTIMIZATION (~4-6 hours)
+# PHASE 2: HYPERPARAMETER OPTIMIZATION (~8-12 hours)
 # ========================================================================
 
 if [[ "$SKIP_PHASE2" == "false" ]]; then
@@ -264,12 +264,12 @@ if [[ "$SKIP_PHASE2" == "false" ]]; then
         print_double_separator
         log_info "PHASE 2: HYPERPARAMETER OPTIMIZATION"
         print_double_separator
-        log_info "Expected runtime: ~4-6 hours"
+        log_info "Expected runtime: ~8-12 hours (100 trials per bucket)"
         echo ""
 
         # Phase 2 Step 1: Optuna per-bucket optimization
         run_step 2 1 "optuna_optimization" \
-            "uv run python optuna_multi_horizon.py --bucket all --n-trials 50"
+            "uv run python optuna_multi_horizon.py --bucket all --n-trials 100"
 
         # Phase 2 Step 2: Final re-evaluation (on holdout period only - no data leakage)
         run_step 2 2 "evaluation_optimized" \

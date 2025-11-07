@@ -149,3 +149,4 @@ documentation/
 *.aux 
 *.lock 
 *.out 
+*.bak 

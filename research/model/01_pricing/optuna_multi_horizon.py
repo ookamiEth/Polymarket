@@ -212,7 +212,7 @@ class OptunaObjective:
         # Get validation metrics
         val_metrics = model.best_score.get("val", {})
         residual_mse = val_metrics.get("l2", 0.0)
-        brier_improvement_pct = (residual_mse / self.baseline_brier) * 100
+        brier_improvement_pct = ((self.baseline_brier - residual_mse) / self.baseline_brier) * 100
 
         # V3: Track feature importance for analysis
         importance = model.feature_importance(importance_type="gain")
@@ -290,19 +290,34 @@ def optimize_bucket(
             f"Consolidated file not found: {consolidated_file}. Run train_multi_horizon.py --bucket {bucket_name} first."
         )
 
-    # Load consolidated data and split temporally (80/20 train/val)
+    # Load consolidated data and split temporally (prevents data leakage)
     logger.info(f"Loading consolidated data: {consolidated_file}")
     data = pl.read_parquet(consolidated_file)
     logger.info(f"  Loaded {len(data):,} samples")
 
-    # Sort by date for temporal split (prevents data leakage)
+    # Sort by date for temporal split
     data = data.sort("date")
-    split_idx = int(len(data) * 0.8)
 
-    # Split into train/val
-    train_data = data[:split_idx]
-    val_data = data[split_idx:]
-    logger.info(f"  Split: {len(train_data):,} train, {len(val_data):,} val (80/20)")
+    # Define temporal boundaries to prevent data contamination:
+    # - Walk-forward training uses Oct 2023 - Apr 2025 (most recent window trains up to Mar 2025, validates May-Jul)
+    # - Optuna validation: Apr 2025 - Jun 2025 (3 months, separate from walk-forward)
+    # - Final holdout test: Jul 2025 - Sep 2025 (3 months, never seen during training/optuna)
+
+    from dateutil.relativedelta import relativedelta
+
+    max_date = data.select(pl.col("date").max().alias("max_date"))["max_date"][0]
+    holdout_start = max_date - relativedelta(months=2, days=29)  # Jul 1, 2025 (3 months before Sep 30)
+    optuna_val_start = holdout_start - relativedelta(months=3)  # Apr 1, 2025 (3 months before holdout)
+
+    logger.info("  Temporal boundaries:")
+    logger.info(f"    Walk-forward training: up to {optuna_val_start}")
+    logger.info(f"    Optuna validation: {optuna_val_start} to {holdout_start}")
+    logger.info(f"    Final holdout test: {holdout_start} to {max_date}")
+
+    # Split into train/val based on temporal boundaries
+    train_data = data.filter(pl.col("date") < optuna_val_start)
+    val_data = data.filter((pl.col("date") >= optuna_val_start) & (pl.col("date") < holdout_start))
+    logger.info(f"  Split: {len(train_data):,} train, {len(val_data):,} val (temporal)")
 
     # Write temporary files for Optuna (will be cleaned up at end)
     train_file = data_dir / f"{bucket_name}_optuna_train.parquet"
@@ -497,8 +512,8 @@ def main() -> None:
     parser.add_argument(
         "--n-trials",
         type=int,
-        default=50,
-        help="Number of Optuna trials per bucket (default: 50)",
+        default=100,
+        help="Number of Optuna trials per bucket (default: 100)",
     )
     parser.add_argument(
         "--config",

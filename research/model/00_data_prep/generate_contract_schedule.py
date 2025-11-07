@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Constants
-OUTPUT_FILE = Path("/Users/lgierhake/Documents/ETH/BT/research/model/results/contract_schedule.parquet")
+OUTPUT_FILE = Path("/home/ubuntu/Polymarket/research/model/results/contract_schedule.parquet")
 SECONDS_PER_15MIN = 900
 MINUTES_PER_HOUR = 60
 
@@ -168,8 +168,8 @@ def main() -> None:
 
     # Use the same period as our perpetual data
     # From the resampling output: 1696118400 (2023-10-01) to 1759276786 (2025-09-30)
-    start_date = "2023-10-01"
-    end_date = "2025-09-30"
+    start_date = "2023-09-26"
+    end_date = "2025-11-06"
 
     try:
         generate_contract_schedule(start_date, end_date, OUTPUT_FILE)
