@@ -370,10 +370,17 @@ Binary options exhibit extreme non-linearity. Empirical delta (computed via fini
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.8\textwidth]{figures/01_delta_surface_2d.png}
-Empirical delta surface compared to Black-Scholes theoretical delta. The model captures smoother transitions than theory, suggesting market participants incorporate information beyond simple log-normal dynamics.\\\rule{\textwidth}{0.4pt}
+\caption{Empirical delta surface compared to Black-Scholes theoretical delta. The model captures smoother transitions than theory, suggesting market participants incorporate information beyond simple log-normal dynamics.}
 \label{fig:delta}
 \end{figure}
 Gamma (second derivative) peaks at at-the-money strikes with values up to 3.50, indicating extreme sensitivity to small price movements. This convexity hotspot explains why ATM options have highest prediction difficulty (Section \ref{sec:error_analysis}).
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\textwidth]{figures/02_gamma_surface.png}
+\caption{Gamma surface showing second-order sensitivity. Peak values of 3.50 at ATM explain the concentration of prediction errors in this region, as small price movements create large probability shifts.}
+\label{fig:gamma}
+\end{figure}
 \subsection{Feature Importance}
 Correlation analysis between features and LightGBM residual predictions reveals:
 \begin{table}[h]
@@ -391,9 +398,16 @@ Time remaining & 4.2\% \\
 Autocorrelation lag-1 & 3.8\% \\
 \bottomrule
 \end{tabular}
-Top 7 features by correlation with residual predictions. Moneyness and momentum dominate, suggesting corrections primarily adjust for directional bias not captured by Black-Scholes.\\\rule{\textwidth}{0.4pt}
+\caption{Top 7 features by correlation with residual predictions. Moneyness and momentum dominate, suggesting corrections primarily adjust for directional bias not captured by Black-Scholes.}
 \label{tab:feature_importance}
 \end{table}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\textwidth]{figures/18_feature_importance.png}
+\caption{Comprehensive feature importance analysis from LightGBM model. The dominance of moneyness (41\%) and momentum features (32\%, 22\%, 19\%) validates our residual learning approach, showing the model primarily corrects for directional biases not captured by theoretical pricing.}
+\label{fig:feature_importance}
+\end{figure}
 \subsection{Regime Analysis}
 \label{sec:regime_analysis}
 K-means clustering on five key features (moneyness, RV\_900s, time\_remaining, jump\_intensity\_300s, autocorr\_lag1\_300s) identifies five distinct market regimes with heterogeneous performance:
@@ -421,6 +435,13 @@ Performance by feature regime. Regime 3 (best regime) accounts for 35\% of data 
 \item \textbf{Regimes 0 \& 1}: High-volatility, long-dated options far from strike. Large jumps and volatility clustering make corrections difficult (4-6\% improvement).
 \item \textbf{Regime 2}: Extreme time-to-expiry options (very long dated). Poor baseline performance (MAE = 0.426) limits correction potential despite 6.3\% relative improvement.
 \end{itemize}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\textwidth]{figures/03_payoff_by_vol_regime.png}
+\caption{Performance comparison across volatility regimes. The substantial 25-30\% improvement in Regime 3 (low volatility, ATM conditions) demonstrates the value of regime-specific modeling and justifies our hierarchical 4-model architecture.}
+\label{fig:payoff_regimes}
+\end{figure}
 \subsection{Error Analysis}
 \label{sec:error_analysis}
 Conditional error analysis reveals systematic patterns:
@@ -441,6 +462,14 @@ Stale IV ($>$300s) & 0.3012 & 0.2901 (3.7\%) \\
 Conditional error analysis. Model performs best in low-volatility regimes (7.3\% improvement) and struggles in high-volatility environments (2.8\%).\\\rule{\textwidth}{0.4pt}
 \label{tab:conditional_errors}
 \end{table}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\textwidth]{figures/11_conditional_errors.png}
+\caption{Conditional error analysis across different market conditions. The 7.3\% improvement in low-volatility regimes versus 2.8\% in high-volatility demonstrates the heterogeneous performance that motivates our regime-specific modeling approach.}
+\label{fig:conditional_errors}
+\end{figure}
+
 Error heatmaps (Figure \ref{fig:error_heatmap}) show worst predictions occur at:
 \begin{itemize}
 \item ATM + high volatility + short time-to-expiry ($<$120s)
@@ -450,7 +479,7 @@ Error heatmaps (Figure \ref{fig:error_heatmap}) show worst predictions occur at:
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.8\textwidth]{figures/09_error_heatmap_2d.png}
-2D error heatmap (moneyness × realized volatility). Darkest regions indicate highest MAE. Worst errors cluster at ATM + high volatility, where gamma is highest and volatility estimation is most critical.\\\rule{\textwidth}{0.4pt}
+\caption{2D error heatmap (moneyness × realized volatility). Darkest regions indicate highest MAE. Worst errors cluster at ATM + high volatility, where gamma is highest and volatility estimation is most critical.}
 \label{fig:error_heatmap}
 \end{figure}
 \subsection{Calibration and Win Rate Analysis}
@@ -458,7 +487,7 @@ Model predictions are well-calibrated across most probability ranges:
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.8\textwidth]{figures/15_win_rate_analysis.png}
-Calibration plot showing actual vs predicted win rates. ML model (green) tracks ideal 45° line more closely than Black-Scholes baseline (red), particularly in the [0.4, 0.6] probability range. Slight overconfidence appears at extremes ($P < 0.1$ and $P > 0.9$).\\\rule{\textwidth}{0.4pt}
+\caption{Calibration plot showing actual vs predicted win rates. ML model (green) tracks ideal 45° line more closely than Black-Scholes baseline (red), particularly in the [0.4, 0.6] probability range. Slight overconfidence appears at extremes ($P < 0.1$ and $P > 0.9$).}
 \label{fig:calibration}
 \end{figure}
 Overall win rate: 50.19\% (nearly perfect for binary options where true probability should center at 50\%).
@@ -510,9 +539,17 @@ We define a trading signal as taking a position when $|P_{\text{final}} - P_{\te
 10\% & 340,525 & 83.5\% & 17.6\% \\
 \bottomrule
 \end{tabular}
-Trading signal quality by edge threshold. 10\% edge achieves 83.5\% win rate but only occurs in 17.6\% of observations, creating a natural selectivity-frequency tradeoff.\\\rule{\textwidth}{0.4pt}
+\caption{Trading signal quality by edge threshold. 10\% edge achieves 83.5\% win rate but only occurs in 17.6\% of observations, creating a natural selectivity-frequency tradeoff.}
 \label{tab:signals}
 \end{table}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\textwidth]{figures/21_trading_signals.png}
+\caption{Trading signal analysis demonstrating the relationship between edge threshold, win rate, and opportunity frequency. The 83.5\% win rate at 10\% edge threshold validates the model's practical trading applicability, while the full spectrum shows how to balance selectivity versus trading frequency.}
+\label{fig:trading_signals}
+\end{figure}
+
 \textbf{Practical implications}:
 \begin{itemize}
 \item \textbf{High-frequency strategy}: Use 2-3\% thresholds for 40\% opportunity rate with 75\% win rate
@@ -523,6 +560,13 @@ Trading signal quality by edge threshold. 10\% edge achieves 83.5\% win rate but
 The discontinuous payoff structure of binary options creates five key differences from vanilla option pricing:
 \subsection{Non-Linear Baseline is Essential}
 Linear models achieve $R^2 = 0.75$ when predicting binary outcomes directly. Black-Scholes baseline achieves $R^2 = 0.99$. The sigmoid shape of $\Phi(d_2)$ is critical for capturing the probability transition from 0 to 1 as moneyness varies.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\textwidth]{figures/00_linear_vs_nonlinear_comparison.png}
+\caption{Comparison of linear baseline (0.206 error) versus Black-Scholes baseline (0.121 error). The 70\% higher error from linear models demonstrates why non-linear baseline modeling is essential for binary options, justifying our two-stage residual learning architecture.}
+\label{fig:linear_comparison}
+\end{figure}
 \subsection{Heteroskedastic Error Structure}
 Vanilla options have roughly constant error variance across strikes (proportional to vega). Binary options have maximum error variance at ATM:
 \begin{equation}
