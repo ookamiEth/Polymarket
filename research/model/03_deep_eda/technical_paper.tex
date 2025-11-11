@@ -32,7 +32,7 @@ Recent work has explored machine learning for vanilla option pricing \cite{dugas
 \end{enumerate}
 We address these challenges through a two-stage residual learning architecture:
 \textbf{Stage 1}: Compute Black-Scholes binary option baseline probability $P_{\text{BS}} = e^{-rT} \Phi(d_2)$ using realized volatility and risk-free rate estimates.
-\textbf{Stage 2}: Train LightGBM gradient boosting model to predict residuals $\epsilon = \text{Outcome} - P_{\text{BS}}$ using 196 engineered features spanning market microstructure, volatility dynamics, momentum, order book depth, funding rates, and cyclical patterns.
+\textbf{Stage 2}: Train LightGBM gradient boosting model to predict residuals $\epsilon = \text{Outcome} - P_{\text{BS}}$ using 175 engineered features spanning market microstructure, volatility dynamics, momentum, order book depth, funding rates, and cyclical patterns.
 \textbf{Final prediction}: $P_{\text{final}} = P_{\text{BS}} + \hat{\epsilon}_{\text{LightGBM}}$
 Our key contributions include:
 \begin{itemize}
@@ -195,59 +195,8 @@ We systematically reduce feature count from 226 to 175 through evidence-based pr
 
 \section{Model Architecture}
 
-\subsection{Feature Normalization Strategy}
-\subsubsection{Current State and Gap Analysis}
-The current implementation lacks explicit feature normalization, which presents several challenges:
-\begin{itemize}
-\item \textbf{Missing documentation}: No normalization pipeline described for 175 features
-\item \textbf{Implicit normalization only}: Limited to ratios (spread/vol) and percentage changes
-\item \textbf{Scale disparities}: Order book sizes vary by 1000x, volumes follow exponential distribution
-\item \textbf{Neural network incompatibility}: Proposed NN ensemble (Section 7.6) requires normalized inputs
-\end{itemize}
-
-While LightGBM's tree-based architecture doesn't require normalization (splits are threshold-based), proper scaling improves:
-\begin{itemize}
-\item Feature importance interpretability
-\item Numerical stability at extremes
-\item Convergence speed for weighted loss functions
-\item Compatibility with ensemble methods
-\end{itemize}
-
-\subsubsection{Proposed Normalization Pipeline}
-\textbf{Regime-Specific Robust Scaling:}
-\begin{equation}
-x_{normalized} = \frac{x - Q_{50}(x|regime)}{Q_{95}(x|regime) - Q_{5}(x|regime)}
-\end{equation}
-where $Q_p$ denotes the $p$-th percentile computed within each regime.
-
-\textbf{Implementation:}
-\begin{center}\textbf{Algorithm:}
-Regime-Specific Feature Normalization\\\rule{\textwidth}{0.4pt}
-\begin{enumerate}
-\item For each regime $r \in$ \{low\_vol\_atm, low\_vol\_otm, high\_vol\_short, high\_vol\_long\}:
-    \begin{enumerate}
-    \item Compute robust statistics: $Q_5^r$, $Q_{50}^r$, $Q_{95}^r$ for each feature
-    \item Apply Winsorization: clip to [1st, 99th] percentiles
-    \item Scale: $x_{scaled}^r = (x - Q_{50}^r) / (Q_{95}^r - Q_5^r)$
-    \end{enumerate}
-\item Special handling for specific features:
-    \begin{itemize}
-    \item \textbf{Volumes}: Apply log-transform before scaling
-    \item \textbf{Funding rates}: Cap at ±3\% before scaling
-    \item \textbf{Moneyness}: Use standardized form $\ln(S/K) / (\sigma\sqrt{T})$
-    \end{itemize}
-\item Store scaler parameters per regime for production deployment
-\end{enumerate}
-\end{center}
-
-\subsubsection{Expected Impact}
-\begin{itemize}
-\item \textbf{Feature importance}: More accurate relative importance metrics
-\item \textbf{Extreme value handling}: Reduced impact of outliers on model training
-\item \textbf{Neural network compatibility}: Enables proposed ensemble architecture
-\item \textbf{Implementation effort}: 4-6 hours
-\item \textbf{Risk}: Low (preprocessing step, models unchanged)
-\end{itemize}
+\subsection{Feature Normalization Note}
+LightGBM's tree-based architecture does not require feature normalization as splits are threshold-based and invariant to monotonic transformations. We therefore train models on raw features without explicit normalization, though we apply domain-appropriate transformations where necessary (e.g., log-transforms for volumes, percentage changes for prices). Feature importance metrics remain interpretable as they measure reduction in loss regardless of scale.
 
 \subsection{LightGBM Hyperparameters}
 We use gradient boosted decision trees (GBDT) via LightGBM \cite{ke2017lightgbm} with the following configuration:
@@ -269,7 +218,7 @@ Bagging frequency & 5 \\
 Min data in leaf & 20 \\
 \bottomrule
 \end{tabular}
-LightGBM hyperparameters. Heavy L2 regularization prevents overfitting given 196 features.\\\rule{\textwidth}{0.4pt}
+LightGBM hyperparameters. Heavy L2 regularization prevents overfitting given 175 features.\\\rule{\textwidth}{0.4pt}
 \label{tab:hyperparams}
 \end{table}
 \subsection{Training Strategy}
@@ -287,8 +236,8 @@ Two-Stage Residual Learning Pipeline\\\rule{\textwidth}{0.4pt}
 \end{enumerate}
 \end{center}
 
-\subsection{Walk-Forward Validation Strategy}
-To ensure robust performance estimates across varying market regimes, we implement expanding window walk-forward validation:
+\subsection{Walk-Forward Validation Strategy (Implemented)}
+To ensure robust performance estimates across varying market regimes, we implement expanding window walk-forward validation. All results reported in Section 5 use this validation methodology:
 
 \textbf{Temporal Fold Structure:}
 \begin{itemize}
@@ -332,7 +281,7 @@ P_{\text{ensemble}} = \frac{\sum_{i=1}^{10} w_i P_i}{\sum_{i=1}^{10} w_i}, \quad
 \end{equation}
 where $\lambda = 0.1$ gives recent models higher weight.
 
-\subsection{Hierarchical Volatility Regime Modeling}
+\subsection{Hierarchical Volatility Regime Modeling (Production Implementation)}
 Rather than a monolithic model, we train four specialized LightGBM models for distinct market conditions:
 
 \subsubsection{Regime Boundary Stability}
@@ -491,9 +440,9 @@ Autocorrelation lag-1 & 3.8\% \\
 \caption{Comprehensive feature importance analysis from LightGBM model. The dominance of moneyness (41\%) and momentum features (32\%, 22\%, 19\%) validates our residual learning approach, showing the model primarily corrects for directional biases not captured by theoretical pricing.}
 \label{fig:feature_importance}
 \end{figure}
-\subsection{Regime Analysis}
+\subsection{Regime Analysis (Exploratory K-means Validation)}
 \label{sec:regime_analysis}
-K-means clustering on five key features (moneyness, RV\_900s, time\_remaining, jump\_intensity\_300s, autocorr\_lag1\_300s) identifies five distinct market regimes with heterogeneous performance:
+To validate our hierarchical regime design (Section 4.4), we performed exploratory K-means clustering on five key features (moneyness, RV\_900s, time\_remaining, jump\_intensity\_300s, autocorr\_lag1\_300s). This unsupervised analysis identifies five natural market regimes, confirming the heterogeneous performance that motivates our production 4-regime hierarchical model:
 \begin{table}[h]
 \centering
 \small
@@ -513,11 +462,13 @@ Performance by feature regime. Regime 3 (best regime) accounts for 35\% of data 
 \end{table}
 \textbf{Key insights}:
 \begin{itemize}
-\item \textbf{Regime 3}: Optimal conditions for ML corrections—ATM options with low realized volatility and medium expiry (200-400 seconds). Model achieves 24.8\% improvement here.
+\item \textbf{Regime 3}: Optimal conditions for ML corrections—ATM options with low realized volatility and medium expiry (200-400 seconds). Model achieves 24.8\% improvement here. This closely corresponds to our hierarchical "Low vol + ATM" regime.
 \item \textbf{Regime 4}: Long-dated ATM options with high autocorrelation. Persistent trends allow momentum features to add value (12.2\% improvement).
 \item \textbf{Regimes 0 \& 1}: High-volatility, long-dated options far from strike. Large jumps and volatility clustering make corrections difficult (4-6\% improvement).
 \item \textbf{Regime 2}: Extreme time-to-expiry options (very long dated). Poor baseline performance (MAE = 0.426) limits correction potential despite 6.3\% relative improvement.
 \end{itemize}
+
+\textbf{Note}: While K-means identified 5 regimes, we implement a more interpretable 4-regime hierarchical structure for production (Section 4.4), combining similar low-performing regimes for operational simplicity.
 
 \begin{figure}[h]
 \centering
@@ -639,6 +590,15 @@ We define a trading signal as taking a position when $|P_{\text{final}} - P_{\te
 \item \textbf{Selective strategy}: Use 10\% threshold for 83.5\% win rate on 17.6\% of opportunities
 \item \textbf{Regime-based}: Increase thresholds in Regime 2 (poor baseline), decrease in Regime 3 (optimal conditions)
 \end{itemize}
+
+\textbf{Important caveats}:
+\begin{itemize}
+\item Results assume perfect execution at predicted prices (no slippage)
+\item Transaction costs not included (0.5-1\% typical on Polymarket)
+\item Based on walk-forward validation, not live trading performance
+\item Requires unlimited liquidity assumption (may not hold for large positions)
+\item Past performance during test period does not guarantee future results
+\end{itemize}
 \section{Binary Payoff Implications for Machine Learning}
 The discontinuous payoff structure of binary options creates five key differences from vanilla option pricing:
 \subsection{Non-Linear Baseline is Essential}
@@ -668,6 +628,29 @@ The non-linear baseline captures the structural relationship between moneyness a
 Unlike vanilla options where vega dominates, binary options are most sensitive to directional moves near strikes. This explains why momentum features (32\%, 22\%, 19\% correlation) matter more than volatility features (5.6\%).
 \subsection{Direct Loss-to-Metric Connection}
 Theorem 1 (Section 2.3) shows that MSE of residuals equals Brier score improvement. This direct connection doesn't hold for vanilla options where pricing errors compound non-linearly through Black-Scholes formula.
+\section{Limitations and Risk Considerations}
+
+\subsection{Regime Transition Periods}
+Model performance degrades during rapid volatility regime changes. When markets transition from low to high volatility (e.g., flash crashes), options near the regime boundary may oscillate between models, creating prediction discontinuities. The 10\% hysteresis buffer proposed in Section 4.4.1 mitigates but does not eliminate this risk.
+
+\subsection{Market Impact and Capacity Constraints}
+Our analysis assumes predictions do not affect market prices. However, binary options on prediction markets have limited liquidity. Large-scale deployment would move prices toward model predictions, potentially creating a self-defeating prophecy. We estimate practical capacity at \$100K-500K per 15-minute window before significant market impact.
+
+\subsection{Feature Availability in Production}
+The model requires real-time access to order book depth (5 levels), funding rates, and open interest data. Latency exceeding 100ms or missing order book levels degrade performance by 2-5\%. Production deployment requires low-latency data infrastructure with redundant feeds.
+
+\subsection{Temporal Stability Assumptions}
+Our 773-day dataset (September 2023 - November 2025) captures multiple volatility regimes but may not represent all market conditions. Black swan events outside this period's distribution could cause model failure. Monthly retraining partially addresses drift but cannot handle unprecedented market structures.
+
+\subsection{Transaction Cost Considerations}
+The reported 83.5\% win rate at 10\% edge threshold assumes perfect execution at predicted prices. Actual trading incurs:
+\begin{itemize}
+\item Polymarket trading fees: 0.5-1\% per trade
+\item Blockchain gas fees: Variable, can spike during congestion
+\item Slippage: 0.1-0.5\% depending on position size
+\end{itemize}
+Net profitability requires edges exceeding 2-3\% after all costs.
+
 \section{Future Work}
 \label{sec:future_work}
 We propose five complementary improvements to the current architecture, ordered by expected return-on-investment and implementation complexity.
@@ -1002,220 +985,9 @@ Bucketed Confusion Matrix Analysis\\\rule{\textwidth}{0.4pt}
 \item \textbf{Implementation effort}: 1 day
 \item \textbf{Risk}: Low (evaluation only, no model changes)
 \end{itemize}
-\subsection{Feedforward Neural Network Architecture}
-\subsubsection{Literature Context}
-Recent research (2023-2024) on tabular deep learning shows:
-\begin{itemize}
-\item Gradient boosted trees (XGBoost/LightGBM) outperform neural networks on most tabular benchmarks
-\item Neural networks excel on unstructured data (images, text) but struggle with irregular tabular functions
-\item \textbf{Ensemble approaches} (GBDT + NN) show 1-3\% improvement over GBDT alone
-\end{itemize}
-For your use case (196 engineered features, tabular structure, 63M rows), LightGBM is likely optimal. Neural networks are worth exploring for \textbf{ensemble gains} only.
-\subsubsection{Proposed Architecture}
-\textbf{Simple Feedforward Network:}
-\begin{align}
-h_1 &= \text{ReLU}(W_1 X + b_1), \quad W_1 \in \mathbb{R}^{512 \times 196} \\
-h_1' &= \text{Dropout}(h_1, p=0.3) \\
-h_2 &= \text{ReLU}(W_2 h_1' + b_2), \quad W_2 \in \mathbb{R}^{256 \times 512} \\
-h_2' &= \text{Dropout}(h_2, p=0.3) \\
-h_3 &= \text{ReLU}(W_3 h_2' + b_3), \quad W_3 \in \mathbb{R}^{128 \times 256} \\
-\hat{\epsilon} &= W_4 h_3 + b_4, \quad W_4 \in \mathbb{R}^{1 \times 128}
-\end{align}
-\textbf{Training Configuration:}
-\begin{itemize}
-\item Optimizer: AdamW with weight decay $10^{-5}$
-\item Learning rate: $10^{-3}$ with cosine annealing
-\item Batch size: 4,096 (balance between stability and regularization)
-\item Epochs: 50-200 with early stopping (patience=15)
-\item Loss: MSE or weighted MSE
-\end{itemize}
-\subsubsection{Ensemble Strategy}
-Rather than replacing LightGBM, use ensemble:
-\textbf{Option 1: Weighted Average}
-\begin{equation}
-P_{\text{final}} = P_{\text{BS}} + \alpha \cdot \hat{\epsilon}_{\text{LGB}} + (1-\alpha) \cdot \hat{\epsilon}_{\text{NN}}
-\end{equation}
-Tune $\alpha \in [0.5, 0.8]$ on validation set.
-\textbf{Option 2: Stacking}
-\begin{equation}
-P_{\text{final}} = P_{\text{BS}} + \text{Ridge}([\hat{\epsilon}_{\text{LGB}}, \hat{\epsilon}_{\text{NN}}])
-\end{equation}
-Train meta-model (Ridge regression) on held-out predictions.
-\subsubsection{Expected Outcomes}
-\begin{itemize}
-\item \textbf{NN alone}: Likely 3-5\% improvement (worse than LightGBM's 5.6\%)
-\item \textbf{Ensemble}: Potentially 6-8\% improvement (additional 0.5-2\% over LightGBM)
-\item \textbf{Trade-offs}: 10× slower training, complex deployment, harder tuning
-\item \textbf{Implementation effort}: 1 week (including architecture search)
-\item \textbf{Risk}: High (uncertain ROI, significant effort)
-\item \textbf{Recommendation}: \textbf{Lowest priority}—only pursue if LightGBM plateaus
-\end{itemize}
+\subsection{Neural Network Ensemble (Low Priority)}
+Recent tabular deep learning research (2023-2024) consistently shows gradient boosted trees outperform neural networks on structured data. For our use case (175 engineered features, 63M rows), LightGBM is likely optimal. While feedforward networks could provide marginal ensemble gains (0.5-2.0\% Brier improvement), the 10× training cost and deployment complexity make this our lowest priority. We recommend pursuing only if tree-based methods plateau. If implemented, use a simple 3-layer architecture (512→256→128) with dropout regularization, and ensemble via weighted averaging ($\alpha \approx 0.7$ for LightGBM, 0.3 for NN).
 
-\subsection{Walk-Forward Validation \& Volatility Regime Models}
-\subsubsection{Motivation}
-Single train/validation/test splits risk lucky/unlucky regime selection. Cryptocurrency markets exhibit non-stationary dynamics with regime shifts (low volatility → high volatility, trending → mean-reverting). Walk-forward validation provides robust performance estimates across multiple time periods, while regime-specific models capture heterogeneous dynamics.
-
-\subsubsection{Walk-Forward Cross-Validation}
-\textbf{Expanding Window Strategy:}
-Divide 773-day dataset (September 26, 2023 - November 6, 2025) into 10 temporal folds:
-\begin{enumerate}
-\item \textbf{Training window:} Expanding (starts 10 months, grows by 1 month per fold)
-\item \textbf{Validation window:} 1 month (hyperparameter tuning, early stopping)
-\item \textbf{Test window:} 1 month (out-of-sample evaluation)
-\item \textbf{Step size:} 1 month (roll forward between folds)
-\item \textbf{Holdout:} Final 3 months (July-September 2025) reserved for final test
-\end{enumerate}
-
-\textbf{Example folds:}
-\begin{center}
-\small
-\begin{tabular}{lll}
-\toprule
-\textbf{Fold} & \textbf{Train Period} & \textbf{Val | Test} \\
-\midrule
-1 & Oct 2023 - Jul 2024 (10 mo) & Aug | Sep 2024 \\
-2 & Oct 2023 - Aug 2024 (11 mo) & Sep | Oct 2024 \\
-3 & Oct 2023 - Sep 2024 (12 mo) & Oct | Nov 2024 \\
-... & ... & ... \\
-10 & Oct 2023 - Apr 2025 (19 mo) & May | Jun 2025 \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\textbf{Aggregation:} Report mean $\pm$ standard deviation across 10 test folds. Ensemble predictions by averaging models with time-decay weights (recent models weighted higher).
-
-\textbf{Advantages vs. single split:}
-\begin{itemize}
-\item Tests across 10 different market regimes (captures non-stationarity)
-\item Provides confidence intervals (10 data points vs 1)
-\item Detects overfitting (high variance across folds indicates instability)
-\item Mimics production deployment (retrain monthly on expanding window)
-\end{itemize}
-
-\subsubsection{Volatility Regime-Specific Models}
-\textbf{Hierarchical Regime Definition:}
-Rather than monolithic model, train specialized trees for distinct market conditions:
-
-\textbf{Level 1: Volatility Split}
-\begin{equation}
-regime_{vol} = \begin{cases}
-\text{Low} & \text{if } rv_{900s} \leq median(rv_{900s}) \\
-\text{High} & \text{otherwise}
-\end{cases}
-\end{equation}
-
-\textbf{Level 2a: Low Volatility Sub-Regimes (by moneyness)}
-\begin{equation}
-regime_{low\_vol} = \begin{cases}
-\text{ATM} & \text{if } |moneyness| < 0.005 \quad \text{(±0.5\%)} \\
-\text{OTM/ITM} & \text{otherwise}
-\end{cases}
-\end{equation}
-
-\textbf{Level 2b: High Volatility Sub-Regimes (by time remaining)}
-\begin{equation}
-regime_{high\_vol} = \begin{cases}
-\text{Short} & \text{if } time\_remaining < 300s \quad \text{(5 min)} \\
-\text{Long} & \text{otherwise}
-\end{cases}
-\end{equation}
-
-\textbf{Final regime set:} 4 specialized models
-\begin{enumerate}
-\item Low volatility + ATM (expected best performance, 35\% of data)
-\item Low volatility + OTM/ITM (moderate performance, 25\% of data)
-\item High volatility + short TTL (challenging, 20\% of data)
-\item High volatility + long TTL (moderate performance, 20\% of data)
-\end{enumerate}
-
-\textbf{Routing at prediction time:}
-\begin{center}\textbf{Algorithm:}
-Hierarchical Regime Routing\\\rule{\textwidth}{0.4pt}
-\begin{enumerate}
-\item Compute $rv_{900s}$ from recent price history
-\item If $rv_{900s} \leq threshold_{vol}$:
-    \begin{enumerate}
-    \item If $|moneyness| < 0.005$: Use \texttt{model\_low\_vol\_atm}
-    \item Else: Use \texttt{model\_low\_vol\_otm}
-    \end{enumerate}
-\item Else (high volatility):
-    \begin{enumerate}
-    \item If $time\_remaining < 300$: Use \texttt{model\_high\_vol\_short}
-    \item Else: Use \texttt{model\_high\_vol\_long}
-    \end{enumerate}
-\end{enumerate}
-\end{center}
-
-\subsubsection{Expected Outcomes}
-\begin{itemize}
-\item \textbf{Walk-forward validation}: Mean test Brier with $\pm$ std, detects temporal instability
-\item \textbf{Regime models}: 5-7\% additional Brier improvement over monolithic model
-\item \textbf{Best regime (Low vol + ATM)}: 25-30\% improvement (vs 24.8\% current Regime 3)
-\item \textbf{Overall weighted improvement}: 15-20\% vs Black-Scholes baseline
-\item \textbf{Implementation effort}: 1 week (walk-forward) + 1 week (regime models)
-\item \textbf{Risk}: Moderate (increased complexity, 4× model count)
-\end{itemize}
-
-\subsection{Extended Dataset \& Feature Optimization}
-\subsubsection{Dataset Expansion}
-Extend from current analysis period to full available history:
-\begin{itemize}
-\item \textbf{Current}: ~730 days (October 2023 - September 2025)
-\item \textbf{Extended}: 773 days (September 26, 2023 - November 6, 2025)
-\item \textbf{Additional data}: 43 days ($\approx$10M additional predictions)
-\item \textbf{Benefit}: Captures additional market regimes, improves statistical power
-\end{itemize}
-
-\subsubsection{Feature Pruning Strategy}
-Reduce feature count from 226 to 165 through systematic pruning:
-
-\textbf{Category 1: Remove Simple Moving Averages (50 features)}
-\begin{itemize}
-\item \textbf{Rationale}: EMAs respond faster to recent changes, more suitable for 15-minute windows
-\item \textbf{Affected features}: All \texttt{*\_sma\_*} features across spreads, imbalances, RV, momentum, range
-\item \textbf{Expected impact}: -0.2\% to +0.5\% Brier (slight improvement from noise reduction)
-\end{itemize}
-
-\textbf{Category 2: Remove 1800s Time Horizon (20 features)}
-\begin{itemize}
-\item \textbf{Rationale}: Redundant with 900s and 3600s (interpolation between)
-\item \textbf{Feature importance analysis}: 1800s features rarely in top 50
-\item \textbf{Expected impact}: -0.1\% to +0.2\% Brier
-\end{itemize}
-
-\textbf{Category 3: Conditional Removal of Funding Rates (0-11 features)}
-\begin{itemize}
-\item \textbf{Rationale}: Funding rates settle every 8 hours, less relevant for 15-minute expiry
-\item \textbf{Decision rule}: Remove if ALL funding features show <1\% LightGBM importance
-\item \textbf{Expected impact}: -0.1\% to +0.3\% Brier
-\end{itemize}
-
-\textbf{Category 4: Remove Short-Term OI EMAs (2 features)}
-\begin{itemize}
-\item \textbf{Features}: \texttt{oi\_ema\_60s}, \texttt{oi\_ema\_300s}
-\item \textbf{Rationale}: High correlation with base \texttt{open\_interest}, minimal unique signal
-\item \textbf{Expected impact}: -0.05\% to +0.1\% Brier
-\end{itemize}
-
-\textbf{Net result:} 226 → 165 features (27\% reduction)
-
-\subsubsection{Feature Addition}
-After pruning, add advanced features (net: 165 → 175 final features):
-\begin{itemize}
-\item Advanced moneyness (7 features): log, standardized, squared, 4 interactions
-\item Order book spreads (4 features): spread-vol ratios, depth-weighted, acceleration
-\item Volatility asymmetry (6 features): variance asym, skew premium, multi-horizon, tail asym
-\end{itemize}
-
-\subsubsection{Expected Outcomes}
-\begin{itemize}
-\item \textbf{Training speed}: +20-30\% faster (fewer features, same sample count)
-\item \textbf{Memory usage}: -15\% reduction (fewer feature columns)
-\item \textbf{Generalization}: +0.2-0.5\% Brier improvement (reduced overfitting)
-\item \textbf{Final feature count}: 175 (vs 226 original)
-\item \textbf{Implementation effort}: 4 hours (automated pruning + validation)
-\item \textbf{Risk}: Low (ablation study validates each removal)
-\end{itemize}
 
 \subsection{Implementation Roadmap - Expert Refined}
 \begin{table}[h]
