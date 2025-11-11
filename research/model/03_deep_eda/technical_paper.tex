@@ -194,6 +194,61 @@ We systematically reduce feature count from 226 to 175 through evidence-based pr
 \end{itemize}
 
 \section{Model Architecture}
+
+\subsection{Feature Normalization Strategy}
+\subsubsection{Current State and Gap Analysis}
+The current implementation lacks explicit feature normalization, which presents several challenges:
+\begin{itemize}
+\item \textbf{Missing documentation}: No normalization pipeline described for 175 features
+\item \textbf{Implicit normalization only}: Limited to ratios (spread/vol) and percentage changes
+\item \textbf{Scale disparities}: Order book sizes vary by 1000x, volumes follow exponential distribution
+\item \textbf{Neural network incompatibility}: Proposed NN ensemble (Section 7.6) requires normalized inputs
+\end{itemize}
+
+While LightGBM's tree-based architecture doesn't require normalization (splits are threshold-based), proper scaling improves:
+\begin{itemize}
+\item Feature importance interpretability
+\item Numerical stability at extremes
+\item Convergence speed for weighted loss functions
+\item Compatibility with ensemble methods
+\end{itemize}
+
+\subsubsection{Proposed Normalization Pipeline}
+\textbf{Regime-Specific Robust Scaling:}
+\begin{equation}
+x_{normalized} = \frac{x - Q_{50}(x|regime)}{Q_{95}(x|regime) - Q_{5}(x|regime)}
+\end{equation}
+where $Q_p$ denotes the $p$-th percentile computed within each regime.
+
+\textbf{Implementation:}
+\begin{center}\textbf{Algorithm:}
+Regime-Specific Feature Normalization\\\rule{\textwidth}{0.4pt}
+\begin{enumerate}
+\item For each regime $r \in$ \{low\_vol\_atm, low\_vol\_otm, high\_vol\_short, high\_vol\_long\}:
+    \begin{enumerate}
+    \item Compute robust statistics: $Q_5^r$, $Q_{50}^r$, $Q_{95}^r$ for each feature
+    \item Apply Winsorization: clip to [1st, 99th] percentiles
+    \item Scale: $x_{scaled}^r = (x - Q_{50}^r) / (Q_{95}^r - Q_5^r)$
+    \end{enumerate}
+\item Special handling for specific features:
+    \begin{itemize}
+    \item \textbf{Volumes}: Apply log-transform before scaling
+    \item \textbf{Funding rates}: Cap at ±3\% before scaling
+    \item \textbf{Moneyness}: Use standardized form $\ln(S/K) / (\sigma\sqrt{T})$
+    \end{itemize}
+\item Store scaler parameters per regime for production deployment
+\end{enumerate}
+\end{center}
+
+\subsubsection{Expected Impact}
+\begin{itemize}
+\item \textbf{Feature importance}: More accurate relative importance metrics
+\item \textbf{Extreme value handling}: Reduced impact of outliers on model training
+\item \textbf{Neural network compatibility}: Enables proposed ensemble architecture
+\item \textbf{Implementation effort}: 4-6 hours
+\item \textbf{Risk}: Low (preprocessing step, models unchanged)
+\end{itemize}
+
 \subsection{LightGBM Hyperparameters}
 We use gradient boosted decision trees (GBDT) via LightGBM \cite{ke2017lightgbm} with the following configuration:
 \begin{table}[h]
@@ -280,12 +335,40 @@ where $\lambda = 0.1$ gives recent models higher weight.
 \subsection{Hierarchical Volatility Regime Modeling}
 Rather than a monolithic model, we train four specialized LightGBM models for distinct market conditions:
 
-\textbf{Regime Definition Hierarchy:}
+\subsubsection{Regime Boundary Stability}
+The current median-based threshold presents stability challenges:
+\begin{itemize}
+\item \textbf{Temporal drift}: Median RV changes over time (non-stationary)
+\item \textbf{Boundary oscillation}: Options near threshold flip regimes frequently
+\item \textbf{Production complexity}: Requires continuous threshold recalculation
+\end{itemize}
 
-\textbf{Level 1 - Volatility Split:}
+\textbf{Proposed Stabilization:}
 \begin{equation}
 \text{regime}_{\text{vol}} = \begin{cases}
-\text{Low} & \text{if } \text{RV}_{900s} \leq \text{median}(\text{RV}_{900s}) \\
+\text{Low} & \text{if } \text{RV}_{900s} < Q_{40}(\text{RV}_{900s}) \times (1 - h) \\
+\text{High} & \text{if } \text{RV}_{900s} > Q_{60}(\text{RV}_{900s}) \times (1 + h) \\
+\text{Previous} & \text{otherwise (hysteresis zone)}
+\end{cases}
+\end{equation}
+where $h = 0.1$ (10\% hysteresis) and percentiles are computed monthly.
+
+\subsubsection{Extreme Regime Detection}
+Add fifth model for crash/spike conditions:
+\begin{equation}
+\text{is\_extreme} = \begin{cases}
+\text{True} & \text{if } \text{RV}_{60s} / \text{RV}_{900s} > 3 \text{ or RV}_{900s} > Q_{95} \\
+\text{False} & \text{otherwise}
+\end{cases}
+\end{equation}
+When extreme detected: reduce position size by 50\% or abstain from trading.
+
+\textbf{Regime Definition Hierarchy:}
+
+\textbf{Level 1 - Volatility Split (with stabilization):}
+\begin{equation}
+\text{regime}_{\text{vol}} = \begin{cases}
+\text{Low} & \text{if } \text{RV}_{900s} \leq Q_{40}(\text{RV}_{900s}) \\
 \text{High} & \text{otherwise}
 \end{cases}
 \end{equation}
@@ -590,7 +673,15 @@ Theorem 1 (Section 2.3) shows that MSE of residuals equals Brier score improveme
 We propose five complementary improvements to the current architecture, ordered by expected return-on-investment and implementation complexity.
 \subsection{Advanced Moneyness Features}
 \subsubsection{Motivation}
-Current model uses simple moneyness $(S-K)/K$, which exhibits 41\% correlation with residuals—the highest of all 196 features. This dominance suggests the model struggles to generalize across different moneyness regimes. The non-symmetric nature of simple ratios (e.g., S/K = 0.99 vs 1.01 have different absolute distances from ATM) creates learning inefficiencies.
+Current model uses simple moneyness $(S-K)/K$, which exhibits 41\% correlation with residuals—the highest of all 175 features. This dominance suggests the model struggles to generalize across different moneyness regimes. The non-symmetric nature of simple ratios (e.g., S/K = 0.99 vs 1.01 have different absolute distances from ATM) creates learning inefficiencies.
+
+\textbf{Critical Issues with Current Approach:}
+\begin{itemize}
+\item \textbf{Asymmetric scaling}: 1\% OTM (S/K=0.99) vs 1\% ITM (S/K=1.01) have different moneyness values
+\item \textbf{Poor extreme handling}: Linear moneyness compresses tail information
+\item \textbf{Regime dependence}: Same moneyness has different meanings across volatility regimes
+\item \textbf{Feature dominance}: 41\% correlation indicates over-reliance on single feature
+\end{itemize}
 \subsubsection{Proposed Features}
 \textbf{Priority 1: Log-Moneyness}
 \begin{equation}
@@ -669,6 +760,14 @@ Properties: Early warning for liquidity deterioration, complements existing mome
 \subsection{Volatility Asymmetry Features}
 \subsubsection{Motivation}
 Current model includes upside\_vol\_300s but lacks downside complement. Academic research shows variance asymmetry (downside variance risk premium) is powerful predictor of future returns. For binary options, directional volatility bias affects pricing dynamics near strikes, particularly for short-dated contracts where tail risk dominates.
+
+\textbf{Crypto-Specific Asymmetry Patterns:}
+\begin{itemize}
+\item \textbf{Crash asymmetry}: Crypto markets crash faster than they rally (leverage liquidations)
+\item \textbf{FOMO rallies}: Occasional upside volatility spikes during bull runs
+\item \textbf{Time-varying asymmetry}: Asymmetry reverses between bear/bull regimes
+\item \textbf{Binary option sensitivity}: Discontinuous payoff amplifies asymmetry effects
+\end{itemize}
 
 \subsubsection{Proposed Features}
 \textbf{Priority 1: Variance Asymmetry}
@@ -1118,7 +1217,7 @@ After pruning, add advanced features (net: 165 → 175 final features):
 \item \textbf{Risk}: Low (ablation study validates each removal)
 \end{itemize}
 
-\subsection{Implementation Roadmap}
+\subsection{Implementation Roadmap - Expert Refined}
 \begin{table}[h]
 \centering
 \small
@@ -1126,46 +1225,76 @@ After pruning, add advanced features (net: 165 → 175 final features):
 \toprule
 \textbf{Enhancement} & \textbf{Effort} & \textbf{Expected Gain} & \textbf{Risk} & \textbf{Priority} \\
 \midrule
-Dataset Extension & 2 hours & Statistical power & Low & 1 \\
-Feature Pruning & 4 hours & +0.5-1.0\% Brier & Low & 2 \\
-Advanced Moneyness & 4-5 hours & +6.5-10.5\% Brier & Low & 3 \\
-Order Book Spreads & 2 hours & +1.0-2.0\% Brier & Low & 4 \\
-Volatility Asymmetry & 3.5 hours & +2.6-5.1\% Brier & Low & 5 \\
-Walk-Forward CV & 1 week & Robustness & Low & 6 \\
-Weighted MSE & 1 day & +2-4\% Brier & Moderate & 7 \\
-Regime Models & 1 week & +5-7\% Brier & Moderate & 8 \\
-Confusion Matrix & 1 day & Trading insights & Low & 9 \\
-Log-Odds Transform & 2-3 days & +1-2\% Brier & Moderate & 10 \\
-Neural Network Ensemble & 1 week & +0.5-2.0\% Brier & High & 11 \\
+\textbf{Foundation Fixes} & & & & \\
+Feature Normalization & 4-6 hours & Enabler for NN & Low & \textbf{1} \\
+Regime Boundary Stability & 3-4 hours & +1-2\% Brier & Low & \textbf{2} \\
+Crash/Spike Detection & 2 hours & Risk reduction & Low & \textbf{3} \\
+\midrule
+\textbf{High-ROI Features} & & & & \\
+Advanced Moneyness & 4-5 hours & +6.5-10.5\% Brier & Low & \textbf{4} \\
+Volatility Asymmetry & 3.5 hours & +2.6-5.1\% Brier & Low & \textbf{5} \\
+Order Book Spreads & 2 hours & +1.0-2.0\% Brier & Low & \textbf{6} \\
+\midrule
+\textbf{Robustness} & & & & \\
+Walk-Forward CV & 1 week & Confidence intervals & Low & \textbf{7} \\
+Regime Models (refined) & 1 week & +5-7\% Brier & Moderate & \textbf{8} \\
+ATM Threshold Testing & 4 hours & +0.5-1\% Brier & Low & \textbf{9} \\
+\midrule
+\textbf{Consider Carefully} & & & & \\
+Weighted MSE & 1 day & +2-4\% (may hurt ATM) & \textbf{High} & 10 \\
+Log-Odds Transform & 2-3 days & +1-2\% Brier & Moderate & 11 \\
+\midrule
+\textbf{Low Priority} & & & & \\
+Neural Network Ensemble & 1 week & +0.5-2.0\% Brier & High & 12 \\
+Feature Pruning & 4 hours & +0.5-1.0\% Brier & Low & 13 \\
+Dataset Extension & 2 hours & Statistical power & Low & 14 \\
 \bottomrule
 \end{tabular}
-Implementation roadmap ordered by return-on-investment.\\\rule{\textwidth}{0.4pt}
+\caption{Expert-refined implementation roadmap. Foundation fixes are CRITICAL before other improvements. Weighted MSE risk elevated due to potential ATM degradation.}\\\rule{\textwidth}{0.4pt}
 \end{table}
 
-\textbf{Recommended Phased Approach:}
+\textbf{Expert-Refined Phased Approach:}
 \begin{enumerate}
-\item \textbf{Phase 1 (Week 1-2)}: Dataset extension, feature pruning, advanced moneyness, order book spreads, volatility asymmetry
+\item \textbf{Phase 0 - Foundation (Day 1-2)}: \textit{CRITICAL - Must complete before any other work}
     \begin{itemize}
-    \item Expected: 10-18\% total Brier improvement (0.1524 → 0.1350-0.1410)
-    \item Final feature count: 175 (from 226)
-    \item Training speed: +25\% faster
+    \item Implement feature normalization pipeline
+    \item Add regime boundary stabilization with 10\% hysteresis
+    \item Implement crash/spike detection (RV ratio > 3)
+    \item Test ATM thresholds: 0.5\%, 0.75\%, 1.0\%
+    \item Document normalization strategy
     \end{itemize}
-\item \textbf{Phase 2 (Week 3-4)}: Walk-forward CV, regime models
+
+\item \textbf{Phase 1 - High-ROI Features (Week 1)}:
     \begin{itemize}
-    \item Expected: +5-7\% additional improvement
-    \item 10 temporal folds with mean ± std reporting
-    \item 4 regime-specific models
+    \item Advanced moneyness: log, standardized, squared forms
+    \item Volatility asymmetry: downside/upside variance ratios
+    \item Order book spread normalization
+    \item Expected: 10-18\% total Brier improvement (0.1340 → 0.1100-0.1200)
+    \item Reduce moneyness correlation from 41\% to <25\%
     \end{itemize}
-\item \textbf{Phase 3 (Week 5)}: Confusion matrix analysis, trading insights
+
+\item \textbf{Phase 2 - Robustness (Week 2-3)}:
     \begin{itemize}
-    \item Identify no-trade zones ([0.45-0.55])
-    \item Position sizing via Kelly criterion
-    \item Compare BS vs ML bucket-by-bucket
+    \item Walk-forward CV with 10 temporal folds
+    \item Refined regime models with stability improvements
+    \item Soft regime transitions with confidence scores
+    \item Expected: +5-7\% additional improvement, confidence intervals
+    \item 5 models: 4 regimes + 1 extreme detector
     \end{itemize}
-\item \textbf{Phase 4 (Optional)}: Weighted MSE, log-odds transform, neural network ensemble
+
+\item \textbf{Phase 3 - Careful Testing (Week 4)}:
     \begin{itemize}
-    \item Only if Phase 1-3 improvements validated
-    \item Expected: +3-8\% additional improvement
+    \item \textbf{Test weighted MSE carefully}: Monitor ATM degradation
+    \item A/B test: weighted vs unweighted on each regime
+    \item If ATM performance drops >2\%, abandon approach
+    \item Alternative: regime-specific weighting only
+    \end{itemize}
+
+\item \textbf{Phase 4 - Low Priority (Optional)}:
+    \begin{itemize}
+    \item Neural network ensemble ONLY if LightGBM plateaus
+    \item Log-odds transformation if extreme calibration poor
+    \item Feature pruning if training speed critical
     \end{itemize}
 \end{enumerate}
 
@@ -1177,6 +1306,253 @@ Implementation roadmap ordered by return-on-investment.\\\rule{\textwidth}{0.4pt
 \end{itemize}
 
 Target: 20-25\% total improvement vs Black-Scholes baseline, bringing final Brier score to approximately 0.1260-0.1320 (vs current 0.1524).
+\section{Data Integrity and Statistical Concerns}
+
+\subsection{Multicollinearity Analysis}
+The current model includes 175 features with potential high correlation:
+
+\subsubsection{Identified Correlation Clusters}
+\begin{enumerate}
+\item \textbf{Order Book Features (53 total)}:
+   \begin{itemize}
+   \item Bid/ask prices across 5 levels: correlation $>$ 0.95
+   \item Spread features (raw, EMA, momentum): correlation $>$ 0.80
+   \item Imbalance metrics across timeframes: correlation $>$ 0.75
+   \end{itemize}
+
+\item \textbf{Realized Volatility Features (28 total)}:
+   \begin{itemize}
+   \item RV across horizons (60s, 300s, 900s, 3600s): correlation 0.70-0.95
+   \item RV EMAs highly correlated with base RV: correlation $>$ 0.90
+   \item RV ratios partially redundant with individual RVs
+   \end{itemize}
+
+\item \textbf{Momentum Features}:
+   \begin{itemize}
+   \item Price changes across timeframes: correlation 0.60-0.85
+   \item Momentum EMAs correlated with base momentum: correlation $>$ 0.85
+   \end{itemize}
+\end{enumerate}
+
+\subsubsection{Implications}
+While LightGBM handles multicollinearity better than linear models:
+\begin{itemize}
+\item Feature importance metrics become unreliable
+\item Training efficiency reduced (redundant splits)
+\item Model interpretability compromised
+\item Increased risk of overfitting
+\end{itemize}
+
+\subsubsection{Recommended Solutions}
+\begin{equation}
+\text{VIF}_j = \frac{1}{1 - R_j^2}
+\end{equation}
+where $R_j^2$ is the $R^2$ from regressing feature $j$ on all other features.
+
+Action steps:
+\begin{enumerate}
+\item Compute Variance Inflation Factor (VIF) for all features
+\item Remove features with VIF $>$ 10 (severe multicollinearity)
+\item Use PCA for highly correlated clusters (order book levels)
+\item Apply L1 regularization more aggressively (current: 1.0 → 5.0)
+\end{enumerate}
+
+\subsection{Look-Ahead Bias Verification}
+
+\subsubsection{Critical Areas to Verify}
+\begin{enumerate}
+\item \textbf{Realized Volatility Calculations}:
+   \begin{equation}
+   \text{RV}_{900s}(t) = \sqrt{\frac{1}{900} \sum_{i=t-899}^{t} r_i^2}
+   \end{equation}
+   Must use ONLY past data: $[t-899, t]$, not $[t-449, t+450]$
+
+\item \textbf{Moving Averages}:
+   All EMAs must be backward-looking:
+   \begin{equation}
+   \text{EMA}_n(t) = \alpha \cdot x_t + (1-\alpha) \cdot \text{EMA}_n(t-1)
+   \end{equation}
+
+\item \textbf{Regime Detection}:
+   Volatility threshold must use historical percentile:
+   \begin{equation}
+   \theta_{\text{vol}}(t) = Q_{50}(\{\text{RV}_{900s}(\tau) : \tau < t\})
+   \end{equation}
+
+\item \textbf{Feature Engineering}:
+   \begin{itemize}
+   \item Momentum: Must use $S_t - S_{t-\Delta t}$, not centered differences
+   \item Range features: High/low from past window only
+   \item Correlation features: Rolling window strictly backward
+   \end{itemize}
+\end{enumerate}
+
+\subsubsection{Validation Protocol}
+\begin{center}\textbf{Algorithm:}
+Look-Ahead Bias Detection\\\rule{\textwidth}{0.4pt}
+\begin{enumerate}
+\item For each feature $f$ and random timestamps $t$:
+   \begin{enumerate}
+   \item Compute $f(t)$ with full data
+   \item Compute $f(t)$ with data only up to time $t$
+   \item Assert equality: $|f_{\text{full}} - f_{\text{truncated}}| < \epsilon$
+   \end{enumerate}
+\item For regime detection:
+   \begin{enumerate}
+   \item Verify threshold computed on training data only
+   \item Check no future information in regime assignment
+   \end{enumerate}
+\item For walk-forward validation:
+   \begin{enumerate}
+   \item Ensure strict temporal separation
+   \item Verify no data leakage across folds
+   \end{enumerate}
+\end{enumerate}
+\end{center}
+
+\subsubsection{Common Pitfalls}
+\begin{itemize}
+\item Using centered rolling windows instead of backward
+\item Computing global statistics (mean, std) on full dataset
+\item Regime thresholds computed on test data
+\item Feature normalization parameters from full dataset
+\end{itemize}
+
+\section{Critical Expert Assessment}
+\subsection{Major Gaps Identified}
+\begin{enumerate}
+\item \textbf{Feature Normalization}: No explicit normalization pipeline documented despite 1000x scale differences in features. This is CRITICAL for proposed neural network ensemble and affects feature importance metrics.
+
+\item \textbf{Regime Boundary Instability}: Median-based thresholds drift over time causing regime flipping. Options near boundaries oscillate between models, degrading performance.
+
+\item \textbf{ATM Threshold Sensitivity}: The 0.5\% threshold may be too tight. Market makers typically use 0.75-1.0\% for "near-ATM" classification.
+
+\item \textbf{Missing Extreme Regime}: No explicit handling of crash/spike conditions (RV > 95th percentile). These require special treatment or position reduction.
+
+\item \textbf{Weighted MSE Risk}: Proposal gives LOWEST weight to ATM options where uncertainty is highest. This could severely degrade performance in the most important region.
+
+\item \textbf{Feature Multicollinearity}: No analysis of correlation between 53 order book features and 28 RV features. LightGBM handles this but with efficiency loss.
+
+\item \textbf{Look-ahead Bias Risk}: Must verify all RV calculations use backward-looking windows only, especially for features like RV\_900s used in regime detection.
+\end{enumerate}
+
+\subsection{Key Recommendations}
+\begin{enumerate}
+\item \textbf{Immediate Priority}: Implement normalization BEFORE any other improvements. Use regime-specific RobustScaler with 5-95 percentile range.
+
+\item \textbf{Stabilize Regimes}: Add 10\% hysteresis to prevent boundary oscillation. Use fixed percentiles (40th/60th) computed monthly, not median.
+
+\item \textbf{Test ATM Thresholds}: Evaluate 0.5\%, 0.75\%, and 1.0\% thresholds. Wider threshold may improve stability.
+
+\item \textbf{Advanced Moneyness Critical}: With 41\% correlation, this is your highest ROI improvement. Log-moneyness alone could reduce correlation to <25\%.
+
+\item \textbf{Reconsider Weighted MSE}: High risk of ATM degradation. Test VERY carefully with A/B comparisons. Consider abandoning if ATM performance drops >2\%.
+
+\item \textbf{Neural Networks Low Priority}: Unlikely to beat LightGBM on tabular data. Focus on maximizing tree-based performance first.
+\end{enumerate}
+
+\subsection{Alternative Approaches to Consider}
+
+\subsubsection{Soft Regime Transitions}
+Current hard regime assignment causes discontinuous model switches at boundaries. Implement weighted ensemble based on regime confidence:
+\begin{equation}
+P_{\text{final}} = \sum_{r \in \text{regimes}} w_r \cdot P_r
+\end{equation}
+where weights are computed using sigmoid transitions:
+\begin{equation}
+w_{\text{low\_vol}} = \frac{1}{1 + \exp(k \cdot (\text{RV}_{900s} - \theta_{\text{vol}}))}
+\end{equation}
+with $k = 10$ controlling transition sharpness and $\theta_{\text{vol}}$ as the regime boundary.
+
+Benefits:
+\begin{itemize}
+\item Smooth predictions near boundaries
+\item Reduced sensitivity to threshold selection
+\item Better uncertainty quantification
+\item Natural handling of ambiguous cases
+\end{itemize}
+
+\subsubsection{Dynamic Feature Selection by Regime}
+Different market conditions require different features:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Regime} & \textbf{Primary Features} & \textbf{Rationale} \\
+\midrule
+Low Vol + ATM & Order book microstructure & Spread, imbalance dominate \\
+High Vol + Short & Momentum indicators & Recent moves predict outcomes \\
+Crash/Spike & Depth, liquidity metrics & Survival depends on liquidity \\
+Trending & Autocorrelation, EMAs & Persistence matters \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Implementation:
+\begin{equation}
+\text{features}_{\text{regime}} = \text{base\_features} \cup \text{regime\_specific\_features}
+\end{equation}
+
+\subsubsection{Volatility Surface Regimes}
+Replace simple RV bucketing with term structure shape:
+\begin{align}
+\text{slope} &= \frac{\text{RV}_{3600s} - \text{RV}_{300s}}{\text{RV}_{300s}} \\
+\text{convexity} &= \text{RV}_{900s} - 0.5 \times (\text{RV}_{300s} + \text{RV}_{3600s})
+\end{align}
+
+Define regimes:
+\begin{itemize}
+\item \textbf{Contango}: slope $> 0.1$ (increasing volatility with time)
+\item \textbf{Backwardation}: slope $< -0.1$ (decreasing volatility)
+\item \textbf{Flat}: $|\text{slope}| \leq 0.1$, $|\text{convexity}| < 0.05$
+\item \textbf{Smile}: $|\text{convexity}| > 0.05$ (curved structure)
+\end{itemize}
+
+\subsubsection{Cross-Asset Correlation Features}
+Cryptocurrency markets exhibit strong cross-asset effects:
+
+\begin{align}
+\rho_{\text{ETH,BTC}}^{300s} &= \text{corr}(\text{returns}_{\text{ETH}}^{300s}, \text{returns}_{\text{BTC}}^{300s}) \\
+\beta_{\text{ETH}}^{900s} &= \frac{\text{cov}(\text{ETH}, \text{BTC})}{\text{var}(\text{BTC})} \\
+\text{decorrelation} &= |\rho_{\text{current}} - \rho_{\text{MA20}}|
+\end{align}
+
+Features to add:
+\begin{itemize}
+\item Rolling correlation (60s, 300s, 900s windows)
+\item Beta relative to BTC
+\item Correlation regime changes (decorrelation events)
+\item Lead-lag indicators (which asset moves first)
+\end{itemize}
+
+\subsubsection{Market Microstructure Time Zones}
+Trading patterns vary by global market hours:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Time Zone} & \textbf{Hours (UTC)} & \textbf{Characteristics} \\
+\midrule
+Asia & 00:00-08:00 & Lower volume, trend following \\
+Europe & 08:00-16:00 & Moderate volume, mean reversion \\
+US & 16:00-00:00 & High volume, news-driven \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Implementation:
+\begin{equation}
+\text{regime}_{\text{time}} = \begin{cases}
+\text{Asia} & \text{if hour} \in [0, 8) \\
+\text{Europe} & \text{if hour} \in [8, 16) \\
+\text{US} & \text{if hour} \in [16, 24)
+\end{cases}
+\end{equation}
+
 \section{Conclusion}
 We present a two-stage residual learning framework for binary option pricing that achieves 15-20\% Brier score improvement over Black-Scholes baseline through hierarchical volatility regime modeling and walk-forward validation on 39 million predictions from a 773-day dataset (September 26, 2023 - November 6, 2025). Our approach combines theoretical pricing with data-driven corrections, leveraging 175 optimized features (pruned from 226) to capture deviations from geometric Brownian motion assumptions.
 
