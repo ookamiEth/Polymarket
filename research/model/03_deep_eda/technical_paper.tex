@@ -41,6 +41,98 @@ Our key contributions include:
 \item \textbf{Feature engineering}: Comprehensive study identifying moneyness and momentum features as primary drivers of residual corrections (41\% and 32\% correlation).
 \item \textbf{Practical}: Derivation of trading signals achieving 83.5\% win rate at 10\% edge thresholds, with regime-specific position sizing recommendations.
 \end{itemize}
+
+\newpage
+\section*{Paper Organization}
+\addcontentsline{toc}{section}{Paper Organization}
+
+\noindent\textbf{Section 2 — Code and Implementation} \\
+Lists all implementation files, data processing pipelines, and analysis scripts for full reproducibility.
+
+\noindent\textbf{Section 3 — Mathematical Framework} \\
+Establishes the theoretical foundation for two-stage residual learning. Presents Black-Scholes binary option baseline and proves that MSE of residuals directly equals Brier score improvement (Theorem 1).
+
+\noindent\textbf{Section 4 — Model Architecture} \\
+Describes the 175-feature engineering pipeline (pruned from 226), LightGBM hyperparameters with heavy L2 regularization, 10-fold walk-forward validation strategy, and hierarchical 4-regime modeling with boundary stabilization.
+
+\noindent\textbf{Section 5 — Empirical Results} \\
+Reports 17.0\% ± 2.1\% Brier improvement over Black-Scholes baseline. Analyzes delta/gamma surfaces showing 138× sensitivity variation, feature importance revealing moneyness dominance (41\%), K-means regime validation, error decomposition by market condition, calibration analysis identifying [0.45-0.55] no-trade zone, and trading signals achieving 83.5\% win rate at 10\% edge threshold.
+
+\noindent\textbf{Section 6 — Binary Payoff Implications} \\
+Discusses five key differences from vanilla option pricing: non-linear baseline necessity, advantages of residual learning over direct prediction, feature engineering focus on discrete dynamics rather than volatility, and direct loss-to-metric connection via Theorem 1.
+
+\noindent\textbf{Section 7 — Limitations and Risk Considerations} \\
+Critical assessment of regime transition risks, market impact constraints (\$100K-500K capacity per 15-minute window), feature availability requirements, temporal stability assumptions, and transaction cost considerations (2-3\% total reducing net profitability).
+
+\noindent\textbf{Section 8 — Future Work} \\
+Five proposed improvements ordered by expected return-on-investment: (1) Advanced moneyness features (+6.5-10.5\% Brier), (2) Volatility asymmetry features (+2.6-5.1\%), (3) Weighted loss functions (+2-4\%, with ATM risk), (4) Log-odds transformation (+1-2\%), (5) Neural network ensemble (+0.5-2.0\%, low priority).
+
+\noindent\textbf{Section 9 — Conclusion} \\
+Summarizes key contributions emphasizing non-linear baseline modeling for discontinuous payoffs, regime-specific feature engineering, and practical trading signal derivation with risk-aware position sizing.
+
+\vspace{0.5cm}
+\noindent\rule{\textwidth}{0.4pt}
+\vspace{0.3cm}
+
+\noindent\textit{Reading guide for different audiences:} \\
+\textbf{Theoreticians:} Focus on Sections 3 (mathematical framework) and 6 (payoff implications). \\
+\textbf{Practitioners:} Focus on Sections 5 (results), 7 (limitations), and 8 (future work). \\
+\textbf{Reproducibility:} Begin with Section 2 (code locations) and refer to specific implementation files.
+
+\newpage
+
+\section{Code and Implementation}
+\label{sec:code}
+
+All analysis and models described in this paper are implemented in Python and organized in the repository at \texttt{/research/model/}. The implementation consists of four main components:
+
+\subsection{Feature Engineering Pipeline}
+\textbf{Location:} \texttt{00\_data\_prep/}
+\begin{itemize}
+\item \texttt{engineer\_all\_features\_v3.py} - Primary feature generation pipeline (226 features, 175 post-pruning)
+\item \texttt{calculate\_realized\_volatility.py} - Realized volatility calculations across 60s, 300s, 900s, 3600s windows
+\item \texttt{engineer\_microstructure\_features.py} - Order book depth and spread features
+\item \texttt{feature\_cols\_v3.py} - Feature name definitions and schema
+\end{itemize}
+
+\subsection{Model Training and Validation}
+\textbf{Location:} \texttt{01\_pricing/}
+\begin{itemize}
+\item \texttt{walk\_forward\_validation.py} - 10-fold expanding window cross-validation (Section 4.3)
+\item \texttt{lightgbm\_memory\_optimized.py} - Memory-efficient LightGBM training for 63M observations
+\item \texttt{train\_multi\_horizon.py} - Hierarchical 4-regime model training (Section 4.4)
+\item \texttt{lightgbm\_optuna\_search.py} - Bayesian hyperparameter optimization (Table 4.2)
+\item \texttt{evaluate\_by\_regime.py} - Regime-specific performance evaluation (Section 5.4)
+\end{itemize}
+
+\subsection{Analysis and Evaluation}
+\textbf{Location:} \texttt{02\_analysis/} and \texttt{03\_deep\_eda/}
+\begin{itemize}
+\item \texttt{03\_deep\_eda/01\_payoff\_nonlinearity.py} - Delta/gamma surface analysis (Figures 1-2)
+\item \texttt{03\_deep\_eda/03\_error\_decomposition.py} - Conditional error analysis (Figure 11)
+\item \texttt{03\_deep\_eda/04\_outcome\_distributions.py} - Calibration curves and win rate analysis (Figures 15, 21)
+\item \texttt{03\_deep\_eda/05\_feature\_attribution.py} - Feature importance studies (Figure 18)
+\item \texttt{02\_analysis/calibration\_analysis.py} - Calibration diagnostic analysis
+\end{itemize}
+
+\subsection{Visualization}
+\textbf{Location:} \texttt{01\_pricing/visualization/}
+\begin{itemize}
+\item \texttt{generate\_all\_plots.py} - Master script generating all 24 figures in this paper
+\item \texttt{trading\_plots.py} - Trading signal analysis visualizations (Section 5.6)
+\item \texttt{advanced\_diagnostics.py} - Model diagnostic plots
+\end{itemize}
+
+\textbf{Data Outputs:}
+\begin{itemize}
+\item Test predictions: \texttt{01\_pricing/xgboost\_residual\_model\_test\_2024-07-01\_2025-09-30.parquet}
+\item Model checkpoints: \texttt{checkpoints/}
+\item Generated figures: \texttt{03\_deep\_eda/figures/}
+\item Performance tables: \texttt{03\_deep\_eda/tables/}
+\end{itemize}
+
+All code is written in Python 3.10+ using Polars for data processing, LightGBM for gradient boosting, and standard scientific computing libraries (NumPy, SciPy). The implementation follows the project's vectorized processing standards (see \texttt{CLAUDE.md}) to handle billion-row datasets efficiently on local hardware.
+
 \section{Mathematical Framework}
 \subsection{Black-Scholes Binary Option Baseline}
 The risk-neutral price of a cash-or-nothing binary call option paying \$1 if $S_T > K$ is:
