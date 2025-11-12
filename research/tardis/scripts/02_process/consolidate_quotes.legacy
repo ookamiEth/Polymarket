@@ -4,11 +4,6 @@ Space-efficient options quote consolidation pipeline.
 
 Streams CSV.gz → 1s sampled directly, avoiding large intermediate files.
 Optimized for systems with limited disk space.
-
-OPTIMIZED VERSION: Maximum parallelization for 32 vCPU machines.
-- Parallel batch processing (30 workers, aggressive RAM usage)
-- Polars-native k-way merge (uses all 32 cores)
-- Expected speedup: 6-10x faster than sequential version
 """
 
 import argparse
@@ -18,7 +13,6 @@ import os
 import sys
 import time
 from collections.abc import Iterator
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -26,14 +20,7 @@ from typing import Any, Optional
 import polars as pl
 import pyarrow.parquet as pq
 
-# Set Polars to use all available cores
-os.environ.setdefault("POLARS_MAX_THREADS", "32")
-os.environ.setdefault("POLARS_STREAMING", "1")
-
 logger = logging.getLogger(__name__)
-
-# Maximum workers for parallel batch processing (20 × 5GB = 100GB, safe for 256GB machine)
-MAX_BATCH_WORKERS = 20
 
 
 @dataclass(order=True)
@@ -116,8 +103,7 @@ class ParquetBatchReader:
                 self.exhausted = True
                 return
 
-            # Simple and fast conversion to dicts
-            # This is actually faster than Arrow iteration for small chunks
+            # Convert to list of dicts
             self.current_chunk = df_chunk.to_dicts()
             self.chunk_idx = 0
             self.total_rows_read += len(self.current_chunk)
@@ -162,162 +148,13 @@ def sample_batch_to_1s(df: pl.DataFrame) -> pl.DataFrame:
     return df_1s
 
 
-def deduplicate_in_chunks(
-    input_path: Path,
-    output_path: Path,
-    chunk_size: int = 10_000_000,
-) -> int:
-    """Deduplicate sorted parquet file in chunks to avoid OOM.
-
-    Processes the file in chunks, removing duplicates within each chunk
-    and handling cross-chunk duplicates by tracking the last key.
-
-    FIXED: Now writes chunks to separate files to avoid O(n²) behavior.
-
-    Args:
-        input_path: Path to sorted parquet file with duplicates
-        output_path: Path for deduplicated output
-        chunk_size: Number of rows to process at once (default 10M)
-
-    Returns:
-        Total number of unique rows written
-    """
-    logger.info(f"Deduplicating {input_path} in chunks of {chunk_size:,} rows...")
-
-    # Track last seen key for cross-chunk deduplication
-    last_key: Optional[tuple[int, str]] = None
-    total_rows_read = 0
-    total_rows_written = 0
-    duplicates_removed = 0
-
-    # Track chunk files for final merge
-    chunk_files: list[Path] = []
-
-    # First, get total row count for progress reporting
-    total_rows = pl.scan_parquet(input_path).select(pl.len()).collect().item()
-    logger.info(f"Total rows to process: {total_rows:,}")
-
-    # Process first chunk
-    offset = 0
-    chunk_df = pl.scan_parquet(input_path).slice(offset, chunk_size).collect()
-
-    if len(chunk_df) == 0:
-        logger.warning("Input file is empty")
-        return 0
-
-    # Deduplicate first chunk
-    chunk_dedup = chunk_df.unique(subset=["timestamp_seconds", "symbol"], keep="first")
-
-    # Write first chunk to its own file
-    chunk_file = output_path.parent / "dedup_chunk_0000.parquet"
-    chunk_dedup.write_parquet(chunk_file, compression="snappy")
-    chunk_files.append(chunk_file)
-
-    # Track last key
-    last_row = chunk_dedup.tail(1)
-    last_key = (last_row["timestamp_seconds"][0], last_row["symbol"][0])
-
-    total_rows_read = len(chunk_df)
-    total_rows_written = len(chunk_dedup)
-    duplicates_removed = len(chunk_df) - len(chunk_dedup)
-
-    logger.info(
-        f"Chunk 1: Read {len(chunk_df):,}, wrote {len(chunk_dedup):,}, removed {len(chunk_df) - len(chunk_dedup):,} duplicates"
-    )
-
-    # Process remaining chunks
-    offset = chunk_size
-    chunk_num = 2
-
-    while offset < total_rows:
-        # Read next chunk
-        chunk_df = pl.scan_parquet(input_path).slice(offset, chunk_size).collect()
-
-        if len(chunk_df) == 0:
-            break
-
-        # Remove duplicates within chunk
-        chunk_dedup = chunk_df.unique(subset=["timestamp_seconds", "symbol"], keep="first")
-
-        # Handle cross-chunk duplicates
-        if last_key is not None:
-            # Check if first row matches last key from previous chunk
-            first_row = chunk_dedup.head(1)
-            if len(first_row) > 0:
-                first_key = (first_row["timestamp_seconds"][0], first_row["symbol"][0])
-                if first_key == last_key:
-                    # Skip the duplicate first row
-                    chunk_dedup = chunk_dedup.slice(1, len(chunk_dedup))
-
-        if len(chunk_dedup) > 0:
-            # Write to separate chunk file (O(1) instead of O(n))
-            chunk_file = output_path.parent / f"dedup_chunk_{chunk_num - 1:04d}.parquet"
-            chunk_dedup.write_parquet(chunk_file, compression="snappy")
-            chunk_files.append(chunk_file)
-
-            # Update last key
-            last_row = chunk_dedup.tail(1)
-            last_key = (last_row["timestamp_seconds"][0], last_row["symbol"][0])
-
-            total_rows_written += len(chunk_dedup)
-
-        total_rows_read += len(chunk_df)
-        duplicates_removed += len(chunk_df) - len(chunk_dedup)
-
-        # Progress reporting
-        progress = (offset / total_rows) * 100
-        logger.info(
-            f"Chunk {chunk_num}: Progress {progress:.1f}%, "
-            f"read {total_rows_read:,}, wrote {total_rows_written:,}, "
-            f"removed {duplicates_removed:,} duplicates"
-        )
-
-        offset += chunk_size
-        chunk_num += 1
-
-    # Combine all chunk files in ONE operation (O(n) instead of O(n²))
-    if len(chunk_files) > 0:
-        if len(chunk_files) == 1:
-            # Only one chunk, just rename it
-            logger.info("Only one chunk, moving to final output...")
-            chunk_files[0].rename(output_path)
-        else:
-            # Multiple chunks, combine them
-            logger.info(f"Combining {len(chunk_files)} deduplicated chunks into final output...")
-            lazy_chunks = [pl.scan_parquet(f) for f in chunk_files]
-            combined = pl.concat(lazy_chunks)
-            combined.sink_parquet(str(output_path), compression="snappy")
-
-            # Clean up chunk files
-            logger.info("Cleaning up temporary chunk files...")
-            for chunk_file in chunk_files:
-                try:
-                    chunk_file.unlink()
-                except Exception as e:
-                    logger.warning(f"Failed to delete chunk file {chunk_file}: {e}")
-
-    logger.info("=" * 80)
-    logger.info("Deduplication complete:")
-    logger.info(f"  Total rows read: {total_rows_read:,}")
-    logger.info(f"  Total rows written: {total_rows_written:,}")
-    logger.info(f"  Duplicates removed: {duplicates_removed:,}")
-    if total_rows_read > 0:
-        logger.info(f"  Reduction: {(duplicates_removed / total_rows_read * 100):.1f}%")
-    logger.info("=" * 80)
-
-    return total_rows_written
-
-
-def kway_merge_batches_streaming_final(
+def kway_merge_batches_streaming(
     batch_files: list[Path],
     output_path: Path,
     chunk_size: int = 100_000,
     reader_chunk_size: int = 10_000,
 ) -> int:
-    """Merge k sorted Parquet files using heap-based streaming merge (memory-safe).
-
-    Used for final merge of intermediate groups to avoid OOM.
-    Memory usage: O(k) where k = number of files (constant ~1GB).
+    """Merge k sorted Parquet files using heap-based streaming merge with deduplication.
 
     Args:
         batch_files: List of sorted Parquet batch files to merge
@@ -328,7 +165,7 @@ def kway_merge_batches_streaming_final(
     Returns:
         Total number of rows written to output file
     """
-    logger.info(f"Heap-based streaming merge of {len(batch_files)} files (memory-safe)...")
+    logger.info(f"Initializing k-way merge for {len(batch_files)} batch files...")
     logger.info(f"Reader chunk size: {reader_chunk_size:,} rows")
     logger.info(f"Output buffer size: {chunk_size:,} rows")
 
@@ -368,6 +205,7 @@ def kway_merge_batches_streaming_final(
     logger.info(f"Initial heap size: {len(heap)} entries")
 
     # Initialize PyArrow streaming writer
+    # We'll create the schema from the first row
     first_entry = heap[0] if heap else None
     if first_entry is None:
         raise ValueError("No data to merge")
@@ -448,7 +286,7 @@ def kway_merge_batches_streaming_final(
     throughput = total_rows_written / merge_elapsed if merge_elapsed > 0 else 0
 
     logger.info("=" * 80)
-    logger.info("Heap-based streaming merge complete:")
+    logger.info("K-way merge complete:")
     logger.info(f"  Total rows processed: {rows_processed:,}")
     logger.info(f"  Total rows written: {total_rows_written:,}")
     logger.info(f"  Duplicates removed: {duplicates_skipped:,}")
@@ -459,159 +297,10 @@ def kway_merge_batches_streaming_final(
     return total_rows_written
 
 
-def kway_merge_batches_polars(batch_files: list[Path], output_path: Path, memory_mode: str = "balanced") -> int:
-    """Merge k sorted Parquet files.
-
-    Since the batch files are ALREADY SORTED by (timestamp_seconds, symbol),
-    we don't need to re-sort them. Just use heap merge which:
-    - Maintains sort order
-    - Deduplicates on-the-fly
-    - Uses constant memory (~1-2GB)
-
-    Memory modes (kept for compatibility but all use heap merge now):
-    - 'safe': Heap merge with smaller buffers
-    - 'balanced': Heap merge with moderate buffers
-    - 'aggressive': Heap merge with larger buffers
-
-    Args:
-        batch_files: List of sorted Parquet batch files to merge
-        output_path: Path for merged output Parquet file
-        memory_mode: Memory profile to use ('safe', 'balanced', 'aggressive')
-
-    Returns:
-        Total number of rows written to output file
-    """
-    logger.info(f"Merging {len(batch_files)} pre-sorted batch files...")
-    logger.info(f"Memory mode: {memory_mode}")
-    logger.info("Using heap merge (files are already sorted, no need to re-sort!)")
-
-    # Choose buffer sizes based on memory mode
-    if memory_mode == "aggressive":
-        chunk_size = 500_000  # 500K output buffer
-        reader_chunk_size = 50_000  # 50K per reader
-        logger.info("Using aggressive buffer sizes for faster I/O")
-    elif memory_mode == "balanced":
-        chunk_size = 200_000  # 200K output buffer
-        reader_chunk_size = 20_000  # 20K per reader
-        logger.info("Using balanced buffer sizes")
-    else:  # safe
-        chunk_size = 100_000  # 100K output buffer
-        reader_chunk_size = 10_000  # 10K per reader
-        logger.info("Using conservative buffer sizes for minimal memory")
-
-    start_time = time.time()
-
-    # Use the heap merge directly - it handles everything!
-    # This function:
-    # 1. Maintains sorted order (heap property)
-    # 2. Deduplicates on-the-fly (checks for consecutive duplicates)
-    # 3. Uses constant memory (only buffers in flight)
-    # 4. Streams output to disk
-    total_rows = kway_merge_batches_streaming_final(
-        batch_files=batch_files,
-        output_path=output_path,
-        chunk_size=chunk_size,
-        reader_chunk_size=reader_chunk_size,
-    )
-
-    elapsed = time.time() - start_time
-    throughput = total_rows / elapsed if elapsed > 0 else 0
-
-    logger.info("=" * 80)
-    logger.info("Heap merge complete:")
-    logger.info(f"  Total rows written: {total_rows:,} (deduplicated)")
-    logger.info(f"  Total time: {elapsed:.1f}s")
-    logger.info(f"  Average throughput: {throughput:,.0f} rows/sec")
-    logger.info(f"  Memory usage: ~{(reader_chunk_size * 26 * 200) / (1024**3):.1f}GB constant")
-    logger.info("=" * 80)
-
-    return total_rows
-
-
-def _process_single_batch(
-    batch_idx: int,
-    batch_csv_files: list[Path],
-    checkpoint_path: Path,
-    num_batches: int,
-    schema_overrides: dict[str, type],
-) -> tuple[Path, int, int]:
-    """Process a single batch of CSV files (helper for parallel execution).
-
-    Args:
-        batch_idx: Batch index
-        batch_csv_files: List of CSV files in this batch
-        checkpoint_path: Directory for intermediate files
-        num_batches: Total number of batches (for logging)
-        schema_overrides: Schema overrides for CSV reading
-
-    Returns:
-        Tuple of (batch_file_path, raw_rows, sampled_rows)
-    """
-    batch_file_path = checkpoint_path / f"batch_1s_{batch_idx:04d}.parquet"
-
-    # Skip if batch already processed
-    if batch_file_path.exists():
-        logger.info(f"Batch {batch_idx + 1}/{num_batches}: Using cached {batch_file_path.name}")
-        cached_df = pl.read_parquet(batch_file_path)
-        return (batch_file_path, 0, len(cached_df))
-
-    logger.info(f"Batch {batch_idx + 1}/{num_batches}: Processing {len(batch_csv_files)} files")
-
-    # Read batch files lazily
-    lazy_dfs = []
-    for csv_file in batch_csv_files:
-        try:
-            lazy_df = pl.scan_csv(csv_file, schema_overrides=schema_overrides)
-            lazy_dfs.append(lazy_df)
-        except Exception as e:
-            logger.warning(f"  Failed to read {csv_file.name}: {e}")
-
-    if len(lazy_dfs) == 0:
-        logger.warning(f"  No valid files in batch {batch_idx + 1}, skipping")
-        return (batch_file_path, 0, 0)
-
-    # Combine batch
-    logger.info(f"  Combining {len(lazy_dfs)} files...")
-    batch_combined = pl.concat(lazy_dfs)
-
-    # Collect batch (load into memory)
-    logger.info("  Collecting batch...")
-    batch_start = time.time()
-    batch_df = batch_combined.collect()
-    collect_elapsed = time.time() - batch_start
-
-    batch_raw_rows = len(batch_df)
-    logger.info(f"  Collected {batch_raw_rows:,} rows in {collect_elapsed:.1f}s")
-
-    # Sample to 1-second immediately (reduces size ~50%)
-    logger.info("  Sampling to 1-second granularity...")
-    sample_start = time.time()
-    batch_1s = sample_batch_to_1s(batch_df)
-    sample_elapsed = time.time() - sample_start
-
-    batch_sampled_rows = len(batch_1s)
-    reduction_pct = (1 - batch_sampled_rows / batch_raw_rows) * 100 if batch_raw_rows > 0 else 0
-
-    logger.info(f"  Sampled to {batch_sampled_rows:,} rows in {sample_elapsed:.1f}s ({reduction_pct:.1f}% reduction)")
-
-    # Free memory
-    del batch_df
-
-    # Write sampled batch
-    logger.info(f"  Writing {batch_file_path.name}...")
-    batch_1s.write_parquet(batch_file_path, compression="snappy")
-
-    batch_size_mb = batch_file_path.stat().st_size / (1024 * 1024)
-    logger.info(f"  Batch file size: {batch_size_mb:.1f} MB")
-
-    return (batch_file_path, batch_raw_rows, batch_sampled_rows)
-
-
 def consolidate_and_sample_batched(
     input_dir: str,
     batch_size: int = 30,
     checkpoint_dir: str = "checkpoints_1s_sampled",
-    memory_mode: str = "balanced",
 ) -> Path:
     """Consolidate CSV.gz files and sample to 1-second, using batch processing.
 
@@ -619,7 +308,6 @@ def consolidate_and_sample_batched(
         input_dir: Directory containing CSV.gz files
         batch_size: Number of files to process per batch (default: 30)
         checkpoint_dir: Directory for intermediate 1s-sampled batch files
-        memory_mode: Memory profile to use ('safe', 'balanced', 'aggressive')
 
     Returns:
         Path to the consolidated 1-second sampled Parquet file
@@ -659,36 +347,78 @@ def consolidate_and_sample_batched(
     total_raw_rows = 0
     total_sampled_rows = 0
 
-    # Prepare batch arguments for parallel processing
-    batch_args = []
     for batch_idx in range(num_batches):
         start_idx = batch_idx * batch_size
         end_idx = min(start_idx + batch_size, len(csv_files))
         batch_csv_files = csv_files[start_idx:end_idx]
-        batch_args.append((batch_idx, batch_csv_files, checkpoint_path, num_batches, schema_overrides))
 
-    # Process batches in parallel using ProcessPoolExecutor
-    logger.info(f"Using {MAX_BATCH_WORKERS} parallel workers for batch processing")
-    logger.info("=" * 80)
+        batch_file_path = checkpoint_path / f"batch_1s_{batch_idx:04d}.parquet"
 
-    with ProcessPoolExecutor(max_workers=MAX_BATCH_WORKERS) as executor:
-        # Submit all batch processing tasks
-        futures = {executor.submit(_process_single_batch, *args): args[0] for args in batch_args}
+        # Skip if batch already processed
+        if batch_file_path.exists():
+            logger.info(f"Batch {batch_idx + 1}/{num_batches}: Using cached {batch_file_path.name}")
+            batch_files.append(batch_file_path)
+            # Read to get row counts for summary
+            cached_df = pl.read_parquet(batch_file_path)
+            total_sampled_rows += len(cached_df)
+            continue
 
-        # Collect results as they complete
-        for future in as_completed(futures):
-            batch_idx = futures[future]
+        logger.info(
+            f"Batch {batch_idx + 1}/{num_batches}: Processing files {start_idx + 1}-{end_idx} ({len(batch_csv_files)} files)"
+        )
+
+        # Read batch files lazily
+        lazy_dfs = []
+        for csv_file in batch_csv_files:
             try:
-                batch_file_path, batch_raw_rows, batch_sampled_rows = future.result()
-                if batch_file_path.exists():
-                    batch_files.append(batch_file_path)
-                    total_raw_rows += batch_raw_rows
-                    total_sampled_rows += batch_sampled_rows
+                lazy_df = pl.scan_csv(csv_file, schema_overrides=schema_overrides)
+                lazy_dfs.append(lazy_df)
             except Exception as e:
-                logger.error(f"Batch {batch_idx + 1}/{num_batches} failed: {e}")
+                logger.warning(f"  Failed to read {csv_file.name}: {e}")
 
-    # Sort batch files by index (they may have completed out of order)
-    batch_files.sort()
+        if len(lazy_dfs) == 0:
+            logger.warning(f"  No valid files in batch {batch_idx + 1}, skipping")
+            continue
+
+        # Combine batch
+        logger.info(f"  Combining {len(lazy_dfs)} files...")
+        batch_combined = pl.concat(lazy_dfs)
+
+        # Collect batch (load into memory)
+        logger.info("  Collecting batch...")
+        batch_start = time.time()
+        batch_df = batch_combined.collect()
+        collect_elapsed = time.time() - batch_start
+
+        batch_raw_rows = len(batch_df)
+        total_raw_rows += batch_raw_rows
+        logger.info(f"  Collected {batch_raw_rows:,} rows in {collect_elapsed:.1f}s")
+
+        # Sample to 1-second immediately (reduces size ~50%)
+        logger.info("  Sampling to 1-second granularity...")
+        sample_start = time.time()
+        batch_1s = sample_batch_to_1s(batch_df)
+        sample_elapsed = time.time() - sample_start
+
+        batch_sampled_rows = len(batch_1s)
+        total_sampled_rows += batch_sampled_rows
+        reduction_pct = (1 - batch_sampled_rows / batch_raw_rows) * 100
+
+        logger.info(
+            f"  Sampled to {batch_sampled_rows:,} rows in {sample_elapsed:.1f}s ({reduction_pct:.1f}% reduction)"
+        )
+
+        # Free memory
+        del batch_df
+
+        # Write sampled batch
+        logger.info(f"  Writing {batch_file_path.name}...")
+        batch_1s.write_parquet(batch_file_path, compression="snappy")
+
+        batch_size_mb = batch_file_path.stat().st_size / (1024 * 1024)
+        logger.info(f"  Batch file size: {batch_size_mb:.1f} MB")
+
+        batch_files.append(batch_file_path)
 
     logger.info("=" * 80)
     logger.info("Batch processing complete:")
@@ -709,11 +439,12 @@ def consolidate_and_sample_batched(
     # Create a temporary output file for merged data
     merged_output = checkpoint_path / "merged_sorted_temp.parquet"
 
-    # Use Polars-native parallel merge with streaming and deduplication
-    total_merged_rows = kway_merge_batches_polars(
+    # Use k-way merge with streaming and deduplication
+    total_merged_rows = kway_merge_batches_streaming(
         batch_files=batch_files,
         output_path=merged_output,
-        memory_mode=memory_mode,
+        chunk_size=100_000,
+        reader_chunk_size=10_000,
     )
 
     merge_elapsed = time.time() - merge_start
@@ -1006,12 +737,6 @@ def main() -> None:
         help="Skip forward-fill stage (output 1s-sampled data only)",
     )
     parser.add_argument(
-        "--memory-mode",
-        choices=["safe", "balanced", "aggressive"],
-        default="balanced",
-        help="Memory profile: 'safe' (minimal), 'balanced' (default), 'aggressive' (high memory)",
-    )
-    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -1047,7 +772,6 @@ def main() -> None:
     logger.info(f"Checkpoint directory: {args.checkpoint_dir}")
     logger.info(f"Max fill gap: {args.max_fill_gap if args.max_fill_gap else 'unlimited'}")
     logger.info(f"Skip forward-fill: {args.skip_forward_fill}")
-    logger.info(f"Memory mode: {args.memory_mode}")
     logger.info("=" * 80)
 
     start_time = time.time()
@@ -1057,7 +781,6 @@ def main() -> None:
         args.input_dir,
         batch_size=args.batch_size,
         checkpoint_dir=args.checkpoint_dir,
-        memory_mode=args.memory_mode,
     )
 
     # Stage 3: Forward-fill gaps (optional)

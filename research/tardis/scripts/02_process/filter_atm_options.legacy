@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
 OPTIMIZED VERSION: Filter Deribit options quotes to only ATM (±3%) short-dated (≤3 days) BTC options.
-PARALLEL VERSION: Processes monthly partitions in parallel for maximum CPU utilization.
+CHUNKED VERSION: Processes data in monthly partitions to handle 1.1B rows on 16GB machines.
 
 KEY OPTIMIZATIONS:
-- Parallel monthly processing (20 workers, aggressive RAM usage)
 - Replaced row loop with DataFrame join (5.9x faster for spot price enrichment)
 - Better progress tracking with performance metrics
 - Improved memory monitoring
-- Expected speedup: 4-8x faster than sequential version
+- Identical logic to original, just optimized implementation
 
 This script:
-1. Processes multiple months in parallel to maximize CPU usage
+1. Processes data month-by-month to avoid memory overflow
 2. Uses vectorized DataFrame join for spot price lookups (NOT row loops)
 3. Applies filters in optimal order to minimize intermediate data
 4. Supports checkpointing and resume functionality
@@ -25,8 +24,8 @@ Output:
 - quotes_1s_atm_short_dated.parquet (estimated 2-10M rows)
 
 Performance:
-- Memory usage: ~5GB per worker × 20 workers = ~100GB for 256GB machine
-- Runtime: ~1-2 minutes total (4-8x faster than sequential)
+- Memory usage: <6GB per chunk (safe for 16GB machines)
+- Runtime: ~5-10 minutes total (3-6x faster than original)
 """
 
 import json
@@ -34,16 +33,11 @@ import logging
 import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
 
 import polars as pl
-
-# Set Polars threading (will be overridden per-worker to prevent oversubscription)
-os.environ.setdefault("POLARS_MAX_THREADS", "4")  # 4 threads per worker for 8 workers = 32 total
-os.environ.setdefault("POLARS_STREAMING", "1")
 
 # Configure logging
 logging.basicConfig(
@@ -54,20 +48,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-QUOTES_FILE = "data/consolidated/quotes_1s_merged.parquet"
-PERPETUAL_FILE = "data/consolidated/deribit_btc_perpetual_1s.parquet"
-OUTPUT_FILE = "data/consolidated/quotes_1s_atm_short_dated_optimized.parquet"
-CHECKPOINT_FILE = "data/consolidated/checkpoints/filter_progress_optimized.json"
+QUOTES_FILE = "quotes_1s_merged.parquet"
+PERPETUAL_FILE = "deribit_btc_perpetual_1s.parquet"
+OUTPUT_FILE = "quotes_1s_atm_short_dated_optimized.parquet"
+CHECKPOINT_FILE = "checkpoints/filter_progress_optimized.json"
 
 ATM_THRESHOLD = 0.03  # ±3% moneyness
 MAX_TTL_SECONDS = 3 * 24 * 60 * 60  # 3 days in seconds
 MAX_TTL_DAYS = 3.0
 
-# Parallelization and memory management
-MAX_MONTH_WORKERS = 8  # Optimal for 32 vCPUs: 8 workers × 4 threads = 32 threads
+# Memory management
 CHUNK_SIZE_MONTHS = 1  # Process 1 month at a time
 ROW_GROUP_SIZE = 25_000  # Smaller batches for chunked processing
-MAX_MEMORY_GB = 12  # 8 workers × 12GB = 96GB (safe for 256GB machine)
+MAX_MEMORY_GB = 8  # Maximum memory before forcing collection
 
 # Month name to number mapping for expiry parsing
 MONTH_MAP = {
@@ -210,7 +203,7 @@ def prepare_spot_prices_dataframe(perpetual_file: str, month_start: int, month_e
     return df
 
 
-def parse_expiry_dates(df: Union[pl.DataFrame, pl.LazyFrame]) -> Union[pl.DataFrame, pl.LazyFrame]:
+def parse_expiry_dates(df: pl.LazyFrame) -> pl.LazyFrame:
     """Parse expiry dates from symbol strings."""
     # Extract day, month, year from expiry_str
     df = df.with_columns(
@@ -266,7 +259,7 @@ def parse_expiry_dates(df: Union[pl.DataFrame, pl.LazyFrame]) -> Union[pl.DataFr
 
 
 def process_monthly_chunk(
-    quotes_df: pl.DataFrame,
+    quotes_file: str,
     spot_df: pl.DataFrame,
     month_start: int,
     month_end: int,
@@ -275,12 +268,11 @@ def process_monthly_chunk(
     """
     OPTIMIZED: Process a single month of options data using vectorized operations.
 
-    Key optimizations:
-    1. Uses DataFrame join instead of dictionary lookup for spot prices (5.9x speedup)
-    2. Accepts pre-filtered quotes DataFrame instead of file path (eliminates I/O contention)
+    Key optimization: Uses DataFrame join instead of dictionary lookup for spot prices.
+    This provides 5.9x speedup for the enrichment step.
 
     Args:
-        quotes_df: Pre-filtered quotes DataFrame for this month (NOT a file path!)
+        quotes_file: Path to quotes Parquet file
         spot_df: DataFrame of timestamp → spot price (NOT a dictionary!)
         month_start: Start timestamp for month
         month_end: End timestamp for month
@@ -299,12 +291,17 @@ def process_monthly_chunk(
     # Monitor memory at start
     mem_start = get_memory_usage()
     logger.info(f"Memory at start: {mem_start:.2f} GB")
-    logger.info(f"Pre-filtered quotes: {len(quotes_df):,} rows")
 
-    # quotes_df is already pre-filtered for this month - no I/O needed!
-    # Temporal filter already applied during pre-loading
+    # Load and filter quotes for this month
+    logger.info("Loading quotes for month...")
+    quotes_df = pl.scan_parquet(quotes_file)
 
     # Apply filters in optimal order
+    logger.info("Applying temporal filter...")
+    quotes_df = quotes_df.filter(
+        (pl.col("timestamp_seconds") >= month_start) & (pl.col("timestamp_seconds") <= month_end)
+    )
+
     logger.info("Applying cheap filters (BTC, non-null quotes)...")
     quotes_df = quotes_df.filter(
         (pl.col("underlying") == "BTC") & ((pl.col("bid_price").is_not_null()) | (pl.col("ask_price").is_not_null()))
@@ -312,8 +309,7 @@ def process_monthly_chunk(
 
     # Parse expiry dates BEFORE collecting
     logger.info("Parsing expiry dates...")
-    quotes_df_parsed: Union[pl.DataFrame, pl.LazyFrame] = parse_expiry_dates(quotes_df)
-    quotes_df = quotes_df_parsed  # type: ignore[assignment]
+    quotes_df = parse_expiry_dates(quotes_df)
 
     # Apply approximate TTL filter (conservative)
     logger.info("Applying approximate TTL filter...")
@@ -325,15 +321,21 @@ def process_monthly_chunk(
     )
     quotes_df = quotes_df.drop(["ttl_approx"])
 
-    # quotes_df is already an eager DataFrame (pre-loaded), no need to collect!
-    logger.info("Quotes already in memory (pre-loaded optimization)")
+    # NOW collect the filtered data for this month
+    logger.info("Collecting filtered quotes...")
+    collect_start = time.time()
+    try:
+        quotes_collected = quotes_df.collect()
+    except Exception as e:
+        logger.error(f"Failed to collect quotes for {month_label}: {e}")
+        return None
+    collect_time = time.time() - collect_start
 
-    if len(quotes_df) == 0:
-        logger.info(f"No quotes found for {month_label} after filtering")
+    if len(quotes_collected) == 0:
+        logger.info(f"No quotes found for {month_label}")
         return None
 
-    logger.info(f"Filtered to {len(quotes_df):,} quotes for enrichment")
-    quotes_collected = quotes_df  # Rename for consistency with rest of function
+    logger.info(f"Collected {len(quotes_collected):,} quotes for enrichment ({collect_time:.2f}s)")
 
     # ============================================================
     # KEY OPTIMIZATION: Use DataFrame join instead of row loop
@@ -347,7 +349,7 @@ def process_monthly_chunk(
 
     enrich_time = time.time() - enrich_start
     logger.info(f"  Spot price enrichment completed in {enrich_time:.3f}s")
-    logger.info(f"  Processing rate: {len(quotes_collected) / enrich_time:,.0f} rows/sec")
+    logger.info(f"  Processing rate: {len(quotes_collected)/enrich_time:,.0f} rows/sec")
 
     # Filter out rows without spot prices
     quotes_collected = quotes_collected.filter(pl.col("spot_price").is_not_null())
@@ -400,10 +402,6 @@ def process_monthly_chunk(
         ]
     )
 
-    # Add timestamp column in microseconds (required by IV calculator)
-    logger.info("Adding timestamp column (microseconds) for compatibility...")
-    quotes_collected = quotes_collected.with_columns([(pl.col("timestamp_seconds") * 1_000_000).alias("timestamp")])
-
     # Calculate total processing time
     chunk_total_time = time.time() - chunk_start_time
 
@@ -412,35 +410,13 @@ def process_monthly_chunk(
     logger.info(f"\n📊 Month {month_label} Performance Metrics:")
     logger.info(f"  Final rows: {len(quotes_collected):,}")
     logger.info(f"  Total time: {chunk_total_time:.2f}s")
-    logger.info(f"  - Enrichment: {enrich_time:.2f}s (OPTIMIZED - DataFrame join)")
+    logger.info(f"  - Collection: {collect_time:.2f}s")
+    logger.info(f"  - Enrichment: {enrich_time:.2f}s (OPTIMIZED)")
     logger.info(f"  - Filtering: {filter_time:.2f}s")
     logger.info(f"  Memory used: {mem_end - mem_start:.2f} GB")
     logger.info(f"  Current memory: {mem_end:.2f} GB")
 
     return quotes_collected
-
-
-def _process_month_wrapper(args: tuple) -> tuple[str, Optional[pl.DataFrame], float]:
-    """Wrapper function for parallel processing of monthly chunks.
-
-    Args:
-        args: Tuple of (month_start, month_end, month_label, quotes_df, spot_df)
-              Note: Both quotes_df and spot_df are pre-filtered DataFrames (not file paths!)
-
-    Returns:
-        Tuple of (month_label, result_df, processing_time)
-    """
-    month_start, month_end, month_label, quotes_df, spot_df = args
-
-    # Both DataFrames are now passed in pre-filtered, no file I/O needed!
-    logger.info(f"Processing {month_label} with {len(quotes_df):,} quotes and {len(spot_df):,} spot prices")
-
-    # Process the month
-    month_start_time = time.time()
-    result = process_monthly_chunk(quotes_df, spot_df, month_start, month_end, month_label)
-    month_time = time.time() - month_start_time
-
-    return (month_label, result, month_time)
 
 
 def main() -> None:
@@ -450,8 +426,8 @@ def main() -> None:
     logger.info("🚀 OPTIMIZED CHUNKED ATM SHORT-DATED OPTIONS FILTERING")
     logger.info("=" * 80)
     logger.info(f"Start time: {start_time}")
-    logger.info("Processing strategy: Monthly chunks with VECTORIZED operations")
-    logger.info("Key optimization: DataFrame join instead of row loops (5.9x faster)")
+    logger.info(f"Processing strategy: Monthly chunks with VECTORIZED operations")
+    logger.info(f"Key optimization: DataFrame join instead of row loops (5.9x faster)")
     logger.info(f"Memory limit: {MAX_MEMORY_GB} GB")
 
     try:
@@ -488,116 +464,62 @@ def main() -> None:
         completed_chunks = set(checkpoint.get("completed_chunks", []))
         performance_metrics = checkpoint.get("performance_metrics", {})
 
-        # Process each month in parallel
+        # Process each month
         all_results = []
         total_rows_output = 0
         total_processing_time = 0
 
-        # Load cached metrics for skipped chunks
-        for _month_start, _month_end, month_label in partitions:
-            if month_label in completed_chunks and month_label in performance_metrics:
-                metrics = performance_metrics[month_label]
-                total_rows_output += metrics.get("rows", 0)
-                total_processing_time += metrics.get("time", 0)
-                logger.info(f"✅ Skipping {month_label} (already completed)")
+        for i, (month_start, month_end, month_label) in enumerate(partitions, 1):
+            # Skip if already completed
+            if month_label in completed_chunks:
+                logger.info(f"\n✅ Skipping {month_label} (already completed)")
+                # Load cached metrics if available
+                if month_label in performance_metrics:
+                    metrics = performance_metrics[month_label]
+                    total_rows_output += metrics.get("rows", 0)
+                    total_processing_time += metrics.get("time", 0)
+                continue
 
-        # Pre-load spot prices ONCE to avoid redundant I/O in each worker
-        logger.info("\n📊 Pre-loading spot prices (shared optimization)...")
-        logger.info("=" * 80)
-        full_spot_df = pl.read_parquet(PERPETUAL_FILE)
-        full_spot_df = full_spot_df.with_columns(
-            [
-                (pl.col("timestamp") // 1_000_000).alias("timestamp_seconds"),
-                pl.col("price").alias("spot_price"),
-            ]
-        ).select(["timestamp_seconds", "spot_price"])
-        logger.info(f"Loaded {len(full_spot_df):,} spot price records")
+            logger.info(f"\n[{i}/{len(partitions)}] Processing {month_label}...")
 
-        # Pre-filter spot data for each month
-        monthly_spot_dfs = {}
-        for month_start, month_end, month_label in partitions:
-            if month_label not in completed_chunks:
-                month_spot_df = (
-                    full_spot_df.filter(
-                        (pl.col("timestamp_seconds") >= month_start) & (pl.col("timestamp_seconds") <= month_end)
-                    )
-                    .group_by("timestamp_seconds")
-                    .agg(pl.col("spot_price").last())
-                    .sort("timestamp_seconds")
+            # Load spot prices as DataFrame (NOT dictionary) for vectorized join
+            spot_df = prepare_spot_prices_dataframe(PERPETUAL_FILE, month_start, month_end)
+
+            # Process the month
+            month_start_time = time.time()
+            result = process_monthly_chunk(QUOTES_FILE, spot_df, month_start, month_end, month_label)
+            month_time = time.time() - month_start_time
+
+            if result is not None and len(result) > 0:
+                all_results.append(result)
+                total_rows_output += len(result)
+                total_processing_time += month_time
+
+                # Store performance metrics
+                performance_metrics[month_label] = {
+                    "rows": len(result),
+                    "time": month_time,
+                }
+
+                logger.info(
+                    f"✅ {month_label}: Added {len(result):,} rows in {month_time:.1f}s "
+                    f"(total so far: {total_rows_output:,})"
                 )
-                monthly_spot_dfs[month_label] = month_spot_df
-                logger.info(f"  {month_label}: {len(month_spot_df):,} unique timestamps")
 
-        # Pre-load quotes ONCE to avoid I/O contention (same optimization as spot prices)
-        logger.info("\n📊 Pre-loading quotes (shared optimization)...")
-        logger.info("=" * 80)
-        quotes_load_start = time.time()
-        full_quotes_df = pl.read_parquet(QUOTES_FILE)
-        quotes_load_time = time.time() - quotes_load_start
-        logger.info(f"Loaded {len(full_quotes_df):,} quote records in {quotes_load_time:.2f}s")
-        logger.info(f"Quotes file size: {Path(QUOTES_FILE).stat().st_size / 1e9:.2f} GB")
+            # Update checkpoint
+            completed_chunks.add(month_label)
+            checkpoint["completed_chunks"] = list(completed_chunks)
+            checkpoint["total_rows_processed"] = total_rows_output
+            checkpoint["performance_metrics"] = performance_metrics
+            save_checkpoint(checkpoint)
 
-        # Pre-filter quotes for each month
-        monthly_quotes_dfs = {}
-        for month_start, month_end, month_label in partitions:
-            if month_label not in completed_chunks:
-                month_quotes_df = full_quotes_df.filter(
-                    (pl.col("timestamp_seconds") >= month_start) & (pl.col("timestamp_seconds") <= month_end)
-                )
-                monthly_quotes_dfs[month_label] = month_quotes_df
-                logger.info(f"  {month_label}: {len(month_quotes_df):,} quote rows")
+            # Check memory and clear if needed
+            current_memory = get_memory_usage()
+            if current_memory > MAX_MEMORY_GB:
+                logger.warning(f"Memory usage high ({current_memory:.2f} GB), clearing cache...")
+                import gc
 
-        # Prepare arguments for months that need processing
-        months_to_process = [
-            (month_start, month_end, month_label, monthly_quotes_dfs[month_label], monthly_spot_dfs[month_label])
-            for month_start, month_end, month_label in partitions
-            if month_label not in completed_chunks
-        ]
-
-        if months_to_process:
-            logger.info(
-                f"\n📊 Processing {len(months_to_process)} months in parallel using {MAX_MONTH_WORKERS} workers"
-            )
-            logger.info("=" * 80)
-
-            # Process months in parallel
-            with ProcessPoolExecutor(max_workers=MAX_MONTH_WORKERS) as executor:
-                # Submit all month processing tasks
-                futures = {executor.submit(_process_month_wrapper, args): args[2] for args in months_to_process}
-
-                # Collect results as they complete
-                for future in as_completed(futures):
-                    month_label = futures[future]
-                    try:
-                        result_label, result, month_time = future.result()
-
-                        if result is not None and len(result) > 0:
-                            all_results.append(result)
-                            total_rows_output += len(result)
-                            total_processing_time += month_time
-
-                            # Store performance metrics
-                            performance_metrics[result_label] = {
-                                "rows": len(result),
-                                "time": month_time,
-                            }
-
-                            logger.info(
-                                f"✅ {result_label}: Added {len(result):,} rows in {month_time:.1f}s "
-                                f"(total so far: {total_rows_output:,})"
-                            )
-
-                        # Update checkpoint
-                        completed_chunks.add(result_label)
-                        checkpoint["completed_chunks"] = list(completed_chunks)
-                        checkpoint["total_rows_processed"] = total_rows_output
-                        checkpoint["performance_metrics"] = performance_metrics
-                        save_checkpoint(checkpoint)
-
-                    except Exception as e:
-                        logger.error(f"❌ {month_label} failed: {e}")
-        else:
-            logger.info("\n✅ All months already completed (using cached results)")
+                gc.collect()
 
         # Combine and write results
         logger.info("\n" + "=" * 80)
@@ -645,14 +567,15 @@ def main() -> None:
             ).row(0, named=True)
 
             logger.info(
-                f"  TTL (days): min={ttl_stats['min']:.2f}, mean={ttl_stats['mean']:.2f}, max={ttl_stats['max']:.2f}"
+                f"  TTL (days): min={ttl_stats['min']:.2f}, "
+                f"mean={ttl_stats['mean']:.2f}, max={ttl_stats['max']:.2f}"
             )
 
             # Performance summary
             logger.info("\n⚡ Performance Summary:")
             logger.info(f"  Total processing time: {total_processing_time:.1f}s")
-            logger.info(f"  Average time per month: {total_processing_time / len(partitions):.1f}s")
-            logger.info(f"  Processing rate: {total_rows_output / total_processing_time:,.0f} rows/sec")
+            logger.info(f"  Average time per month: {total_processing_time/len(partitions):.1f}s")
+            logger.info(f"  Processing rate: {total_rows_output/total_processing_time:,.0f} rows/sec")
 
         else:
             logger.warning("No data matched the filtering criteria")
