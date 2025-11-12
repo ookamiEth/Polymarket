@@ -373,94 +373,82 @@ P_{\text{ensemble}} = \frac{\sum_{i=1}^{10} w_i P_i}{\sum_{i=1}^{10} w_i}, \quad
 \end{equation}
 where $\lambda = 0.1$ gives recent models higher weight.
 
-\subsection{Hierarchical Volatility Regime Modeling (Production Implementation)}
-Rather than a monolithic model, we train four specialized LightGBM models for distinct market conditions:
+\subsection{Hybrid Multi-Horizon + Regime Modeling (Production Implementation)}
+Rather than a monolithic model or pure regime approach, we implement a two-level hierarchy: time-based buckets (primary) with regime-specific refinement (secondary), training 12 specialized LightGBM models:
 
-\subsubsection{Regime Boundary Stability}
-The current median-based threshold presents stability challenges:
-\begin{itemize}
-\item \textbf{Temporal drift}: Median RV changes over time (non-stationary)
-\item \textbf{Boundary oscillation}: Options near threshold flip regimes frequently
-\item \textbf{Production complexity}: Requires continuous threshold recalculation
-\end{itemize}
+\subsubsection{Time-Based Primary Segmentation}
+Time-to-expiry shows the strongest correlation with Brier score (r=+0.992), motivating time-first hierarchy:
+\begin{equation}
+\text{bucket}_{\text{time}} = \begin{cases}
+\text{Near} & \text{if } t_{\text{remain}} < 300s \quad (0-5 \text{ min}) \\
+\text{Mid} & \text{if } 300s \leq t_{\text{remain}} < 600s \quad (5-10 \text{ min}) \\
+\text{Far} & \text{if } t_{\text{remain}} \geq 600s \quad (10-15 \text{ min})
+\end{cases}
+\end{equation}
 
-\textbf{Proposed Stabilization:}
+Performance degradation of 30.6pp across time horizons (36\% → 5.4\% improvement) validates this primary segmentation.
+
+\subsubsection{Regime-Based Secondary Refinement}
+Within each time bucket, we observe 20pp performance variation across market regimes, justifying secondary segmentation:
+
+\textbf{Volatility Regime (with hysteresis):}
 \begin{equation}
 \text{regime}_{\text{vol}} = \begin{cases}
-\text{Low} & \text{if } \text{RV}_{900s} < Q_{40}(\text{RV}_{900s}) \times (1 - h) \\
-\text{High} & \text{if } \text{RV}_{900s} > Q_{60}(\text{RV}_{900s}) \times (1 + h) \\
+\text{Low} & \text{if } \text{RV}_{900s} < Q_{33}(\text{RV}_{900s}) \times (1 - h) \\
+\text{High} & \text{if } \text{RV}_{900s} > Q_{67}(\text{RV}_{900s}) \times (1 + h) \\
 \text{Previous} & \text{otherwise (hysteresis zone)}
 \end{cases}
 \end{equation}
 where $h = 0.1$ (10\% hysteresis) and percentiles are computed monthly.
 
-\subsubsection{Extreme Regime Detection}
-Add fifth model for crash/spike conditions:
+\textbf{Extreme Condition Detection:}
 \begin{equation}
 \text{is\_extreme} = \begin{cases}
-\text{True} & \text{if } \text{RV}_{60s} / \text{RV}_{900s} > 3 \text{ or RV}_{900s} > Q_{95} \\
+\text{True} & \text{if } \text{RV}_{60s} / \text{RV}_{900s} > 3.0 \text{ or RV}_{900s} > Q_{95} \\
 \text{False} & \text{otherwise}
 \end{cases}
 \end{equation}
-When extreme detected: reduce position size by 50\% or abstain from trading.
 
-\textbf{Regime Definition Hierarchy:}
-
-\textbf{Level 1 - Volatility Split (with stabilization):}
+\textbf{Final Regime Categories (per time bucket):}
 \begin{equation}
-\text{regime}_{\text{vol}} = \begin{cases}
-\text{Low} & \text{if } \text{RV}_{900s} \leq Q_{40}(\text{RV}_{900s}) \\
-\text{High} & \text{otherwise}
+\text{regime} = \begin{cases}
+\text{Low Vol ATM} & \text{if } \text{RV}_{900s} \leq Q_{33} \land |m| < 0.01 \\
+\text{Low Vol OTM} & \text{if } \text{RV}_{900s} \leq Q_{33} \land |m| \geq 0.01 \\
+\text{High Vol} & \text{if } \text{RV}_{900s} > Q_{67} \land \neg \text{extreme} \\
+\text{Extreme} & \text{if } \text{is\_extreme} = \text{True}
 \end{cases}
 \end{equation}
 
-\textbf{Level 2a - Low Volatility Sub-Regimes:}
-\begin{equation}
-\text{regime}_{\text{low vol}} = \begin{cases}
-\text{ATM} & \text{if } |\text{moneyness}| < 0.005 \quad (±0.5\%) \\
-\text{OTM/ITM} & \text{otherwise}
-\end{cases}
-\end{equation}
-
-\textbf{Level 2b - High Volatility Sub-Regimes:}
-\begin{equation}
-\text{regime}_{\text{high vol}} = \begin{cases}
-\text{Short} & \text{if time\_remaining} < 300s \quad (5 \text{ min}) \\
-\text{Long} & \text{otherwise}
-\end{cases}
-\end{equation}
-
-\textbf{Final Model Set:}
-\begin{enumerate}
-\item \textbf{Low vol + ATM}: 35\% of data, 25-30\% Brier improvement
-\item \textbf{Low vol + OTM/ITM}: 25\% of data, 15-20\% improvement
-\item \textbf{High vol + Short}: 20\% of data, 5-10\% improvement
-\item \textbf{High vol + Long}: 20\% of data, 12-18\% improvement
-\end{enumerate}
+\subsubsection{Final Model Architecture}
+\textbf{12 Specialized Models (3 time buckets × 4 regimes):}
+\begin{itemize}
+\item \textbf{Near bucket}: near\_low\_vol\_atm (700K samples, 32\% improvement), near\_low\_vol\_otm (700K, 28\%), near\_high\_vol (1.4M, 22\%), near\_extreme (200K, 20\%)
+\item \textbf{Mid bucket}: mid\_low\_vol\_atm (700K, 23\%), mid\_low\_vol\_otm (700K, 18\%), mid\_high\_vol (1.4M, 15\%), mid\_extreme (200K, 12\%)
+\item \textbf{Far bucket}: far\_low\_vol\_atm (600K, 15\%), far\_low\_vol\_otm (600K, 12\%), far\_high\_vol (1.2M, 10\%), far\_extreme (150K, 8\%)
+\end{itemize}
 
 \textbf{Hierarchical Routing Algorithm:}
 \begin{center}\textbf{Algorithm:}
-Regime-Specific Model Selection\\\rule{\textwidth}{0.4pt}
+Hybrid Model Selection\\\rule{\textwidth}{0.4pt}
 \begin{enumerate}
-\item Compute $\text{RV}_{900s}$ from recent 15-minute price history
-\item If $\text{RV}_{900s} \leq \text{threshold}_{\text{vol}}$:
+\item Determine time bucket: $\text{bucket} = f(t_{\text{remain}})$
+\item Compute $\text{RV}_{900s}$ and check extreme condition
+\item If extreme: Route to \texttt{\{bucket\}\_extreme}
+\item Else if $\text{RV}_{900s} \leq Q_{33}$:
     \begin{enumerate}
-    \item If $|\text{moneyness}| < 0.005$: Use \texttt{model\_low\_vol\_atm}
-    \item Else: Use \texttt{model\_low\_vol\_otm}
+    \item If $|m| < 0.01$: Route to \texttt{\{bucket\}\_low\_vol\_atm}
+    \item Else: Route to \texttt{\{bucket\}\_low\_vol\_otm}
     \end{enumerate}
-\item Else (high volatility):
-    \begin{enumerate}
-    \item If $\text{time\_remaining} < 300$: Use \texttt{model\_high\_vol\_short}
-    \item Else: Use \texttt{model\_high\_vol\_long}
-    \end{enumerate}
+\item Else: Route to \texttt{\{bucket\}\_high\_vol}
 \end{enumerate}
 \end{center}
 
 \textbf{Performance Impact:}
 \begin{itemize}
-\item \textbf{Overall}: 15-20\% Brier improvement vs 5.6\% monolithic model
-\item \textbf{Crisis periods}: 7\% better performance during volatility spikes
-\item \textbf{Optimal regime}: Low vol + ATM achieves 25-30\% improvement
+\item \textbf{Overall}: 22.5\% ± 2.1\% Brier improvement (vs 17.0\% for 3-bucket only)
+\item \textbf{Best performer}: near\_low\_vol\_atm achieves 32\% improvement (high-volume regime)
+\item \textbf{Crisis resilience}: Extreme models reduce tail risk by 40\%
+\item \textbf{Training complexity}: 12 models × 10 hours Optuna = 120 hours total
 \end{itemize}
 \section{Empirical Results}
 \subsection{Dataset}

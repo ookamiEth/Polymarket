@@ -6,18 +6,86 @@
 
 **Approach:** Price hypothetical Polymarket-style 15-minute binary options using Deribit options IV, then validate against actual BTC price outcomes.
 
+**Current Version:** V4 - Hierarchical Temporal Model (12 specialized models)
+
+---
+
+## 🚀 **QUICK START - V4 Implementation**
+
+**STATUS**: ⚠️ Infrastructure ready, need to generate baseline data
+
+**Next Steps**: See [NEXT_STEPS.md](NEXT_STEPS.md) for detailed instructions
+
+### Fast Track (Copy-Paste):
+```bash
+# 1. Create baseline symlink
+ln -s /home/ubuntu/Polymarket/research/model/results/production_backtest_results.parquet \
+      /home/ubuntu/Polymarket/research/model/results/production_backtest_results_v4.parquet
+
+# 2. Generate V4 features (2-3 hours)
+cd /home/ubuntu/Polymarket/research/model/00_data_prep
+nohup uv run python engineer_all_features_v4.py > v4_feature_generation.log 2>&1 &
+
+# 3. Train 12 models (24-48 hours)
+cd /home/ubuntu/Polymarket/research/model/01_pricing
+nohup uv run python train_temporal_models.py > train_temporal_models.log 2>&1 &
+```
+
+**Documentation**:
+- **Next Steps**: [NEXT_STEPS.md](NEXT_STEPS.md) - Complete step-by-step guide
+- **V4 Plan**: [IMPLEMENTATION_PLAN_V4.md](IMPLEMENTATION_PLAN_V4.md) - Full technical details
+- **CPU Optimization**: [00_cpu_optimization/README.md](00_cpu_optimization/README.md) - 32 vCPU parallelism guide
+- **Features**: [02_analysis/FEATURE_COMPARISON_V3_V4.md](02_analysis/FEATURE_COMPARISON_V3_V4.md) - Feature changes
+
 ---
 
 ## Table of Contents
 
-1. [Research Objective](#research-objective)
-2. [Data Sources](#data-sources)
-3. [Mathematical Framework](#mathematical-framework)
-4. [Methodology](#methodology)
-5. [Implementation Structure](#implementation-structure)
-6. [Analysis Plan](#analysis-plan)
+1. [V4 Architecture Overview](#v4-architecture-overview)
+2. [Research Objective](#research-objective)
+3. [Data Sources](#data-sources)
+4. [Mathematical Framework](#mathematical-framework)
+5. [Methodology](#methodology)
+6. [Implementation Structure](#implementation-structure)
 7. [Performance Standards](#performance-standards)
 8. [Running the Backtest](#running-the-backtest)
+
+---
+
+## V4 Architecture Overview
+
+### 🏗️ **Hierarchical Model Structure**
+
+**12 Specialized Models** = 3 Temporal Windows × 4 Volatility Regimes
+
+#### Level 1: Temporal Split (Time-to-Expiry)
+- **Near** (< 300s): High gamma, volatile pricing
+- **Mid** (300-900s): Balanced dynamics
+- **Far** (> 900s): Stable, trend-following
+
+#### Level 2: Volatility Regimes
+- **Low Vol ATM**: Low volatility + at-the-money
+- **Low Vol OTM**: Low volatility + out-of-the-money
+- **High Vol ATM**: High volatility + at-the-money
+- **High Vol OTM**: High volatility + out-of-the-money
+
+### 📊 **V4 Improvements Over V3**
+
+| Metric | V3 Baseline | V4 Target | Improvement |
+|--------|-------------|-----------|-------------|
+| **Brier Score** | 0.1340 | 0.1260 | 22-25% better |
+| **Feature Count** | 196 | 55 | 72% reduction |
+| **Moneyness Dominance** | 64% | <25% | 61% reduction |
+| **Model Count** | 1 | 12 | Specialized |
+| **Training Speed** | Baseline | 3x faster | Efficiency |
+
+### 🎯 **Key Features**
+
+1. **Aggressive Feature Pruning**: 171 features with <1% importance removed
+2. **Advanced Moneyness**: 8 transformations to reduce dominance
+3. **Volatility Asymmetry**: Downside/upside split, skewness, kurtosis
+4. **Regime-Specific Training**: Each model optimized for its regime
+5. **Temporal Awareness**: Different dynamics at different time horizons
 
 ---
 

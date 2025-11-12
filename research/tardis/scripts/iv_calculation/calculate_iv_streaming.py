@@ -250,12 +250,8 @@ def process_with_streaming(
 
         logger.info(f"\nProcessing rows {chunk_start:,} to {chunk_end:,}...")
 
-        # Read chunk
-        df_chunk = pl.read_parquet(
-            input_file,
-            n_rows=actual_chunk_size,
-            row_index_offset=chunk_start,
-        )
+        # Read chunk using lazy evaluation (fixes Polars row_index_offset bug)
+        df_chunk = pl.scan_parquet(input_file).slice(chunk_start, actual_chunk_size).collect()
 
         # Calculate IVs for chunk
         df_with_iv = calculate_ivs_chunk(
@@ -331,6 +327,36 @@ def process_with_streaming(
     # Check output file size
     output_size_mb = Path(output_file).stat().st_size / (1024 * 1024)
     logger.info(f"Output file size: {output_size_mb:.1f} MB")
+
+    # Validate date range (catch data duplication issues)
+    logger.info("\n" + "=" * 80)
+    logger.info("DATE RANGE VALIDATION")
+    logger.info("=" * 80)
+
+    from datetime import datetime
+
+    date_stats = result_df.select(
+        [
+            pl.col("timestamp_seconds").min().alias("min_ts"),
+            pl.col("timestamp_seconds").max().alias("max_ts"),
+        ]
+    ).collect()
+
+    min_ts = date_stats["min_ts"][0]
+    max_ts = date_stats["max_ts"][0]
+    min_date = datetime.fromtimestamp(min_ts).date()
+    max_date = datetime.fromtimestamp(max_ts).date()
+    days_span = (max_date - min_date).days
+
+    logger.info(f"Date range: {min_date} to {max_date}")
+    logger.info(f"Days covered: {days_span}")
+
+    # Sanity check: if we have 200M+ rows, we should have 500+ days of data
+    if total_rows > 100_000_000 and days_span < 100:
+        logger.warning(f"⚠️  WARNING: Large dataset ({total_rows:,} rows) but narrow date range ({days_span} days)!")
+        logger.warning("    This may indicate data duplication. Check input file.")
+    else:
+        logger.info("✅ Date range validation passed")
 
     logger.info("\n✅ Processing complete!")
 
