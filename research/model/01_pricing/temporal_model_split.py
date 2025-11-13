@@ -21,7 +21,7 @@ Date: 2025-11-12
 from __future__ import annotations
 
 import logging
-from typing import Dict, Tuple
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -39,17 +39,19 @@ def assign_temporal_regime(df: pl.DataFrame) -> pl.DataFrame:
     Returns:
         DataFrame with added 'temporal_regime' column
     """
-    return df.with_columns([
-        pl.when(pl.col("time_remaining") < 300)
-          .then(pl.lit("near"))
-          .when(pl.col("time_remaining") <= 900)
-          .then(pl.lit("mid"))
-          .otherwise(pl.lit("far"))
-          .alias("temporal_regime")
-    ])
+    return df.with_columns(
+        [
+            pl.when(pl.col("time_remaining") < 300)
+            .then(pl.lit("near"))
+            .when(pl.col("time_remaining") < 600)
+            .then(pl.lit("mid"))
+            .otherwise(pl.lit("far"))
+            .alias("temporal_regime")
+        ]
+    )
 
 
-def get_temporal_thresholds(regime: str) -> Dict[str, float]:
+def get_temporal_thresholds(regime: str) -> dict[str, float]:
     """
     Get regime-specific thresholds and parameters.
 
@@ -64,13 +66,13 @@ def get_temporal_thresholds(regime: str) -> Dict[str, float]:
     """
     thresholds = {
         "near": {
-            "min_samples": 50000,      # Minimum samples for training
-            "vol_low": 0.01,           # Low volatility threshold
-            "vol_high": 0.03,          # High volatility threshold
-            "moneyness_atm": 0.01,     # ATM threshold (1% moneyness)
-            "extreme_vol": 0.05,       # Extreme volatility threshold
-            "min_time": 0,             # Minimum time remaining
-            "max_time": 300,           # Maximum time remaining
+            "min_samples": 50000,  # Minimum samples for training
+            "vol_low": 0.01,  # Low volatility threshold
+            "vol_high": 0.03,  # High volatility threshold
+            "moneyness_atm": 0.01,  # ATM threshold (1% moneyness)
+            "extreme_vol": 0.05,  # Extreme volatility threshold
+            "min_time": 0,  # Minimum time remaining
+            "max_time": 300,  # Maximum time remaining
         },
         "mid": {
             "min_samples": 100000,
@@ -79,7 +81,7 @@ def get_temporal_thresholds(regime: str) -> Dict[str, float]:
             "moneyness_atm": 0.01,
             "extreme_vol": 0.04,
             "min_time": 300,
-            "max_time": 900,
+            "max_time": 600,
         },
         "far": {
             "min_samples": 50000,
@@ -87,9 +89,9 @@ def get_temporal_thresholds(regime: str) -> Dict[str, float]:
             "vol_high": 0.02,
             "moneyness_atm": 0.01,
             "extreme_vol": 0.035,
-            "min_time": 900,
-            "max_time": np.inf,
-        }
+            "min_time": 600,
+            "max_time": 900,
+        },
     }
 
     if regime not in thresholds:
@@ -98,7 +100,7 @@ def get_temporal_thresholds(regime: str) -> Dict[str, float]:
     return thresholds[regime]
 
 
-def get_temporal_feature_importance(regime: str) -> Dict[str, float]:
+def get_temporal_feature_importance(regime: str) -> dict[str, float]:
     """
     Get expected feature importance for each temporal regime.
 
@@ -144,16 +146,15 @@ def get_temporal_feature_importance(regime: str) -> Dict[str, float]:
             "price_position_900s": 0.07,
             "range_900s": 0.06,
             "day_of_week": 0.05,
-        }
+        },
     }
 
     return importance.get(regime, {})
 
 
 def split_data_by_temporal_regime(
-    df: pl.DataFrame,
-    test_size: float = 0.2
-) -> Dict[str, Tuple[pl.DataFrame, pl.DataFrame]]:
+    df: pl.DataFrame, test_size: float = 0.2
+) -> dict[str, tuple[pl.DataFrame, pl.DataFrame]]:
     """
     Split data by temporal regime for training.
 
@@ -187,14 +188,12 @@ def split_data_by_temporal_regime(
 
         splits[regime] = (train_df, test_df)
 
-        logger.info(
-            f"Regime {regime}: {len(train_df):,} train, {len(test_df):,} test samples"
-        )
+        logger.info(f"Regime {regime}: {len(train_df):,} train, {len(test_df):,} test samples")
 
     return splits
 
 
-def validate_temporal_splits(df: pl.DataFrame) -> Dict[str, Dict[str, float]]:
+def validate_temporal_splits(df: pl.DataFrame) -> dict[str, dict[str, float]]:
     """
     Validate data distribution across temporal regimes.
 
@@ -228,14 +227,12 @@ def validate_temporal_splits(df: pl.DataFrame) -> Dict[str, Dict[str, float]]:
     # Log summary
     logger.info("Temporal regime distribution:")
     for regime, regime_stats in stats.items():
-        logger.info(
-            f"  {regime}: {regime_stats['count']:,} samples ({regime_stats['percentage']:.1f}%)"
-        )
+        logger.info(f"  {regime}: {regime_stats['count']:,} samples ({regime_stats['percentage']:.1f}%)")
 
     return stats
 
 
-def get_temporal_model_config(regime: str) -> Dict[str, any]:
+def get_temporal_model_config(regime: str) -> dict[str, Any]:
     """
     Get model configuration for a specific temporal regime.
 
@@ -308,7 +305,7 @@ def get_temporal_model_config(regime: str) -> Dict[str, any]:
                 "hv_3600s",
                 "price_position_900s",
             ],
-        }
+        },
     }
 
     if regime not in configs:
@@ -325,21 +322,23 @@ def main():
 
     # Create sample data for demonstration
     n_samples = 100000
-    df = pl.DataFrame({
-        "time_remaining": np.random.uniform(0, 1200, n_samples),
-        "moneyness": np.random.normal(0, 0.02, n_samples),
-        "rv_900s": np.random.uniform(0.005, 0.04, n_samples),
-        "outcome": np.random.binomial(1, 0.5, n_samples),
-    })
+    df = pl.DataFrame(
+        {
+            "time_remaining": np.random.uniform(0, 1200, n_samples),
+            "moneyness": np.random.normal(0, 0.02, n_samples),
+            "rv_900s": np.random.uniform(0.005, 0.04, n_samples),
+            "outcome": np.random.binomial(1, 0.5, n_samples),
+        }
+    )
 
     # Assign temporal regimes
     df = assign_temporal_regime(df)
 
     # Validate distribution
-    stats = validate_temporal_splits(df)
+    validate_temporal_splits(df)
 
     # Split by regime
-    splits = split_data_by_temporal_regime(df)
+    split_data_by_temporal_regime(df)
 
     # Show configurations
     for regime in ["near", "mid", "far"]:
@@ -352,8 +351,5 @@ def main():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     main()

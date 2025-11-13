@@ -16,11 +16,12 @@ Key Improvements from V3:
 - Residual learning architecture (outcome - Black-Scholes baseline)
 
 Usage:
-  # Train all 8 models (always uses walk-forward validation)
+  # Train all 12 models (always uses walk-forward validation)
   uv run python train_multi_horizon_v4.py
 
   # Train specific model
   uv run python train_multi_horizon_v4.py --model near_low_vol_atm
+  uv run python train_multi_horizon_v4.py --model far_low_vol_atm
 
   # With custom config
   uv run python train_multi_horizon_v4.py --config config/multi_horizon_regime_config.yaml
@@ -738,10 +739,14 @@ def main() -> None:
             "mid_low_vol_otm",
             "mid_high_vol_atm",
             "mid_high_vol_otm",
+            "far_low_vol_atm",
+            "far_low_vol_otm",
+            "far_high_vol_atm",
+            "far_high_vol_otm",
             "all",
         ],
         default="all",
-        help="Which model to train (default: all 8 models)",
+        help="Which model to train (default: all 12 models)",
     )
     parser.add_argument(
         "--config",
@@ -804,7 +809,7 @@ def main() -> None:
         if len(missing_features) > 10:
             logger.warning(f"    ... and {len(missing_features) - 10} more")
 
-    # Define 8 hybrid models (no "far" bucket due to insufficient data)
+    # Define 12 hybrid models (3 temporal buckets × 4 volatility regimes)
     hybrid_models = [
         ("near_low_vol_atm", 0, 300),
         ("near_low_vol_otm", 0, 300),
@@ -814,14 +819,26 @@ def main() -> None:
         ("mid_low_vol_otm", 300, 600),
         ("mid_high_vol_atm", 300, 600),
         ("mid_high_vol_otm", 300, 600),
+        ("far_low_vol_atm", 600, 900),
+        ("far_low_vol_otm", 600, 900),
+        ("far_high_vol_atm", 600, 900),
+        ("far_high_vol_otm", 600, 900),
     ]
 
     # Determine which models to train
-    models_to_train = (
-        hybrid_models
-        if args.model == "all"
-        else [(args.model, 0 if "near" in args.model else 300, 300 if "near" in args.model else 600)]
-    )
+    if args.model == "all":
+        models_to_train = hybrid_models
+    else:
+        # Determine time range based on temporal bucket in model name
+        if "near" in args.model:
+            time_min, time_max = 0, 300
+        elif "mid" in args.model:
+            time_min, time_max = 300, 600
+        elif "far" in args.model:
+            time_min, time_max = 600, 900
+        else:
+            raise ValueError(f"Unknown temporal bucket in model name: {args.model}")
+        models_to_train = [(args.model, time_min, time_max)]
 
     logger.info(f"\nTraining {len(models_to_train)} model(s): {[m[0] for m in models_to_train]}")
 
