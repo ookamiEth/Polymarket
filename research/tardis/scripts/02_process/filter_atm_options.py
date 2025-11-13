@@ -31,6 +31,7 @@ Performance:
 
 import json
 import logging
+import multiprocessing as mp
 import os
 import sys
 import time
@@ -420,6 +421,19 @@ def process_monthly_chunk(
     return quotes_collected
 
 
+def _worker_init() -> None:
+    """Initialize worker process with correct Polars threading.
+
+    CRITICAL: Must be called via ProcessPoolExecutor initializer parameter
+    to set threading BEFORE any Polars operations execute.
+
+    This function runs once per worker process, immediately after spawning,
+    before any user code runs. This guarantees POLARS_MAX_THREADS is set
+    before the first DataFrame operation.
+    """
+    os.environ["POLARS_MAX_THREADS"] = "4"
+
+
 def _process_month_wrapper(args: tuple) -> tuple[str, Optional[pl.DataFrame], float]:
     """Wrapper function for parallel processing of monthly chunks.
 
@@ -432,7 +446,7 @@ def _process_month_wrapper(args: tuple) -> tuple[str, Optional[pl.DataFrame], fl
     """
     month_start, month_end, month_label, quotes_df, spot_df = args
 
-    # Both DataFrames are now passed in pre-filtered, no file I/O needed!
+    # Polars threading is set by _worker_init() via ProcessPoolExecutor initializer
     logger.info(f"Processing {month_label} with {len(quotes_df):,} quotes and {len(spot_df):,} spot prices")
 
     # Process the month
@@ -561,7 +575,14 @@ def main() -> None:
             logger.info("=" * 80)
 
             # Process months in parallel
-            with ProcessPoolExecutor(max_workers=MAX_MONTH_WORKERS) as executor:
+            # CRITICAL: Use spawn context to avoid fork+threading deadlock
+            # Spawn creates fresh Python interpreters without inherited Polars locks
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(
+                max_workers=MAX_MONTH_WORKERS,
+                mp_context=ctx,  # Use spawn, not fork (avoids inherited thread pool deadlock)
+                initializer=_worker_init,
+            ) as executor:
                 # Submit all month processing tasks
                 futures = {executor.submit(_process_month_wrapper, args): args[2] for args in months_to_process}
 

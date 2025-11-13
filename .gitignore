@@ -151,3 +151,7 @@ documentation/
 *.out 
 *.bak 
 !technical_paper.pdf 
+*.pid 
+*.parquet.backup_20251113_005540
+*.parquet.backup_20251113_111640
+*.parquet.backup_20251113_151648 

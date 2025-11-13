@@ -50,6 +50,8 @@ import polars as pl
 import psutil
 from sklearn.preprocessing import StandardScaler
 
+from impute_missing_features_v4 import impute_binance_features
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -81,13 +83,17 @@ FEATURE_STATS_FILE = RESULTS_DIR / "feature_stats_v4.parquet"
 # Standard time windows (seconds) - removed 1800s for V4
 WINDOWS = [60, 300, 900, 3600]
 
-# Features to KEEP from existing files (28 features) - removed 5 correlated features
+# Features to KEEP from existing files (32 features) - removed 5 correlated features
 KEEP_FEATURES = {
     "baseline": [
         "time_remaining",
+        "S",  # Spot price (needed for V4 transformations)
+        "K",  # Strike price (needed for V4 transformations)
+        "sigma_mid",  # Implied volatility (needed for V4 transformations)
+        "T_years",  # Time to expiry in years (needed for V4 transformations)
         "moneyness",
         "iv_staleness_seconds",
-    ],  # 3
+    ],  # 7 (was 3, added 4 for V4 transformations)
     "advanced": [
         # Drawdown (4) - REMOVED drawdown_from_high_15m and runup_from_low_15m (correlated)
         "high_15m",
@@ -197,8 +203,8 @@ def load_and_write_existing_features(memory_monitor: MemoryMonitor) -> Path:
         memory_monitor: Memory monitor for tracking usage
 
     Returns:
-        Path to intermediate parquet file with 26 features + timestamp_seconds
-        - Baseline: 3 (time_remaining, moneyness, iv_staleness_seconds)
+        Path to intermediate parquet file with 30 features + timestamp_seconds
+        - Baseline: 7 (time_remaining, S, K, sigma_mid, T_years, moneyness, iv_staleness_seconds)
         - Advanced: 21 (drawdown, higher moments, time, vol clustering, autocorr_decay, reversals_300s)
         - Micro: 2 (autocorr_lag5_300s, hurst_300s)
     """
@@ -224,6 +230,8 @@ def load_and_write_existing_features(memory_monitor: MemoryMonitor) -> Path:
             "time_remaining",
             "S",  # Spot price
             "K",  # Strike price
+            "sigma_mid",  # Implied volatility (needed for V4 transformations)
+            "T_years",  # Time to expiry in years (needed for V4 transformations)
             "iv_staleness_seconds",
         ]
     )
@@ -237,6 +245,10 @@ def load_and_write_existing_features(memory_monitor: MemoryMonitor) -> Path:
         [
             "timestamp_seconds",
             "time_remaining",
+            "S",  # Keep for V4 transformations
+            "K",  # Keep for V4 transformations
+            "sigma_mid",  # Keep for V4 transformations
+            "T_years",  # Keep for V4 transformations
             "moneyness",
             "iv_staleness_seconds",
         ]
@@ -361,7 +373,7 @@ def load_and_write_existing_features(memory_monitor: MemoryMonitor) -> Path:
     else:
         logger.info("  ✓ No nulls in sample")
 
-    logger.info("✓ Wrote 26 existing features (3 baseline + 21 advanced + 2 micro)")
+    logger.info("✓ Wrote 30 existing features (7 baseline + 21 advanced + 2 micro)")
 
     return output_file
 
@@ -421,6 +433,15 @@ def engineer_and_write_funding_features() -> Path:
             "funding_rate_ema_3600s",
             # REMOVED: All SMA columns
         ]
+    )
+
+    # Impute missing features for date gaps (2023-09-26 to 2023-09-30, 2025-10-01 to 2025-11-05)
+    logger.info("Imputing missing funding features for date gaps...")
+    df = impute_binance_features(
+        df,
+        feature_type="funding",
+        valid_start_ts=1696118400,  # 2023-10-01 00:00:00 UTC
+        valid_end_ts=1759276799,  # 2025-09-30 23:59:59 UTC
     )
 
     # Write to intermediate file (streaming write - no memory spike)
@@ -563,6 +584,15 @@ def engineer_and_write_orderbook_l0_features() -> Path:
             # REMOVED: imbalance_vol_1800s
             "imbalance_vol_3600s",
         ]
+    )
+
+    # Impute missing features for date gaps
+    logger.info("Imputing missing orderbook L0 features for date gaps...")
+    df = impute_binance_features(
+        df,
+        feature_type="orderbook",
+        valid_start_ts=1696118400,  # 2023-10-01 00:00:00 UTC
+        valid_end_ts=1759276799,  # 2025-09-30 23:59:59 UTC
     )
 
     # Write to intermediate file (streaming write - no memory spike)
@@ -751,6 +781,15 @@ def engineer_and_write_orderbook_5level_features() -> Path:
         ]
     )
 
+    # Impute missing features for date gaps
+    logger.info("Imputing missing orderbook 5-level features for date gaps...")
+    df = impute_binance_features(
+        df,
+        feature_type="orderbook_5level",
+        valid_start_ts=1696118400,  # 2023-10-01 00:00:00 UTC
+        valid_end_ts=1759276799,  # 2025-09-30 23:59:59 UTC
+    )
+
     # Write to intermediate file (streaming write - no memory spike)
     output_file = INTERMEDIATE_DIR / "04_orderbook_5level_features.parquet"
     logger.info(f"Writing orderbook 5-level features to {output_file}...")
@@ -828,6 +867,15 @@ def engineer_and_write_price_basis_features() -> Path:
         ]
     )
 
+    # Impute missing features for date gaps
+    logger.info("Imputing missing price basis features for date gaps...")
+    df = impute_binance_features(
+        df,
+        feature_type="price_basis",
+        valid_start_ts=1696118400,  # 2023-10-01 00:00:00 UTC
+        valid_end_ts=1759276799,  # 2025-09-30 23:59:59 UTC
+    )
+
     # Write to intermediate file (streaming write - no memory spike)
     output_file = INTERMEDIATE_DIR / "05_price_basis_features.parquet"
     logger.info(f"Writing price basis features to {output_file}...")
@@ -889,6 +937,15 @@ def engineer_and_write_oi_features() -> Path:
         ]
     )
 
+    # Impute missing features for date gaps
+    logger.info("Imputing missing OI features for date gaps...")
+    df = impute_binance_features(
+        df,
+        feature_type="open_interest",
+        valid_start_ts=1696118400,  # 2023-10-01 00:00:00 UTC
+        valid_end_ts=1759276799,  # 2025-09-30 23:59:59 UTC
+    )
+
     # Write to intermediate file (streaming write - no memory spike)
     output_file = INTERMEDIATE_DIR / "06_oi_features.parquet"
     logger.info(f"Writing OI features to {output_file}...")
@@ -905,17 +962,17 @@ def engineer_and_write_rv_momentum_range_features() -> Path:
     Write to intermediate parquet file.
 
     Categories:
-    - RV: rv_300s, rv_900s (2 raw) + 10 EMAs/SMAs = 22 features
+    - RV: rv_60s, rv_300s, rv_900s (3 raw) + 10 EMAs/SMAs = 23 features (added rv_60s for V4)
     - Momentum: momentum_300s, momentum_900s (2 raw) + 10 EMAs/SMAs = 22 features
     - Range: range_300s, range_900s (2 raw) + 10 EMAs/SMAs = 22 features
     - Derived ratios: 4 features (rv_ratio_5m_1m, etc.)
     - EMAs: 1 raw EMA (ema_900s) - REMOVED ema_12s, ema_60s, ema_300s (correlated)
     - EMA ratios: 1 feature (price_vs_ema_900) - REMOVED 4 ratios depending on correlated EMAs
 
-    Total: 71 features (was 79, removed 8 correlated features)
+    Total: 72 features (was 79, removed 8 correlated features, added rv_60s)
 
     Returns:
-        Path to intermediate parquet file (63M rows × 72 columns)
+        Path to intermediate parquet file (63M rows × 73 columns)
     """
     logger.info("=" * 80)
     logger.info("MODULE 7: Engineering RV/Momentum/Range Features")
@@ -925,6 +982,7 @@ def engineer_and_write_rv_momentum_range_features() -> Path:
     df = pl.scan_parquet(RV_FILE).select(
         [
             "timestamp_seconds",
+            "rv_60s",  # Needed by normalize_orderbook_features in V4 transformations
             "rv_300s",
             "rv_900s",
         ]
@@ -1034,8 +1092,8 @@ def engineer_and_write_rv_momentum_range_features() -> Path:
         ]
     )
 
-    # Join EMAs
-    df = df.join(advanced, on="timestamp_seconds", how="left")
+    # Join EMAs (use suffix to avoid conflicts)
+    df = df.join(advanced, on="timestamp_seconds", how="left", suffix="_advanced")
 
     # Load baseline for price
     logger.info(f"Loading baseline for price: {BASELINE_FILE}")
@@ -1051,7 +1109,8 @@ def engineer_and_write_rv_momentum_range_features() -> Path:
         ["timestamp_seconds", "S"]
     )
 
-    df = df.join(baseline, on="timestamp_seconds", how="left")
+    # Join baseline (use suffix to avoid conflicts)
+    df = df.join(baseline, on="timestamp_seconds", how="left", suffix="_baseline")
 
     # EMA ratios (price normalized by EMAs)
     df = df.with_columns(
@@ -1066,7 +1125,8 @@ def engineer_and_write_rv_momentum_range_features() -> Path:
     df = df.select(
         [
             "timestamp_seconds",
-            # RV (22)
+            # RV (23) - added rv_60s for V4 transformations
+            "rv_60s",
             "rv_300s",
             "rv_900s",
             "rv_300s_ema_60s",
@@ -1117,7 +1177,7 @@ def engineer_and_write_rv_momentum_range_features() -> Path:
     logger.info(f"Writing RV/momentum/range features to {output_file}...")
     df.sink_parquet(output_file, compression="snappy")
 
-    logger.info("✓ Wrote ~45 RV/momentum/range features (pruned)")
+    logger.info("✓ Wrote ~46 RV/momentum/range features (pruned, added rv_60s for V4)")
 
     return output_file
 
@@ -1133,36 +1193,45 @@ def add_advanced_moneyness_features(df: pl.LazyFrame) -> pl.LazyFrame:
     """
     logger.info("Adding advanced moneyness features...")
 
-    df = df.with_columns(
-        [
-            # Log moneyness (handles extreme values better)
-            (pl.col("S") / pl.col("K")).log().alias("log_moneyness"),
-            # Squared moneyness (captures non-linear effects)
-            ((pl.col("S") / pl.col("K")) - 1).pow(2).alias("moneyness_squared"),
-            # Cubed moneyness (asymmetric effects)
-            ((pl.col("S") / pl.col("K")) - 1).pow(3).alias("moneyness_cubed"),
-            # Standardized moneyness (normalized by recent history - using 7 day window)
+    # Check if rv_60s is available (for moneyness_x_vol interaction)
+    schema = df.collect_schema()
+    has_rv_60s = "rv_60s" in schema.names()
+
+    features_to_add = [
+        # Log moneyness (handles extreme values better)
+        (pl.col("S") / pl.col("K")).log().alias("log_moneyness"),
+        # Squared moneyness (captures non-linear effects)
+        ((pl.col("S") / pl.col("K")) - 1).pow(2).alias("moneyness_squared"),
+        # Cubed moneyness (asymmetric effects)
+        ((pl.col("S") / pl.col("K")) - 1).pow(3).alias("moneyness_cubed"),
+        # Standardized moneyness (normalized by recent history - using 7 day window)
+        (
             (
                 (pl.col("S") / pl.col("K"))
                 - (pl.col("S") / pl.col("K")).mean().over(pl.col("timestamp").dt.truncate("7d"))
             )
-            / ((pl.col("S") / pl.col("K")).std().over(pl.col("timestamp").dt.truncate("7d")) + 1e-10).alias(
-                "standardized_moneyness"
-            ),
-            # Interaction: moneyness × time remaining
-            ((pl.col("S") / pl.col("K")) - 1) * pl.col("time_remaining").alias("moneyness_x_time"),
-            # Interaction: moneyness × volatility
-            ((pl.col("S") / pl.col("K")) - 1) * pl.col("rv_60s").alias("moneyness_x_vol"),
-            # Moneyness distance from strike (absolute)
-            ((pl.col("S") / pl.col("K")) - 1).abs().alias("moneyness_distance"),
-            # Moneyness percentile (relative to recent history)
+            / ((pl.col("S") / pl.col("K")).std().over(pl.col("timestamp").dt.truncate("7d")) + 1e-10)
+        ).alias("standardized_moneyness"),
+        # Interaction: moneyness × time remaining
+        (((pl.col("S") / pl.col("K")) - 1) * pl.col("time_remaining")).alias("moneyness_x_time"),
+        # Moneyness distance from strike (absolute)
+        ((pl.col("S") / pl.col("K")) - 1).abs().alias("moneyness_distance"),
+        # Moneyness percentile (relative to recent history)
+        (
             (pl.col("S") / pl.col("K"))
             .rank("dense")
             .over(pl.col("timestamp").dt.truncate("1d"))
             .truediv(pl.col("S").count().over(pl.col("timestamp").dt.truncate("1d")))
-            .alias("moneyness_percentile"),
-        ]
-    )
+        ).alias("moneyness_percentile"),
+    ]
+
+    # Add moneyness × volatility interaction only if rv_60s is available
+    if has_rv_60s:
+        features_to_add.append(
+            (((pl.col("S") / pl.col("K")) - 1) * pl.col("rv_60s")).alias("moneyness_x_vol")
+        )
+
+    df = df.with_columns(features_to_add)
 
     return df
 
@@ -1223,7 +1292,9 @@ def add_volatility_asymmetry_features(df: pl.LazyFrame) -> pl.LazyFrame:
         )
 
     # IV-RV spread decomposition (using existing sigma_mid if available)
-    if "sigma_mid" in df.columns:
+    # Check schema instead of .columns to avoid unnecessary resolution
+    schema = df.collect_schema()
+    if "sigma_mid" in schema.names():
         df = df.with_columns(
             [
                 # Decompose IV-RV spread by downside and upside
@@ -1246,40 +1317,42 @@ def normalize_orderbook_features(df: pl.LazyFrame) -> pl.LazyFrame:
     """
     Normalize order book features relative to price and volatility.
 
-    V4 Enhancement: 15 new features (5 levels × 3 normalizations).
+    V4 Enhancement (Simplified): Uses actual columns from Module 3 (L0) and Module 4 (5-level).
+
+    NOTE: Original design expected level-by-level orderbook columns (ob_spread_bps_level1-5)
+    which are not created by any module. This simplified version uses available aggregated
+    columns: bid_ask_spread_bps, depth_imbalance_5, weighted_mid_price_5.
+
+    Creates 3 normalized features instead of original 15.
     """
-    logger.info("Normalizing orderbook features...")
+    logger.info("Normalizing orderbook features (using available columns)...")
 
-    for level in range(1, 6):  # 5 orderbook levels
-        # Check if columns exist
-        spread_col = f"ob_spread_bps_level{level}"
-        mid_col = f"ob_mid_price_level{level}"
-        bid_col = f"ob_bid_size_level{level}"
-        ask_col = f"ob_ask_size_level{level}"
-        imbalance_col = f"ob_imbalance_level{level}"
+    # Normalize bid-ask spread by volatility (from Module 3)
+    # Spread normalized by realized volatility indicates relative transaction cost
+    df = df.with_columns(
+        [
+            (pl.col("bid_ask_spread_bps") / (pl.col("rv_60s") * 10000 + 1e-10)).alias("spread_vol_normalized"),
+        ]
+    )
 
-        # Only add if base columns exist
-        if spread_col in df.columns:
-            df = df.with_columns(
-                [
-                    # Spread relative to price level
-                    (pl.col(spread_col) / (pl.col(mid_col) + 1e-10)).alias(f"ob_spread_relative_level{level}"),
-                    # Spread adjusted for volatility context
-                    (pl.col(spread_col) / ((pl.col("rv_60s") * pl.col(mid_col)) + 1e-10)).alias(
-                        f"ob_spread_vol_adjusted_level{level}"
-                    ),
-                ]
-            )
+    # Normalize depth imbalance by volatility (from Module 4)
+    # Depth imbalance adjusted for market volatility context
+    df = df.with_columns(
+        [
+            (pl.col("depth_imbalance_5") / (pl.col("rv_60s") + 1e-10)).alias("depth_imbalance_vol_normalized"),
+        ]
+    )
 
-        if imbalance_col in df.columns and bid_col in df.columns and ask_col in df.columns:
-            df = df.with_columns(
-                [
-                    # Imbalance normalized by total volume
-                    (pl.col(imbalance_col) / (pl.col(bid_col) + pl.col(ask_col) + 1e-10)).alias(
-                        f"ob_imbalance_normalized_level{level}"
-                    ),
-                ]
-            )
+    # Weighted mid price velocity (change rate normalized by volatility)
+    # Uses EMA to estimate recent price movement
+    df = df.with_columns(
+        [
+            (
+                (pl.col("weighted_mid_price_5") - pl.col("weighted_mid_ema_60s"))
+                / (pl.col("weighted_mid_ema_60s") * pl.col("rv_60s") + 1e-10)
+            ).alias("weighted_mid_velocity_normalized"),
+        ]
+    )
 
     return df
 
@@ -1296,12 +1369,15 @@ def detect_extreme_conditions(df: pl.LazyFrame) -> pl.LazyFrame:
     """
     logger.info("Adding extreme condition detection...")
 
+    # Use rolling quantile (30 days ≈ 2,592,000 seconds)
+    thirty_days_seconds = 30 * 24 * 3600
+
     df = df.with_columns(
         [
             # Compute RV ratio
             (pl.col("rv_60s") / (pl.col("rv_900s") + 1e-10)).alias("rv_ratio"),
-            # Compute 95th percentile of RV_900s over last 30 days
-            pl.col("rv_900s").quantile(0.95).over(pl.col("timestamp").dt.truncate("30d")).alias("rv_95th_percentile"),
+            # Compute 95th percentile of RV_900s over last 30 days using rolling window
+            pl.col("rv_900s").rolling_quantile(0.95, window_size=thirty_days_seconds).alias("rv_95th_percentile"),
         ]
     )
 
@@ -1309,11 +1385,11 @@ def detect_extreme_conditions(df: pl.LazyFrame) -> pl.LazyFrame:
     df = df.with_columns(
         [
             pl.when((pl.col("rv_ratio") > 3) | (pl.col("rv_900s") > pl.col("rv_95th_percentile")))
-            .then(True)
-            .otherwise(False)
+            .then(pl.lit(True))
+            .otherwise(pl.lit(False))
             .alias("is_extreme_condition"),
             # Position scaling factor (50% reduction during extremes)
-            pl.when(pl.col("is_extreme_condition")).then(0.5).otherwise(1.0).alias("position_scale"),
+            pl.when(pl.col("rv_ratio") > 3).then(pl.lit(0.5)).otherwise(pl.lit(1.0)).alias("position_scale"),
         ]
     )
 
@@ -1331,11 +1407,14 @@ def detect_regime_with_hysteresis(df: pl.LazyFrame, hysteresis: float = 0.1) -> 
     """
     logger.info("Adding regime detection with hysteresis...")
 
+    # Use rolling quantiles (30 days ≈ 2,592,000 seconds)
+    thirty_days_seconds = 30 * 24 * 3600
+
     # Monthly percentile computation for non-stationary thresholds
     df = df.with_columns(
         [
-            pl.col("rv_900s").quantile(0.33).over(pl.col("timestamp").dt.truncate("30d")).alias("vol_low_thresh"),
-            pl.col("rv_900s").quantile(0.67).over(pl.col("timestamp").dt.truncate("30d")).alias("vol_high_thresh"),
+            pl.col("rv_900s").rolling_quantile(0.33, window_size=thirty_days_seconds).alias("vol_low_thresh"),
+            pl.col("rv_900s").rolling_quantile(0.67, window_size=thirty_days_seconds).alias("vol_high_thresh"),
         ]
     )
 
@@ -1475,6 +1554,7 @@ def join_all_features_temporal_chunking(
         )
 
         # Chain joins for this chunk (fits in memory with 256GB)
+        # Use suffixes to avoid column conflicts from source files
         chunk_df = (
             existing_chunk.join(funding_chunk, on="timestamp_seconds", how="left")
             .join(orderbook_l0_chunk, on="timestamp_seconds", how="left")
@@ -1484,12 +1564,27 @@ def join_all_features_temporal_chunking(
             .join(rv_chunk, on="timestamp_seconds", how="left")
         )
 
+        # Check if 'timestamp' column already exists from joins (from advanced/baseline files)
+        # If so, drop it before creating our own timestamp column for V4 transformations
+        schema = chunk_df.collect_schema()
+        if "timestamp" in schema.names():
+            chunk_df = chunk_df.drop("timestamp")
+
+        # Convert timestamp_seconds to datetime for V4 transformations
+        # (V4 functions use .dt.truncate() for rolling windows which requires datetime)
+        chunk_df = chunk_df.with_columns(
+            [(pl.col("timestamp_seconds") * 1_000_000).cast(pl.Datetime("us")).alias("timestamp")]
+        )
+
         # Apply V4 feature transformations
         chunk_df = add_advanced_moneyness_features(chunk_df)
         chunk_df = add_volatility_asymmetry_features(chunk_df)
         chunk_df = normalize_orderbook_features(chunk_df)
         chunk_df = detect_extreme_conditions(chunk_df)
         chunk_df = detect_regime_with_hysteresis(chunk_df)
+
+        # Drop temporary timestamp column (keep only timestamp_seconds)
+        chunk_df = chunk_df.drop("timestamp")
 
         # Collect and write chunk
         chunk_result = chunk_df.collect()

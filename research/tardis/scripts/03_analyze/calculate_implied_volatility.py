@@ -251,8 +251,8 @@ def add_time_to_expiry(df: pl.DataFrame) -> pl.DataFrame:
         ]
     )
 
-    # Drop temporary columns
-    df = df.drop(["expiry_timestamp", "expiry_datetime", "timestamp_dt"])
+    # Drop temporary columns (keep expiry_timestamp for V4 backtest)
+    df = df.drop(["expiry_datetime", "timestamp_dt"])
 
     # Filter out invalid time_to_expiry
     invalid_count = df.filter(pl.col("time_to_expiry").is_null() | (pl.col("time_to_expiry") <= 0)).shape[0]
