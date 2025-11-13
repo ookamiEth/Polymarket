@@ -50,8 +50,6 @@ import polars as pl
 import psutil
 from sklearn.preprocessing import StandardScaler
 
-from impute_missing_features_v4 import impute_binance_features
-
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -435,15 +433,6 @@ def engineer_and_write_funding_features() -> Path:
         ]
     )
 
-    # Impute missing features for date gaps (2023-09-26 to 2023-09-30, 2025-10-01 to 2025-11-05)
-    logger.info("Imputing missing funding features for date gaps...")
-    df = impute_binance_features(
-        df,
-        feature_type="funding",
-        valid_start_ts=1696118400,  # 2023-10-01 00:00:00 UTC
-        valid_end_ts=1759276799,  # 2025-09-30 23:59:59 UTC
-    )
-
     # Write to intermediate file (streaming write - no memory spike)
     output_file = INTERMEDIATE_DIR / "02_funding_features.parquet"
     logger.info(f"Writing funding features to {output_file}...")
@@ -584,15 +573,6 @@ def engineer_and_write_orderbook_l0_features() -> Path:
             # REMOVED: imbalance_vol_1800s
             "imbalance_vol_3600s",
         ]
-    )
-
-    # Impute missing features for date gaps
-    logger.info("Imputing missing orderbook L0 features for date gaps...")
-    df = impute_binance_features(
-        df,
-        feature_type="orderbook",
-        valid_start_ts=1696118400,  # 2023-10-01 00:00:00 UTC
-        valid_end_ts=1759276799,  # 2025-09-30 23:59:59 UTC
     )
 
     # Write to intermediate file (streaming write - no memory spike)
@@ -781,15 +761,6 @@ def engineer_and_write_orderbook_5level_features() -> Path:
         ]
     )
 
-    # Impute missing features for date gaps
-    logger.info("Imputing missing orderbook 5-level features for date gaps...")
-    df = impute_binance_features(
-        df,
-        feature_type="orderbook_5level",
-        valid_start_ts=1696118400,  # 2023-10-01 00:00:00 UTC
-        valid_end_ts=1759276799,  # 2025-09-30 23:59:59 UTC
-    )
-
     # Write to intermediate file (streaming write - no memory spike)
     output_file = INTERMEDIATE_DIR / "04_orderbook_5level_features.parquet"
     logger.info(f"Writing orderbook 5-level features to {output_file}...")
@@ -867,15 +838,6 @@ def engineer_and_write_price_basis_features() -> Path:
         ]
     )
 
-    # Impute missing features for date gaps
-    logger.info("Imputing missing price basis features for date gaps...")
-    df = impute_binance_features(
-        df,
-        feature_type="price_basis",
-        valid_start_ts=1696118400,  # 2023-10-01 00:00:00 UTC
-        valid_end_ts=1759276799,  # 2025-09-30 23:59:59 UTC
-    )
-
     # Write to intermediate file (streaming write - no memory spike)
     output_file = INTERMEDIATE_DIR / "05_price_basis_features.parquet"
     logger.info(f"Writing price basis features to {output_file}...")
@@ -935,15 +897,6 @@ def engineer_and_write_oi_features() -> Path:
             "oi_ema_900s",
             "oi_ema_3600s",
         ]
-    )
-
-    # Impute missing features for date gaps
-    logger.info("Imputing missing OI features for date gaps...")
-    df = impute_binance_features(
-        df,
-        feature_type="open_interest",
-        valid_start_ts=1696118400,  # 2023-10-01 00:00:00 UTC
-        valid_end_ts=1759276799,  # 2025-09-30 23:59:59 UTC
     )
 
     # Write to intermediate file (streaming write - no memory spike)
@@ -1182,6 +1135,129 @@ def engineer_and_write_rv_momentum_range_features() -> Path:
     return output_file
 
 
+def engineer_and_write_extreme_regime_features(rv_momentum_range_file: Path, existing_file: Path) -> Path:
+    """
+    Engineer 9 extreme condition and regime features on FULL dataset (before chunking).
+
+    CRITICAL: This module computes 30-day rolling windows on the complete dataset
+    to avoid null issues from temporal chunking boundaries.
+
+    Features:
+    - rv_ratio (rv_60s / rv_900s)
+    - rv_95th_percentile (30-day rolling quantile)
+    - is_extreme_condition (boolean flag)
+    - position_scale (risk adjustment factor)
+    - vol_low_thresh (30-day 33rd percentile)
+    - vol_high_thresh (30-day 67th percentile)
+    - volatility_regime (low/medium/high)
+    - market_regime (combined vol + moneyness)
+
+    Returns:
+        Path to intermediate parquet file (66.7M rows × 10 columns: timestamp_seconds + 9 features)
+    """
+    logger.info("=" * 80)
+    logger.info("MODULE 7b: Engineering Extreme/Regime Features (Full Dataset)")
+    logger.info("=" * 80)
+
+    # Load RV features from Module 7
+    logger.info(f"Loading RV features: {rv_momentum_range_file}")
+    df = pl.scan_parquet(rv_momentum_range_file).select(["timestamp_seconds", "rv_60s", "rv_900s"])
+
+    # Load S and K to compute moneyness_distance (needed for market_regime)
+    logger.info(f"Loading S and K from: {existing_file}")
+    existing = pl.scan_parquet(existing_file).select(["timestamp_seconds", "S", "K"]).with_columns([
+        ((pl.col("S") / pl.col("K")) - 1).abs().alias("moneyness_distance")
+    ]).select(["timestamp_seconds", "moneyness_distance"])
+
+    # Join
+    df = df.join(existing, on="timestamp_seconds", how="left")
+
+    logger.info("Computing extreme condition features on FULL dataset...")
+    logger.info("  (30-day rolling windows computed WITHOUT chunking to avoid boundary nulls)")
+
+    # Detect extreme conditions (includes 30-day rolling quantile)
+    thirty_days_seconds = 30 * 24 * 3600
+
+    df = df.with_columns(
+        [
+            # Compute RV ratio
+            (pl.col("rv_60s") / (pl.col("rv_900s") + 1e-10)).alias("rv_ratio"),
+            # Compute 95th percentile of RV_900s over last 30 days using rolling window
+            pl.col("rv_900s").rolling_quantile(0.95, window_size=thirty_days_seconds).alias("rv_95th_percentile"),
+        ]
+    )
+
+    # Flag extreme conditions
+    df = df.with_columns(
+        [
+            pl.when((pl.col("rv_ratio") > 3) | (pl.col("rv_900s") > pl.col("rv_95th_percentile")))
+            .then(pl.lit(True))
+            .otherwise(pl.lit(False))
+            .alias("is_extreme_condition"),
+            # Position scaling factor (50% reduction during extremes)
+            pl.when(pl.col("rv_ratio") > 3).then(pl.lit(0.5)).otherwise(pl.lit(1.0)).alias("position_scale"),
+        ]
+    )
+
+    logger.info("Computing regime detection features on FULL dataset...")
+
+    # Monthly percentile computation for non-stationary thresholds
+    df = df.with_columns(
+        [
+            pl.col("rv_900s").rolling_quantile(0.33, window_size=thirty_days_seconds).alias("vol_low_thresh"),
+            pl.col("rv_900s").rolling_quantile(0.67, window_size=thirty_days_seconds).alias("vol_high_thresh"),
+        ]
+    )
+
+    # Add regime columns based on thresholds
+    df = df.with_columns(
+        [
+            pl.when(pl.col("rv_900s") < pl.col("vol_low_thresh"))
+            .then(pl.lit("low"))
+            .when(pl.col("rv_900s") > pl.col("vol_high_thresh"))
+            .then(pl.lit("high"))
+            .otherwise(pl.lit("medium"))
+            .alias("volatility_regime"),
+            # Combined regime with moneyness
+            pl.when((pl.col("rv_900s") < pl.col("vol_low_thresh")) & (pl.col("moneyness_distance") < 0.01))
+            .then(pl.lit("low_vol_atm"))
+            .when((pl.col("rv_900s") < pl.col("vol_low_thresh")) & (pl.col("moneyness_distance") >= 0.01))
+            .then(pl.lit("low_vol_otm"))
+            .when((pl.col("rv_900s") > pl.col("vol_high_thresh")) & (pl.col("moneyness_distance") < 0.01))
+            .then(pl.lit("high_vol_atm"))
+            .when((pl.col("rv_900s") > pl.col("vol_high_thresh")) & (pl.col("moneyness_distance") >= 0.01))
+            .then(pl.lit("high_vol_otm"))
+            .otherwise(pl.lit("medium_vol"))
+            .alias("market_regime"),
+        ]
+    )
+
+    # Select only extreme/regime features (drop rv_60s, rv_900s, moneyness_distance - those come from other modules)
+    df = df.select(
+        [
+            "timestamp_seconds",
+            "rv_ratio",
+            "rv_95th_percentile",
+            "is_extreme_condition",
+            "position_scale",
+            "vol_low_thresh",
+            "vol_high_thresh",
+            "volatility_regime",
+            "market_regime",
+        ]
+    )
+
+    # Write to intermediate file (streaming write - no memory spike)
+    output_file = INTERMEDIATE_DIR / "07b_extreme_regime_features.parquet"
+    logger.info(f"Writing extreme/regime features to {output_file}...")
+    df.sink_parquet(output_file, compression="snappy")
+
+    logger.info("✓ Wrote 8 extreme/regime features (computed on full dataset)")
+    logger.info("  (Expected nulls: ~3.89% from first 30 days only)")
+
+    return output_file
+
+
 # ==================== V4 New Feature Functions ====================
 
 
@@ -1227,9 +1303,7 @@ def add_advanced_moneyness_features(df: pl.LazyFrame) -> pl.LazyFrame:
 
     # Add moneyness × volatility interaction only if rv_60s is available
     if has_rv_60s:
-        features_to_add.append(
-            (((pl.col("S") / pl.col("K")) - 1) * pl.col("rv_60s")).alias("moneyness_x_vol")
-        )
+        features_to_add.append((((pl.col("S") / pl.col("K")) - 1) * pl.col("rv_60s")).alias("moneyness_x_vol"))
 
     df = df.with_columns(features_to_add)
 
@@ -1454,29 +1528,31 @@ def join_all_features_temporal_chunking(
     basis_file: Path,
     oi_file: Path,
     rv_momentum_range_file: Path,
+    extreme_regime_file: Path,
     memory_monitor: MemoryMonitor,
 ) -> Path:
     """
     Join all feature sources using temporal (3-month) chunking optimized for 256GB RAM.
 
     MEMORY-OPTIMIZED APPROACH:
-    - Processes data in 3-month chunks (63M rows → ~5.25M rows/chunk, ~12 chunks total)
-    - Joins all 6 sources within each chunk
+    - Processes data in 3-month chunks (66.7M rows → ~5.6M rows/chunk, ~12 chunks total)
+    - Joins all 8 sources within each chunk (added extreme/regime features)
     - Writes temporal chunks to disk
     - Concatenates chunks lazily at end
 
     This avoids Polars hash table memory explosion (100GB+) from chaining
-    6 joins on 63M rows. 3-month chunking reduces hash table size by 12x while
+    8 joins on 66.7M rows. 3-month chunking reduces hash table size by 12x while
     maintaining good performance (fewer disk I/O operations than daily chunking).
 
     Args:
         existing_file: Path to existing features (26 features)
-        funding_file: Path to funding features (11 features)
-        orderbook_l0_file: Path to L0 orderbook features (32 features)
+        funding_file: Path to funding features (5 features)
+        orderbook_l0_file: Path to L0 orderbook features (18 features)
         orderbook_5level_file: Path to 5-level orderbook features (31 features)
-        basis_file: Path to basis features (34 features)
-        oi_file: Path to OI features (6 features)
-        rv_momentum_range_file: Path to RV/momentum/range features (79 features)
+        basis_file: Path to basis features (5 features)
+        oi_file: Path to OI features (3 features)
+        rv_momentum_range_file: Path to RV/momentum/range features (46 features)
+        extreme_regime_file: Path to extreme/regime features (8 features) - COMPUTED ON FULL DATASET
         memory_monitor: Memory monitor instance
 
     Returns:
@@ -1552,6 +1628,10 @@ def join_all_features_temporal_chunking(
             (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) >= chunk_start)
             & (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) < chunk_end)
         )
+        extreme_regime_chunk = pl.scan_parquet(extreme_regime_file).filter(
+            (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) >= chunk_start)
+            & (pl.from_epoch("timestamp_seconds", time_unit="s").cast(pl.Date) < chunk_end)
+        )
 
         # Chain joins for this chunk (fits in memory with 256GB)
         # Use suffixes to avoid column conflicts from source files
@@ -1562,6 +1642,7 @@ def join_all_features_temporal_chunking(
             .join(basis_chunk, on="timestamp_seconds", how="left")
             .join(oi_chunk, on="timestamp_seconds", how="left")
             .join(rv_chunk, on="timestamp_seconds", how="left")
+            .join(extreme_regime_chunk, on="timestamp_seconds", how="left")
         )
 
         # Check if 'timestamp' column already exists from joins (from advanced/baseline files)
@@ -1577,11 +1658,11 @@ def join_all_features_temporal_chunking(
         )
 
         # Apply V4 feature transformations
+        # NOTE: Extreme/regime features are now pre-computed in Module 7b and joined above
+        #       (avoids 30-day rolling window null issues from chunking boundaries)
         chunk_df = add_advanced_moneyness_features(chunk_df)
         chunk_df = add_volatility_asymmetry_features(chunk_df)
         chunk_df = normalize_orderbook_features(chunk_df)
-        chunk_df = detect_extreme_conditions(chunk_df)
-        chunk_df = detect_regime_with_hysteresis(chunk_df)
 
         # Drop temporary timestamp column (keep only timestamp_seconds)
         chunk_df = chunk_df.drop("timestamp")
@@ -1767,6 +1848,10 @@ def main() -> None:
     rv_momentum_range_file = engineer_and_write_rv_momentum_range_features()
     memory_monitor.log_memory("After Module 7 (RV/momentum/range)")
 
+    # Module 7b: Generate and write extreme/regime features (computed on FULL dataset before chunking)
+    extreme_regime_file = engineer_and_write_extreme_regime_features(rv_momentum_range_file, existing_file)
+    memory_monitor.log_memory("After Module 7b (extreme/regime features)")
+
     # Module 8: Join all features using temporal chunking (writes output directly)
     output_file = join_all_features_temporal_chunking(
         existing_file,
@@ -1776,6 +1861,7 @@ def main() -> None:
         basis_file,
         oi_file,
         rv_momentum_range_file,
+        extreme_regime_file,
         memory_monitor,
     )
     memory_monitor.log_memory("After Module 8 (temporal chunking)")
