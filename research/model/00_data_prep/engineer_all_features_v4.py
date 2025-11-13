@@ -1165,25 +1165,42 @@ def engineer_and_write_extreme_regime_features(rv_momentum_range_file: Path, exi
 
     # Load S and K to compute moneyness_distance (needed for market_regime)
     logger.info(f"Loading S and K from: {existing_file}")
-    existing = pl.scan_parquet(existing_file).select(["timestamp_seconds", "S", "K"]).with_columns([
-        ((pl.col("S") / pl.col("K")) - 1).abs().alias("moneyness_distance")
-    ]).select(["timestamp_seconds", "moneyness_distance"])
+    existing = (
+        pl.scan_parquet(existing_file)
+        .select(["timestamp_seconds", "S", "K"])
+        .with_columns([((pl.col("S") / pl.col("K")) - 1).abs().alias("moneyness_distance")])
+        .select(["timestamp_seconds", "moneyness_distance"])
+    )
 
     # Join
     df = df.join(existing, on="timestamp_seconds", how="left")
 
     logger.info("Computing extreme condition features on FULL dataset...")
     logger.info("  (30-day rolling windows computed WITHOUT chunking to avoid boundary nulls)")
+    logger.info("  Sorting by timestamp for time-based rolling windows...")
+
+    # CRITICAL: Sort by timestamp for time-based rolling windows
+    df = df.sort("timestamp_seconds")
+
+    # CRITICAL: Filter nulls before rolling operations (drops 900 warmup rows)
+    # rolling_*_by() does not support nulls in Polars streaming engine
+    # Filter BOTH rv_60s and rv_900s to ensure all columns used in subsequent operations are null-free
+    logger.info("  Filtering warmup nulls: rv_60s (60 rows) and rv_900s (900 rows)...")
+    df = df.filter(pl.col("rv_60s").is_not_null() & pl.col("rv_900s").is_not_null())
 
     # Detect extreme conditions (includes 30-day rolling quantile)
-    thirty_days_seconds = 30 * 24 * 3600
+    # Use TIME-BASED rolling windows, not row-based
+    # NOTE: window_size must be in seconds when using integer timestamp column
+    # 30 days = 30 * 24 * 60 * 60 = 2,592,000 seconds
 
     df = df.with_columns(
         [
             # Compute RV ratio
             (pl.col("rv_60s") / (pl.col("rv_900s") + 1e-10)).alias("rv_ratio"),
-            # Compute 95th percentile of RV_900s over last 30 days using rolling window
-            pl.col("rv_900s").rolling_quantile(0.95, window_size=thirty_days_seconds).alias("rv_95th_percentile"),
+            # Compute 95th percentile of RV_900s over last 30 DAYS (2,592,000 seconds)
+            pl.col("rv_900s")
+            .rolling_quantile_by(by="timestamp_seconds", window_size="2592000i", quantile=0.95)
+            .alias("rv_95th_percentile"),
         ]
     )
 
@@ -1201,11 +1218,16 @@ def engineer_and_write_extreme_regime_features(rv_momentum_range_file: Path, exi
 
     logger.info("Computing regime detection features on FULL dataset...")
 
-    # Monthly percentile computation for non-stationary thresholds
+    # Monthly percentile computation for non-stationary thresholds (TIME-BASED windows)
+    # 30 days = 2,592,000 seconds
     df = df.with_columns(
         [
-            pl.col("rv_900s").rolling_quantile(0.33, window_size=thirty_days_seconds).alias("vol_low_thresh"),
-            pl.col("rv_900s").rolling_quantile(0.67, window_size=thirty_days_seconds).alias("vol_high_thresh"),
+            pl.col("rv_900s")
+            .rolling_quantile_by(by="timestamp_seconds", window_size="2592000i", quantile=0.33)
+            .alias("vol_low_thresh"),
+            pl.col("rv_900s")
+            .rolling_quantile_by(by="timestamp_seconds", window_size="2592000i", quantile=0.67)
+            .alias("vol_high_thresh"),
         ]
     )
 
@@ -1443,15 +1465,21 @@ def detect_extreme_conditions(df: pl.LazyFrame) -> pl.LazyFrame:
     """
     logger.info("Adding extreme condition detection...")
 
-    # Use rolling quantile (30 days ≈ 2,592,000 seconds)
-    thirty_days_seconds = 30 * 24 * 3600
+    # CRITICAL: Sort by timestamp for time-based rolling windows
+    df = df.sort("timestamp_seconds")
+
+    # CRITICAL: Filter nulls before rolling operations
+    df = df.filter(pl.col("rv_900s").is_not_null())
 
     df = df.with_columns(
         [
             # Compute RV ratio
             (pl.col("rv_60s") / (pl.col("rv_900s") + 1e-10)).alias("rv_ratio"),
-            # Compute 95th percentile of RV_900s over last 30 days using rolling window
-            pl.col("rv_900s").rolling_quantile(0.95, window_size=thirty_days_seconds).alias("rv_95th_percentile"),
+            # Compute 95th percentile of RV_900s over last 30 days using time-based rolling window
+            # 30 days = 2,592,000 seconds
+            pl.col("rv_900s")
+            .rolling_quantile_by(by="timestamp_seconds", window_size="2592000i", quantile=0.95)
+            .alias("rv_95th_percentile"),
         ]
     )
 
@@ -1481,14 +1509,22 @@ def detect_regime_with_hysteresis(df: pl.LazyFrame, hysteresis: float = 0.1) -> 
     """
     logger.info("Adding regime detection with hysteresis...")
 
-    # Use rolling quantiles (30 days ≈ 2,592,000 seconds)
-    thirty_days_seconds = 30 * 24 * 3600
+    # CRITICAL: Sort by timestamp for time-based rolling windows
+    df = df.sort("timestamp_seconds")
 
-    # Monthly percentile computation for non-stationary thresholds
+    # CRITICAL: Filter nulls before rolling operations
+    df = df.filter(pl.col("rv_900s").is_not_null())
+
+    # Monthly percentile computation for non-stationary thresholds using time-based windows
+    # 30 days = 2,592,000 seconds
     df = df.with_columns(
         [
-            pl.col("rv_900s").rolling_quantile(0.33, window_size=thirty_days_seconds).alias("vol_low_thresh"),
-            pl.col("rv_900s").rolling_quantile(0.67, window_size=thirty_days_seconds).alias("vol_high_thresh"),
+            pl.col("rv_900s")
+            .rolling_quantile_by(by="timestamp_seconds", window_size="2592000i", quantile=0.33)
+            .alias("vol_low_thresh"),
+            pl.col("rv_900s")
+            .rolling_quantile_by(by="timestamp_seconds", window_size="2592000i", quantile=0.67)
+            .alias("vol_high_thresh"),
         ]
     )
 
