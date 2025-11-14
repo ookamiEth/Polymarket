@@ -136,8 +136,8 @@ FEATURE_COLS_V4 = [
     "mark_index_ema_3600s",
     "mark_index_ema_60s",
     "mark_index_ema_900s",
-    "market_regime",
-    "market_regime_4way",
+    # "market_regime",  # EXCLUDED: Categorical metadata (filtered by combined_regime)
+    # "market_regime_4way",  # EXCLUDED: Categorical metadata
     "momentum_300s",
     "momentum_300s_ema_300s",
     "momentum_300s_ema_3600s",
@@ -210,7 +210,7 @@ FEATURE_COLS_V4 = [
     "spread_vol_normalized",
     "standardized_moneyness",
     "tail_risk_300s",
-    "temporal_regime",
+    # "temporal_regime",  # EXCLUDED: Categorical metadata (filtered by time range)
     "time_remaining",
     "time_since_high_15m",
     "time_since_low_15m",
@@ -389,8 +389,12 @@ def train_model_walk_forward(
     # Calculate holdout test period (last N months)
     from dateutil.relativedelta import relativedelta
 
-    # If holdout_months=3, we want last 3 full months, so subtract 3 months and add 1 day
-    # Example: max_date=2024-12-31, holdout_months=3 -> holdout_start=2024-10-01
+    # Holdout calculation: Reserve last N full months for final testing
+    # Example: max_date=2024-12-31, holdout_months=3
+    #   -> max_date.replace(day=1) = 2024-12-01 (first day of last month)
+    #   -> subtract (3-1)=2 months = 2024-10-01
+    #   -> holdout_start = 2024-10-01 (3 full months: Oct, Nov, Dec)
+    #   -> walk_forward_end = 2024-09-30 (day before holdout)
     holdout_start = max_date.replace(day=1) - relativedelta(months=holdout_months - 1)
     walk_forward_end = holdout_start - relativedelta(days=1)
 
@@ -399,13 +403,15 @@ def train_model_walk_forward(
     logger.info(f"Holdout test: {holdout_start} to {max_date}")
 
     # Generate walk-forward windows with embargo period
+    # EXPANDING WINDOW: train_start stays at min_date, train_end advances each window
     windows: list[
         tuple[date, date, date, date, date, date]
     ] = []  # (train_start, train_end, embargo_start, embargo_end, val_start, val_end)
-    current_start = min_date
+    train_start = min_date
+    current_train_end = min_date + relativedelta(months=train_months) - relativedelta(days=1)
 
     while True:
-        train_end = current_start + relativedelta(months=train_months) - relativedelta(days=1)
+        train_end = current_train_end
 
         # Add embargo period (gap between train and val)
         if embargo_days > 0:
@@ -424,20 +430,33 @@ def train_model_walk_forward(
         if val_end >= holdout_start:
             break
 
-        windows.append((current_start, train_end, embargo_start, embargo_end, val_start, val_end))
+        windows.append((train_start, train_end, embargo_start, embargo_end, val_start, val_end))
 
-        # Step forward (expanding window)
-        current_start += relativedelta(months=step_months)
+        # Step forward (expanding window: only advance train_end, keep train_start fixed)
+        current_train_end += relativedelta(months=step_months)
 
     logger.info(f"Generated {len(windows)} walk-forward windows")
 
     # Train and validate on each window
     window_metrics: list[dict[str, Any]] = []
+    failed_windows: list[int] = []
+    skipped_windows: list[int] = []
     walk_forward_start_time = time.time()
 
     for window_idx, (train_start, train_end, embargo_start, embargo_end, val_start, val_end) in enumerate(windows, 1):
+        # Progress indicator
+        progress_pct = (window_idx / len(windows)) * 100
+        elapsed = time.time() - walk_forward_start_time
+        if window_idx > 1:
+            avg_time_per_window = elapsed / (window_idx - 1)
+            remaining_windows = len(windows) - window_idx + 1
+            eta_seconds = avg_time_per_window * remaining_windows
+            eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+        else:
+            eta_str = "estimating..."
+
         logger.info(f"\n{'─' * 80}")
-        logger.info(f"Window {window_idx}/{len(windows)}")
+        logger.info(f"Window {window_idx}/{len(windows)} [{progress_pct:.1f}%] | ETA: {eta_str}")
         logger.info(f"  Train:   {train_start} to {train_end}")
         if embargo_days > 0:
             logger.info(f"  Embargo: {embargo_start} to {embargo_end} ({embargo_days} day(s))")
@@ -457,6 +476,7 @@ def train_model_walk_forward(
 
         if n_train < 10000 or n_val < 1000:
             logger.warning(f"⚠ Skipping window {window_idx}: insufficient samples")
+            skipped_windows.append(window_idx)
             continue
 
         # Write temporary files
@@ -532,12 +552,14 @@ def train_model_walk_forward(
                 }
             )
 
-            # Clean up
-            del train_data, val_data, model
-            gc.collect()
+            # Clean up memory explicitly between windows
+            del train_data, val_data, model, val_df_for_ic, val_features_array, val_outcomes
+            del val_predictions_raw, val_predictions
+            gc.collect()  # Force garbage collection to free memory before next window
 
         except Exception as e:
             logger.error(f"Error training window {window_idx}: {e}")
+            failed_windows.append(window_idx)
             continue
 
         finally:
@@ -547,9 +569,33 @@ def train_model_walk_forward(
 
         monitor.check_memory(f"After window {window_idx}")
 
-    if len(window_metrics) == 0:
+    # Validate window success rate
+    total_windows = len(windows)
+    successful_windows = len(window_metrics)
+    success_rate = successful_windows / total_windows if total_windows > 0 else 0.0
+
+    logger.info(f"\n{'=' * 80}")
+    logger.info("WALK-FORWARD WINDOW SUMMARY")
+    logger.info(f"{'=' * 80}")
+    logger.info(f"Total windows: {total_windows}")
+    logger.info(f"Successful:    {successful_windows} ({success_rate:.1%})")
+    logger.info(f"Skipped:       {len(skipped_windows)} (insufficient data)")
+    logger.info(f"Failed:        {len(failed_windows)} (training errors)")
+
+    if len(failed_windows) > 0:
+        logger.warning(f"Failed windows: {failed_windows}")
+    if len(skipped_windows) > 0:
+        logger.info(f"Skipped windows: {skipped_windows}")
+
+    # Fail if success rate too low
+    if successful_windows == 0:
         msg = "No windows produced valid models"
         raise ValueError(msg)
+    if success_rate < 0.5:
+        msg = f"Only {success_rate:.1%} of windows succeeded (minimum: 50%). Check data quality."
+        raise ValueError(msg)
+    if success_rate < 0.7:
+        logger.warning(f"⚠ Low success rate: {success_rate:.1%} of windows succeeded")
 
     # Aggregate validation metrics
     logger.info(f"\n{'=' * 80}")
@@ -784,7 +830,7 @@ def main() -> None:
         logger.info("✓ W&B run initialized")
 
     # Setup paths
-    output_dir = model_dir / Path(config["data"]["output_dir"])
+    output_dir = model_dir / Path(config["training"]["output_dir"])
     models_dir = model_dir / Path(config["models"]["output_dir"])
 
     # Get pipeline-ready features file (V4)
@@ -844,12 +890,27 @@ def main() -> None:
 
     # Train each model
     all_metrics = {}
+    total_models = len(models_to_train)
+    models_start_time = time.time()
 
-    for model_name, time_min, time_max in models_to_train:
+    for model_idx, (model_name, time_min, time_max) in enumerate(models_to_train, 1):
         model_config = config["hybrid_models"][model_name]
 
+        # Overall progress tracking
+        overall_progress = (model_idx - 1) / total_models * 100
+        if model_idx > 1:
+            elapsed = time.time() - models_start_time
+            avg_time_per_model = elapsed / (model_idx - 1)
+            remaining_models = total_models - model_idx + 1
+            eta_seconds = avg_time_per_model * remaining_models
+            eta_hours = int(eta_seconds // 3600)
+            eta_mins = int((eta_seconds % 3600) // 60)
+            eta_str = f"{eta_hours}h {eta_mins}m"
+        else:
+            eta_str = "estimating..."
+
         logger.info(f"\n{'#' * 80}")
-        logger.info(f"# MODEL: {model_name}")
+        logger.info(f"# MODEL {model_idx}/{total_models}: {model_name} [{overall_progress:.1f}%] | ETA: {eta_str}")
         logger.info(f"# Bucket: {model_config['bucket']}")
         logger.info(f"# Regime: {model_config['regime']}")
         logger.info(f"# Time range: {time_min}-{time_max}s")

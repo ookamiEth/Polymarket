@@ -9,6 +9,7 @@ This module provides:
 
 import shutil
 from pathlib import Path
+from typing import Optional
 
 import polars as pl
 import pytest
@@ -116,6 +117,103 @@ def synthetic_predictions_df() -> pl.DataFrame:
             "time_remaining": [100, 150, 200, 250, 350, 400, 450, 500, 700, 800],
         }
     )
+
+
+# ============================================================================
+# V4 SYNTHETIC DATA FIXTURES
+# ============================================================================
+
+
+@pytest.fixture
+def v4_synthetic_small() -> pl.DataFrame:
+    """
+    Generate small V4 dataset (1K rows) for fast tests.
+
+    Returns:
+        DataFrame with all 156 V4 features + regime columns
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    from synthetic_v4_data_generator import generate_v4_features  # type: ignore
+
+    return generate_v4_features(n_samples=1000, regime_distribution="balanced", seed=42)
+
+
+@pytest.fixture
+def v4_synthetic_medium() -> pl.DataFrame:
+    """
+    Generate medium V4 dataset (10K rows) for moderate tests.
+
+    Returns:
+        DataFrame with all 156 V4 features + regime columns
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    from synthetic_v4_data_generator import generate_v4_features  # type: ignore
+
+    return generate_v4_features(n_samples=10_000, regime_distribution="realistic", seed=42)
+
+
+@pytest.fixture
+def v4_synthetic_large() -> pl.DataFrame:
+    """
+    Generate large V4 dataset (100K rows) for integration tests.
+
+    Returns:
+        DataFrame with all 156 V4 features + regime columns
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    from synthetic_v4_data_generator import generate_v4_features  # type: ignore
+
+    return generate_v4_features(n_samples=100_000, regime_distribution="realistic", seed=42)
+
+
+@pytest.fixture
+def v4_edge_case_missing_features() -> pl.DataFrame:
+    """Load edge case: missing features."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    from edge_case_fixtures import create_missing_features_data  # type: ignore
+
+    return create_missing_features_data()
+
+
+@pytest.fixture
+def v4_edge_case_nan_features() -> pl.DataFrame:
+    """Load edge case: NaN in features."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    from edge_case_fixtures import create_nan_features_data  # type: ignore
+
+    return create_nan_features_data()
+
+
+@pytest.fixture
+def v4_edge_case_nan_outcomes() -> pl.DataFrame:
+    """Load edge case: NaN in outcomes."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    from edge_case_fixtures import create_nan_outcomes_data  # type: ignore
+
+    return create_nan_outcomes_data()
+
+
+@pytest.fixture
+def v4_edge_case_duplicates() -> pl.DataFrame:
+    """Load edge case: duplicate timestamps."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    from edge_case_fixtures import create_duplicate_timestamps_data  # type: ignore
+
+    return create_duplicate_timestamps_data()
 
 
 # ============================================================================
@@ -283,3 +381,175 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')")
     config.addinivalue_line("markers", "integration: marks tests as integration tests")
     config.addinivalue_line("markers", "unit: marks tests as unit tests")
+    config.addinivalue_line("markers", "v4: marks tests specific to V4 pipeline")
+
+
+# ============================================================================
+# V4 ASSERTION HELPERS
+# ============================================================================
+
+
+def assert_v4_schema(df: pl.DataFrame, require_all_features: bool = True) -> None:
+    """
+    Assert DataFrame has valid V4 schema (156 features + regime columns).
+
+    Args:
+        df: DataFrame to validate
+        require_all_features: If True, require all 156 features present
+
+    Raises:
+        AssertionError: If schema invalid
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    from synthetic_v4_data_generator import FEATURE_COLS_V4  # type: ignore
+
+    # Check required columns
+    required_cols = ["timestamp_seconds", "outcome", "prob_mid", "residual", "combined_regime", "date"]
+    for col in required_cols:
+        assert col in df.columns, f"Missing required column: {col}"
+
+    # Check features
+    if require_all_features:
+        missing_features = set(FEATURE_COLS_V4) - set(df.columns)
+        assert not missing_features, f"Missing {len(missing_features)} features: {sorted(missing_features)[:10]}..."
+    else:
+        # At least some features present
+        features_present = [f for f in FEATURE_COLS_V4 if f in df.columns]
+        assert len(features_present) > 0, "No V4 features found in DataFrame"
+
+
+def assert_no_duplicates(df: pl.DataFrame, key_cols: list[str]) -> None:
+    """
+    Assert no duplicate rows based on key columns.
+
+    Args:
+        df: DataFrame to check
+        key_cols: Columns that should be unique together
+
+    Raises:
+        AssertionError: If duplicates found
+    """
+    n_total = len(df)
+    n_unique = len(df.select(key_cols).unique())
+
+    assert n_total == n_unique, f"Found {n_total - n_unique} duplicate rows based on {key_cols}"
+
+
+def assert_regime_distribution(
+    df: pl.DataFrame,
+    expected_regimes: Optional[list[str]] = None,
+    min_samples_per_regime: int = 100,
+) -> None:
+    """
+    Assert regime distribution is valid.
+
+    Args:
+        df: DataFrame with combined_regime column
+        expected_regimes: List of expected regimes (default: all 12)
+        min_samples_per_regime: Minimum samples required per regime
+
+    Raises:
+        AssertionError: If distribution invalid
+    """
+    if expected_regimes is None:
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+        from synthetic_v4_data_generator import COMBINED_REGIMES  # type: ignore
+
+        expected_regimes = COMBINED_REGIMES
+
+    assert "combined_regime" in df.columns, "Missing combined_regime column"
+
+    regime_counts = df["combined_regime"].value_counts()
+    present_regimes = set(regime_counts["combined_regime"].to_list())
+
+    # Handle expected_regimes being None after conditional assignment
+    regimes_list = expected_regimes if expected_regimes is not None else []
+    expected_set = set(regimes_list)
+
+    missing_regimes = expected_set - present_regimes
+    if missing_regimes:
+        raise AssertionError(f"Missing regimes: {sorted(missing_regimes)}")
+
+    # Check minimum samples
+    for regime in regimes_list:
+        count = (
+            regime_counts.filter(pl.col("combined_regime") == regime)["count"][0] if regime in present_regimes else 0
+        )
+        assert count >= min_samples_per_regime, (
+            f"Regime {regime} has only {count} samples (min: {min_samples_per_regime})"
+        )
+
+
+def assert_no_nan_in_features(df: pl.DataFrame, feature_cols: list[str]) -> None:
+    """
+    Assert no NaN values in specified feature columns.
+
+    Args:
+        df: DataFrame to check
+        feature_cols: List of feature columns to check
+
+    Raises:
+        AssertionError: If NaN found
+    """
+    for col in feature_cols:
+        if col not in df.columns:
+            continue
+        n_nulls = df[col].null_count()
+        assert n_nulls == 0, f"Found {n_nulls} NaN values in {col}"
+
+
+def assert_feature_types(df: pl.DataFrame, expected_type: type[pl.DataType] = pl.Float64) -> None:
+    """
+    Assert feature columns have correct data types.
+
+    Args:
+        df: DataFrame to check
+        expected_type: Expected Polars data type for features
+
+    Raises:
+        AssertionError: If types incorrect
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    from synthetic_v4_data_generator import FEATURE_COLS_V4  # type: ignore
+
+    wrong_types = []
+    for col in FEATURE_COLS_V4:
+        if col not in df.columns:
+            continue
+        if df.schema[col] != expected_type:
+            wrong_types.append(f"{col}: {df.schema[col]} != {expected_type}")
+
+    assert not wrong_types, f"Found {len(wrong_types)} features with wrong types:\n" + "\n".join(wrong_types[:10])
+
+
+def assert_temporal_boundaries(df: pl.DataFrame, bucket: str, expected_min: float, expected_max: float) -> None:
+    """
+    Assert temporal regime boundaries are correct.
+
+    Args:
+        df: DataFrame with time_remaining column
+        bucket: Temporal bucket name (near/mid/far)
+        expected_min: Minimum time_remaining for bucket
+        expected_max: Maximum time_remaining for bucket
+
+    Raises:
+        AssertionError: If boundaries violated
+    """
+    assert "time_remaining" in df.columns, "Missing time_remaining column"
+    assert "temporal_regime" in df.columns, "Missing temporal_regime column"
+
+    bucket_df = df.filter(pl.col("temporal_regime") == bucket)
+    if len(bucket_df) == 0:
+        return  # No samples in this bucket
+
+    min_val = float(bucket_df["time_remaining"].min())  # type: ignore
+    max_val = float(bucket_df["time_remaining"].max())  # type: ignore
+
+    assert min_val >= expected_min, f"{bucket}: min time_remaining {min_val} < expected {expected_min}"
+    assert max_val <= expected_max, f"{bucket}: max time_remaining {max_val} > expected {expected_max}"

@@ -263,7 +263,11 @@ class V4OptunaObjective:
 
         # Walk-forward validation
         window_mses = []
-        output_dir = Path(f"/tmp/optuna_v4_{self.model_name}")
+        # Use tempfile for cross-platform compatibility
+        import tempfile
+
+        temp_base = Path(tempfile.gettempdir())
+        output_dir = temp_base / f"optuna_v4_{self.model_name}"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         for window_idx, (train_start, train_end, val_start, val_end) in enumerate(self.windows):
@@ -379,8 +383,8 @@ def optimize_model(
     search_space = get_hybrid_search_space(bucket, regime, config)
 
     # Get stratified data file
-    model_dir = Path(__file__).parent.parent
-    data_dir = model_dir / Path(config["data"]["output_dir"])
+    model_dir = Path(__file__).resolve().parent.parent
+    data_dir = model_dir / Path(config["training"]["output_dir"])
     data_file = data_dir / f"{model_name}_data.parquet"
 
     if not data_file.exists():
@@ -478,6 +482,17 @@ def optimize_model(
 
     logger.info(f"\n✓ Saved optimized config to {best_config_file}")
 
+    # Clean up temporary directory
+    import shutil
+
+    temp_base_dir = Path(f"/tmp/optuna_v4_{model_name}")
+    if temp_base_dir.exists():
+        try:
+            shutil.rmtree(temp_base_dir)
+            logger.info(f"✓ Cleaned up temp directory: {temp_base_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up temp directory {temp_base_dir}: {e}")
+
     monitor.check_memory("After optimization")
 
     return best_config
@@ -510,7 +525,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).parent.parent / "config" / "multi_horizon_regime_config.yaml",
+        default=Path(__file__).resolve().parent.parent / "config" / "multi_horizon_regime_config.yaml",
         help="Path to multi-horizon + regime config file",
     )
     parser.add_argument(
@@ -549,8 +564,8 @@ def main() -> None:
     if args.output_dir:
         output_dir = args.output_dir
     else:
-        model_dir = Path(__file__).parent.parent
-        output_dir = model_dir / Path(config["models"]["output_dir"]).parent / "models_optuna"
+        model_dir = Path(__file__).resolve().parent.parent
+        output_dir = model_dir / "01_pricing" / "models_optuna"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
