@@ -38,6 +38,17 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 import optuna
+
+# W&B integration (optional)
+try:
+    import wandb
+    from wandb.integration.optuna import WandbCallback  # type: ignore[import-not-found]
+
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None  # type: ignore[assignment]
+    WandbCallback = None  # type: ignore[assignment,misc]
 import polars as pl
 import yaml
 
@@ -306,9 +317,17 @@ class V4OptunaObjective:
                     callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],  # Silent
                 )
 
-                # Get validation MSE
+                # Get validation metric (RMSE) and convert to MSE
                 best_score = model.best_score
-                val_mse = best_score.get("val", {}).get("l2", 0.0)
+                if "val" not in best_score or "rmse" not in best_score["val"]:
+                    logger.warning(
+                        f"  Trial {trial.number} window {window_idx}: "
+                        f"Validation metric not found in best_score: {best_score}"
+                    )
+                    continue  # Skip this window
+
+                val_rmse = best_score["val"]["rmse"]
+                val_mse = val_rmse**2  # Convert RMSE to MSE
 
                 window_mses.append(val_mse)
 
@@ -431,6 +450,29 @@ def optimize_model(
         windows=windows,
     )
 
+    # Initialize W&B for Optuna tracking (if enabled)
+    wandb_run = None
+    wandb_callback = None
+    if config.get("wandb", {}).get("enabled", False) and WANDB_AVAILABLE:
+        try:
+            wandb_run = wandb.init(  # type: ignore[union-attr]
+                project=config["wandb"]["project"] + "-optuna",
+                name=f"optimize_{model_name}",
+                config={
+                    "model": model_name,
+                    "n_trials": n_trials,
+                    "n_jobs": n_jobs,
+                    "search_space": search_space,
+                },
+                tags=config["wandb"]["tags"] + ["optuna-optimization"],
+            )
+            wandb_callback = WandbCallback(metric_name="mean_validation_mse")  # type: ignore[misc]
+            logger.info("✓ W&B Optuna tracking enabled")
+        except Exception as e:
+            logger.warning(f"Failed to initialize W&B Optuna tracking: {e}")
+            wandb_run = None
+            wandb_callback = None
+
     # Optimize
     logger.info(f"\n{'=' * 80}")
     logger.info(f"RUNNING OPTIMIZATION ({n_trials} trials, {n_jobs} parallel jobs)")
@@ -443,6 +485,7 @@ def optimize_model(
         n_trials=n_trials,
         n_jobs=n_jobs,
         show_progress_bar=True,
+        callbacks=[wandb_callback] if wandb_callback else [],
     )
 
     optimization_time = (time.time() - start_time) / 60
@@ -482,6 +525,55 @@ def optimize_model(
 
     logger.info(f"\n✓ Saved optimized config to {best_config_file}")
 
+    # =========================================================================
+    # TRAIN FINAL MODEL WITH OPTIMIZED HYPERPARAMETERS
+    # =========================================================================
+    logger.info(f"\n{'=' * 80}")
+    logger.info("TRAINING FINAL MODEL WITH OPTIMIZED HYPERPARAMETERS")
+    logger.info(f"{'=' * 80}")
+
+    # Import training utilities
+    from train_multi_horizon_v4 import train_model_walk_forward
+
+    try:
+        # Get pipeline-ready data file
+        model_dir = Path(__file__).parent.parent
+        pipeline_ready_file = model_dir / "data" / "consolidated_features_v4_pipeline_ready.parquet"
+
+        if not pipeline_ready_file.exists():
+            raise FileNotFoundError(f"Pipeline-ready file not found: {pipeline_ready_file}")
+
+        # Train model on full walk-forward validation using optimized hyperparameters
+        final_model, metrics = train_model_walk_forward(
+            model_name=model_name,
+            model_config=model_config,
+            data_file=pipeline_ready_file,
+            hyperparameters={**fixed_params, **best_params},
+            features=features,
+            output_dir=output_dir,  # Temp files
+            walk_forward_config=config["walk_forward_validation"],
+            wandb_run=None,
+        )
+
+        # Save final model to models_optuna directory
+        final_model_path = output_dir / f"lightgbm_{model_name}.txt"
+        final_model.save_model(str(final_model_path))
+
+        logger.info(f"\n✓ Final optimized model saved to: {final_model_path}")
+        logger.info(f"  Walk-forward validation MSE: {metrics.get('mean_mse', 'N/A'):.6f}")
+        logger.info("  This model can now be used in evaluation and production")
+
+    except Exception as e:
+        logger.error(f"\n✗ Failed to train final model: {e}")
+        logger.error("  Optimized hyperparameters were saved, but model training failed")
+        logger.error("  You can manually train the model by running:")
+        logger.error(f"    cd {model_dir}")
+        logger.error(f"    uv run python train_multi_horizon_v4.py --model {model_name} \\")
+        logger.error("      --config ../config/multi_horizon_regime_config.yaml")
+        import traceback
+
+        traceback.print_exc()
+
     # Clean up temporary directory
     import shutil
 
@@ -494,6 +586,11 @@ def optimize_model(
             logger.warning(f"Failed to clean up temp directory {temp_base_dir}: {e}")
 
     monitor.check_memory("After optimization")
+
+    # Finish W&B run
+    if wandb_run is not None:
+        wandb_run.finish()
+        logger.info("✓ W&B Optuna run finished")
 
     return best_config
 

@@ -330,6 +330,7 @@ def train_model_walk_forward(
     output_dir: Path,
     walk_forward_config: dict[str, Any],
     wandb_run: Any | None = None,
+    wandb_config: dict[str, Any] | None = None,
 ) -> tuple[lgb.Booster, dict[str, Any]]:
     """
     Train LightGBM model using walk-forward validation.
@@ -552,6 +553,37 @@ def train_model_walk_forward(
                 }
             )
 
+            # Log per-window metrics to W&B in real-time (ACTIVE LOGGING)
+            if wandb_run is not None and wandb_config is not None and wandb_config.get("log_per_window", False):
+                # Log individual window metrics
+                wandb_run.log(
+                    {
+                        f"{model_name}/window_{window_idx}/residual_mse": residual_mse,
+                        f"{model_name}/window_{window_idx}/baseline_brier": baseline_brier_val,
+                        f"{model_name}/window_{window_idx}/spearman_ic": spearman_ic,
+                        f"{model_name}/window_{window_idx}/pearson_ic": pearson_ic,
+                        f"{model_name}/window_{window_idx}/ic_pvalue": ic_pvalue,
+                        f"{model_name}/window_{window_idx}/n_train": n_train,
+                        f"{model_name}/window_{window_idx}/n_val": n_val,
+                        f"{model_name}/window_{window_idx}/best_iteration": model.best_iteration,
+                        f"{model_name}/window_progress": window_idx,
+                        f"{model_name}/overall_progress_pct": (window_idx / len(windows)) * 100,
+                    }
+                )
+
+                # Log running statistics across windows so far
+                mses_so_far = [m["residual_mse"] for m in window_metrics]
+                ics_so_far = [m["spearman_ic"] for m in window_metrics]
+                wandb_run.log(
+                    {
+                        f"{model_name}/mean_mse_so_far": float(np.mean(mses_so_far)),
+                        f"{model_name}/std_mse_so_far": float(np.std(mses_so_far)),
+                        f"{model_name}/mean_ic_so_far": float(np.mean(ics_so_far)),
+                        f"{model_name}/std_ic_so_far": float(np.std(ics_so_far)),
+                    }
+                )
+                logger.info(f"  ✓ W&B: Logged window {window_idx}/{len(windows)} metrics")
+
             # Clean up memory explicitly between windows
             del train_data, val_data, model, val_df_for_ic, val_features_array, val_outcomes
             del val_predictions_raw, val_predictions
@@ -766,6 +798,54 @@ def train_model_walk_forward(
         "window_metrics": window_metrics,
     }
 
+    # Upload window_metrics as W&B table for detailed analysis
+    if wandb_run is not None and wandb_config is not None and wandb_config.get("log_window_tables", False):
+        try:
+            # Prepare table data
+            table_data = []
+            for m in window_metrics:
+                table_data.append(
+                    [
+                        m["window"],
+                        m["train_start"],
+                        m["train_end"],
+                        m["val_start"],
+                        m["val_end"],
+                        m["n_train"],
+                        m["n_val"],
+                        round(m["baseline_brier"], 6),
+                        round(m["residual_mse"], 6),
+                        round(m["spearman_ic"], 4),
+                        round(m["pearson_ic"], 4),
+                        round(m["ic_pvalue"], 6),
+                        m["ic_pvalue"] < 0.05,  # Significance flag
+                        m["best_iteration"],
+                    ]
+                )
+
+            # Create W&B table
+            columns = [
+                "window",
+                "train_start",
+                "train_end",
+                "val_start",
+                "val_end",
+                "n_train",
+                "n_val",
+                "baseline_brier",
+                "residual_mse",
+                "spearman_ic",
+                "pearson_ic",
+                "ic_pvalue",
+                "ic_significant",
+                "best_iteration",
+            ]
+            wandb_table = wandb.Table(columns=columns, data=table_data)
+            wandb_run.log({f"{model_name}/window_details_table": wandb_table})
+            logger.info(f"  ✓ W&B: Uploaded window_metrics table ({len(window_metrics)} windows)")
+        except Exception as e:
+            logger.warning(f"  Failed to upload W&B table: {e}")
+
     return final_model, aggregated_metrics
 
 
@@ -932,6 +1012,7 @@ def main() -> None:
             models_dir,
             walk_forward_config,
             wandb_run,
+            config.get("wandb", {}),
         )
 
         all_metrics[model_name] = metrics
