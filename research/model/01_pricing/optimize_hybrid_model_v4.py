@@ -560,7 +560,14 @@ def optimize_model(
         final_model.save_model(str(final_model_path))
 
         logger.info(f"\n✓ Final optimized model saved to: {final_model_path}")
-        logger.info(f"  Walk-forward validation MSE: {metrics.get('mean_mse', 'N/A'):.6f}")
+
+        # Format MSE safely (handle None/string cases)
+        mean_mse = metrics.get("mean_mse", None)
+        if mean_mse is not None and isinstance(mean_mse, (int, float)):
+            logger.info(f"  Walk-forward validation MSE: {mean_mse:.6f}")
+        else:
+            logger.info(f"  Walk-forward validation MSE: {mean_mse}")
+
         logger.info("  This model can now be used in evaluation and production")
 
     except Exception as e:
