@@ -113,9 +113,9 @@ def combine_csvs(input_dir: Path, output_file: str) -> pl.DataFrame:
 
 
 def resample_to_1s_vwap(df: pl.DataFrame, output_file: str) -> None:
-    """Resample trades to 1-second VWAP intervals."""
+    """Resample trades to 1-second intervals with VWAP and last price."""
     logger.info("=" * 80)
-    logger.info("STEP 3: RESAMPLING TO 1-SECOND VWAP")
+    logger.info("STEP 3: RESAMPLING TO 1-SECOND INTERVALS (VWAP + LAST PRICE)")
     logger.info("=" * 80)
 
     start_time = time.time()
@@ -129,8 +129,8 @@ def resample_to_1s_vwap(df: pl.DataFrame, output_file: str) -> None:
         ]
     )
 
-    # Group by timestamp_seconds and calculate VWAP
-    logger.info("Calculating 1-second VWAP...")
+    # Group by timestamp_seconds and calculate VWAP + last price
+    logger.info("Calculating 1-second VWAP and last price...")
     resampled = (
         df.group_by("timestamp_seconds")
         .agg(
@@ -140,6 +140,7 @@ def resample_to_1s_vwap(df: pl.DataFrame, output_file: str) -> None:
                 pl.col("price").mean().alias("price_mean"),
                 pl.col("price").min().alias("price_min"),
                 pl.col("price").max().alias("price_max"),
+                pl.col("price").last().alias("last_price"),  # Chronologically last trade price
                 pl.col("timestamp").first().alias("timestamp_us"),  # Keep microsecond precision
                 pl.len().alias("trade_count"),
             ]
@@ -154,16 +155,20 @@ def resample_to_1s_vwap(df: pl.DataFrame, output_file: str) -> None:
         )
         .with_columns(
             [
-                # Add 'price' as alias for 'vwap' (for compatibility with downstream scripts)
-                pl.col("vwap").alias("price"),
+                # Add 'price' as alias for 'last_price' (primary price, backwards compatible)
+                pl.col("last_price").alias("price"),
+                # Add 'close' as alias for 'last_price' (OHLC naming convention)
+                pl.col("last_price").alias("close"),
             ]
         )
         .select(
             [
                 "timestamp",
                 "timestamp_seconds",
-                "vwap",
-                "price",  # Added for Stage 4 compatibility
+                "last_price",  # Primary price (chronologically last trade)
+                "close",  # Alias for last_price (OHLC convention)
+                "price",  # Alias for last_price (backwards compatibility)
+                "vwap",  # Keep for validation/comparison
                 "price_mean",
                 "price_min",
                 "price_max",
@@ -192,7 +197,9 @@ def resample_to_1s_vwap(df: pl.DataFrame, output_file: str) -> None:
     # Summary statistics
     logger.info("")
     logger.info("Data Summary:")
-    logger.info(f"  Date range (seconds): {resampled['timestamp_seconds'].min()} to {resampled['timestamp_seconds'].max()}")
+    logger.info(
+        f"  Date range (seconds): {resampled['timestamp_seconds'].min()} to {resampled['timestamp_seconds'].max()}"
+    )
     logger.info(f"  VWAP range: ${resampled['vwap'].min():.2f} - ${resampled['vwap'].max():.2f}")
     logger.info(f"  Average trades per second: {resampled['trade_count'].mean():.1f}")
     logger.info(f"  Total volume: {resampled['total_amount'].sum():,.2f} BTC")
@@ -225,10 +232,7 @@ def main():
         sys.exit(1)
 
     # Set up temporary directory
-    if args.temp_dir:
-        temp_dir = args.temp_dir
-    else:
-        temp_dir = f"./temp_perpetual_csv_{int(time.time())}"
+    temp_dir = args.temp_dir or f"./temp_perpetual_csv_{int(time.time())}"
 
     logger.info("=" * 80)
     logger.info("DERIBIT PERPETUAL CSV DOWNLOAD & PROCESSING")

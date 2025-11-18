@@ -23,13 +23,10 @@ Key improvements:
 import logging
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
-import numpy as np
 import polars as pl
-from scipy import stats
 from tqdm import tqdm
 
 # Add parent and archive directory to path for imports
@@ -50,13 +47,13 @@ logger = logging.getLogger(__name__)
 
 # File paths
 CONTRACTS_FILE = Path("/home/ubuntu/Polymarket/research/model/results/contract_schedule.parquet")
-PERPETUAL_FILE = Path("/home/ubuntu/Polymarket/research/tardis/data/consolidated/btc_perpetual_1s_resampled_ffill.parquet")
+PERPETUAL_FILE = Path(
+    "/home/ubuntu/Polymarket/research/tardis/data/consolidated/btc_perpetual_1s_resampled_ffill.parquet"
+)
 OPTIONS_FILE = Path(
     "/home/ubuntu/Polymarket/research/tardis/data/consolidated/btc_options_atm_shortdated_with_iv_2023_2025.parquet"
 )
-RATES_FILE = Path(
-    "/home/ubuntu/Polymarket/research/risk_free_rate/data/blended_lending_rates_2023_2025.parquet"
-)
+RATES_FILE = Path("/home/ubuntu/Polymarket/research/risk_free_rate/data/blended_lending_rates_2023_2025.parquet")
 OUTPUT_FILE = Path("/home/ubuntu/Polymarket/research/model/results/production_backtest_results_v4.parquet")
 CHECKPOINT_FILE = Path("/home/ubuntu/Polymarket/research/model/checkpoints/backtest_progress_v4.json")
 
@@ -151,12 +148,12 @@ def join_spot_prices_streaming(grid: pl.LazyFrame) -> pl.LazyFrame:
     """Join spot prices using lazy evaluation."""
     logger.info("Setting up spot price join...")
 
-    # Scan perpetual data lazily
-    perpetual = pl.scan_parquet(PERPETUAL_FILE).select(["timestamp_seconds", "vwap"])
+    # Scan perpetual data lazily (using last_price instead of vwap)
+    perpetual = pl.scan_parquet(PERPETUAL_FILE).select(["timestamp_seconds", "last_price"])
 
     # Lazy join
     grid = grid.join(perpetual, left_on="timestamp", right_on="timestamp_seconds", how="left")
-    grid = grid.rename({"vwap": "S"})
+    grid = grid.rename({"last_price": "S"})
 
     return grid
 
@@ -222,9 +219,7 @@ def process_options_iv_chunked(
             # Get options for this chunk's timestamps
             chunk_timestamps = pairs_chunk["timestamp"].unique().to_list()
 
-            options_chunk = options_filtered.filter(
-                pl.col("timestamp_seconds").is_in(chunk_timestamps)
-            ).collect()
+            options_chunk = options_filtered.filter(pl.col("timestamp_seconds").is_in(chunk_timestamps)).collect()
 
             if len(options_chunk) == 0:
                 pbar.update(chunk_end - chunk_start)
@@ -246,9 +241,11 @@ def process_options_iv_chunked(
             )
 
             # Add IV timestamp for staleness tracking
-            closest_chunk = closest_chunk.with_columns([
-                pl.col("timestamp").alias("iv_timestamp"),  # When this IV was quoted
-            ])
+            closest_chunk = closest_chunk.with_columns(
+                [
+                    pl.col("timestamp").alias("iv_timestamp"),  # When this IV was quoted
+                ]
+            )
 
             all_closest_options.append(closest_chunk)
             pbar.update(chunk_end - chunk_start)
@@ -309,9 +306,7 @@ def apply_forward_fill_with_staleness(grid: pl.DataFrame, monitor: DataQualityMo
     )
 
     # Calculate IV staleness (seconds since IV was quoted)
-    grid = grid.with_columns(
-        [(pl.col("timestamp") - pl.col("iv_timestamp")).alias("iv_staleness_seconds")]
-    )
+    grid = grid.with_columns([(pl.col("timestamp") - pl.col("iv_timestamp")).alias("iv_staleness_seconds")])
 
     # Mark stale IV as invalid
     grid = grid.with_columns(
@@ -320,7 +315,6 @@ def apply_forward_fill_with_staleness(grid: pl.DataFrame, monitor: DataQualityMo
             .then(None)
             .otherwise(pl.col("implied_vol_bid"))
             .alias("implied_vol_bid_validated"),
-
             pl.when(pl.col("iv_staleness_seconds") > MAX_IV_STALENESS_SECONDS)
             .then(None)
             .otherwise(pl.col("implied_vol_ask"))
@@ -341,14 +335,16 @@ def apply_forward_fill_with_staleness(grid: pl.DataFrame, monitor: DataQualityMo
         monitor.update("max_iv_staleness", valid_staleness.max())
 
     logger.info(f"Final IV coverage (after staleness filter): {final_coverage:.1%}")
-    logger.info(f"Staleness violations: {staleness_violations:,} ({staleness_violations/len(grid)*100:.2%})")
+    logger.info(f"Staleness violations: {staleness_violations:,} ({staleness_violations / len(grid) * 100:.2%})")
 
     # Use validated columns for pricing (drop original IV columns to avoid duplicates)
     grid = grid.drop(["implied_vol_bid", "implied_vol_ask"])
-    grid = grid.rename({
-        "implied_vol_bid_validated": "implied_vol_bid",
-        "implied_vol_ask_validated": "implied_vol_ask",
-    })
+    grid = grid.rename(
+        {
+            "implied_vol_bid_validated": "implied_vol_bid",
+            "implied_vol_ask_validated": "implied_vol_ask",
+        }
+    )
 
     return grid
 
@@ -445,20 +441,22 @@ def process_contract_batch(
         grid = grid.join(price_cols, on=["contract_id", "timestamp"], how="left")
     else:
         # Add empty price columns to maintain consistent schema
-        grid = grid.with_columns([
-            pl.lit(None).alias("sigma_mid").cast(pl.Float64),
-            pl.lit(None).alias("T_years").cast(pl.Float64),
-            pl.lit(None).alias("d2_bid").cast(pl.Float64),
-            pl.lit(None).alias("d2_ask").cast(pl.Float64),
-            pl.lit(None).alias("d2_mid").cast(pl.Float64),
-            pl.lit(None).alias("prob_bid").cast(pl.Float64),
-            pl.lit(None).alias("prob_ask").cast(pl.Float64),
-            pl.lit(None).alias("prob_mid").cast(pl.Float64),
-            pl.lit(None).alias("discount").cast(pl.Float64),
-            pl.lit(None).alias("price_bid").cast(pl.Float64),
-            pl.lit(None).alias("price_ask").cast(pl.Float64),
-            pl.lit(None).alias("price_mid").cast(pl.Float64),
-        ])
+        grid = grid.with_columns(
+            [
+                pl.lit(None).alias("sigma_mid").cast(pl.Float64),
+                pl.lit(None).alias("T_years").cast(pl.Float64),
+                pl.lit(None).alias("d2_bid").cast(pl.Float64),
+                pl.lit(None).alias("d2_ask").cast(pl.Float64),
+                pl.lit(None).alias("d2_mid").cast(pl.Float64),
+                pl.lit(None).alias("prob_bid").cast(pl.Float64),
+                pl.lit(None).alias("prob_ask").cast(pl.Float64),
+                pl.lit(None).alias("prob_mid").cast(pl.Float64),
+                pl.lit(None).alias("discount").cast(pl.Float64),
+                pl.lit(None).alias("price_bid").cast(pl.Float64),
+                pl.lit(None).alias("price_ask").cast(pl.Float64),
+                pl.lit(None).alias("price_mid").cast(pl.Float64),
+            ]
+        )
 
     return grid
 
@@ -561,11 +559,11 @@ def run_production_backtest(
     logger.info("\n" + "=" * 80)
     logger.info("BACKTEST COMPLETE")
     logger.info("=" * 80)
-    logger.info(f"Elapsed time: {elapsed_time/60:.1f} minutes")
+    logger.info(f"Elapsed time: {elapsed_time / 60:.1f} minutes")
     logger.info(f"Output file: {file_size_mb:.1f} MB")
     logger.info(f"Total rows: {len(final_results):,}")
     logger.info(f"Contracts processed: {final_results['contract_id'].n_unique():,}")
-    logger.info(f"Pricing success rate: {len(priced_rows)/len(final_results)*100:.1%}")
+    logger.info(f"Pricing success rate: {len(priced_rows) / len(final_results) * 100:.1%}")
 
     # Log data quality report
     monitor.log_summary()
