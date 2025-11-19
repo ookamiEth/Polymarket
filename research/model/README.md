@@ -10,839 +10,522 @@
 
 ---
 
-## 🚀 **QUICK START - V4 Implementation**
+## 🚀 Quick Start
 
-**STATUS**: ⚠️ Infrastructure ready, need to generate baseline data
-
-**Next Steps**: See [NEXT_STEPS.md](NEXT_STEPS.md) for detailed instructions
-
-### Fast Track (Copy-Paste):
+### Run Full V4 Pipeline
 ```bash
-# 1. Create baseline symlink
-ln -s /home/ubuntu/Polymarket/research/model/results/production_backtest_results.parquet \
-      /home/ubuntu/Polymarket/research/model/results/production_backtest_results_v4.parquet
+# From research/model directory
+
+# 1. Run test suite (~15 min)
+bin/run_all_tests_v4.sh
 
 # 2. Generate V4 features (2-3 hours)
-cd /home/ubuntu/Polymarket/research/model/00_data_prep
-nohup uv run python engineer_all_features_v4.py > v4_feature_generation.log 2>&1 &
+cd 00_data_prep
+uv run python engineer_all_features_v4.py
 
-# 3. Train 12 models (24-48 hours)
-cd /home/ubuntu/Polymarket/research/model/01_pricing
-nohup uv run python train_temporal_models.py > train_temporal_models.log 2>&1 &
+# 3. Prepare pipeline data
+uv run python prepare_pipeline_data_v4.py
+
+# 4. Train models (24-48 hours)
+bin/run_multi_horizon_pipeline_v4.sh
+
+# 5. Run production backtest
+cd 01_pricing
+uv run python production_backtest_v4.py
 ```
 
-**Documentation**:
-- **Next Steps**: [NEXT_STEPS.md](NEXT_STEPS.md) - Complete step-by-step guide
-- **V4 Plan**: [IMPLEMENTATION_PLAN_V4.md](IMPLEMENTATION_PLAN_V4.md) - Full technical details
-- **CPU Optimization**: [00_cpu_optimization/README.md](00_cpu_optimization/README.md) - 32 vCPU parallelism guide
-- **Features**: [02_analysis/FEATURE_COMPARISON_V3_V4.md](02_analysis/FEATURE_COMPARISON_V3_V4.md) - Feature changes
-
----
-
-## Table of Contents
-
-1. [V4 Architecture Overview](#v4-architecture-overview)
-2. [Research Objective](#research-objective)
-3. [Data Sources](#data-sources)
-4. [Mathematical Framework](#mathematical-framework)
-5. [Methodology](#methodology)
-6. [Implementation Structure](#implementation-structure)
-7. [Performance Standards](#performance-standards)
-8. [Running the Backtest](#running-the-backtest)
-
----
-
-## V4 Architecture Overview
-
-### 🏗️ **Hierarchical Model Structure**
-
-**12 Specialized Models** = 3 Temporal Windows × 4 Volatility Regimes
-
-#### Level 1: Temporal Split (Time-to-Expiry)
-- **Near** (< 300s): High gamma, volatile pricing
-- **Mid** (300-900s): Balanced dynamics
-- **Far** (> 900s): Stable, trend-following
-
-#### Level 2: Volatility Regimes
-- **Low Vol ATM**: Low volatility + at-the-money
-- **Low Vol OTM**: Low volatility + out-of-the-money
-- **High Vol ATM**: High volatility + at-the-money
-- **High Vol OTM**: High volatility + out-of-the-money
-
-### 📊 **V4 Improvements Over V3**
-
-| Metric | V3 Baseline | V4 Target | Improvement |
-|--------|-------------|-----------|-------------|
-| **Brier Score** | 0.1340 | 0.1260 | 22-25% better |
-| **Feature Count** | 196 | 55 | 72% reduction |
-| **Moneyness Dominance** | 64% | <25% | 61% reduction |
-| **Model Count** | 1 | 12 | Specialized |
-| **Training Speed** | Baseline | 3x faster | Efficiency |
-
-### 🎯 **Key Features**
-
-1. **Aggressive Feature Pruning**: 171 features with <1% importance removed
-2. **Advanced Moneyness**: 8 transformations to reduce dominance
-3. **Volatility Asymmetry**: Downside/upside split, skewness, kurtosis
-4. **Regime-Specific Training**: Each model optimized for its regime
-5. **Temporal Awareness**: Different dynamics at different time horizons
-
----
-
-## Research Objective
-
-### Primary Goal
-**Validate the accuracy of Black-Scholes binary option pricing for ultra-short-dated (15-minute) BTC contracts.**
-
-### Core Hypothesis
-Implied volatilities extracted from Deribit BTC options markets contain sufficient predictive information to accurately price binary options on 15-minute BTC price movements.
-
-### Success Criteria
-1. **Calibration**: Model probabilities match realized frequencies (calibration plot shows 45° line)
-2. **Brier Score**: < 0.25 (lower is better, 0 = perfect)
-3. **No systematic bias**: Regression analysis shows no significant moneyness or time-dependent biases
-
----
-
-## Data Sources
-
-### 1. BTC Options Implied Volatility
-**File:** `/Users/lgierhake/Documents/ETH/BT/research/tardis/data/consolidated/btc_options_atm_shortdated_with_iv_2023_2025.parquet`
-
-**Rows:** 204,722,673
-**Period:** Oct 2023 - Sep 2025
-
-**Key Columns:**
-- `timestamp_seconds`: Unix timestamp (seconds)
-- `symbol`: Option symbol (e.g., "BTC-2OCT23-27250-C")
-- `type`: "call" or "put"
-- `strike_price`: Option strike
-- `expiry_timestamp`: Option expiration (Unix seconds)
-- `time_to_expiry_seconds`: Time to expiry
-- `spot_price`: BTC spot price at quote time
-- `moneyness`: S/K ratio
-- `implied_vol_bid`: IV calculated from bid price
-- `implied_vol_ask`: IV calculated from ask price
-- `has_bid`, `has_ask`: Boolean flags for quote availability
-- `iv_calc_status`: "success" if IV calculation succeeded
-
-**Usage:** Extract σ (implied volatility) for pricing binary options.
-
----
-
-### 2. BTC Spot Price (Perpetual Futures)
-**File:** `/Users/lgierhake/Documents/ETH/BT/research/tardis/data/consolidated/btc_perpetual_1s_2023_2025.parquet`
-
-**Rows:** 13,505,552 trades
-**Period:** Oct 2023 - Oct 2025
-
-**Key Columns:**
-- `timestamp`: Unix timestamp (microseconds)
-- `price`: Trade price
-- `amount`: Trade size
-- `side`: "buy" or "sell"
-
-**Preprocessing Required:** Resample trade data to 1-second bars (VWAP or last price).
-
-**Usage:** Provides S (spot price) for binary option pricing and contract outcomes.
-
----
-
-### 3. Risk-Free Rate
-**File:** `/Users/lgierhake/Documents/ETH/BT/research/risk_free_rate/data/blended_lending_rates_2023_2025.parquet`
-
-**Rows:** 731 days
-**Period:** Oct 2023 - Sep 2025
-
-**Key Columns:**
-- `date`: Calendar date
-- `blended_supply_apr`: Blended USDC/USDT lending rate (annual %)
-
-**Usage:** Provides r (risk-free rate) for discounting. Convert APR to decimal (e.g., 4.27% → 0.0427).
-
----
-
-## Mathematical Framework
-
-### Binary Option Definition
-
-A **binary (digital) option** pays a fixed amount ($1) if the underlying asset finishes above the strike at expiration, otherwise $0.
-
-**Payoff:**
-```
-Payoff = { $1  if S(T) > K
-         { $0  if S(T) ≤ K
-```
-
-Where:
-- `S(T)` = Spot price at expiration
-- `K` = Strike price (set at contract open)
-
----
-
-### Black-Scholes Binary Option Pricing
-
-**Fair Value Formula:**
-```
-Price = e^(-rT) × N(d₂)
-```
-
-Where:
-- `Price` = Fair value of binary option (probability-adjusted and discounted)
-- `e^(-rT)` = Discount factor (present value of $1 received at time T)
-- `N(d₂)` = Risk-neutral probability of finishing in-the-money
-- `r` = Risk-free interest rate (annual, as decimal)
-- `T` = Time to expiration (in years)
-
----
-
-### Calculating d₂
-
-**Formula:**
-```
-d₂ = [ln(S/K) + (r - σ²/2)T] / (σ√T)
-```
-
-Where:
-- `S` = Current spot price (BTC price at time of pricing)
-- `K` = Strike price (BTC price at contract open, fixed)
-- `ln(S/K)` = Log-moneyness (positive = ITM, negative = OTM)
-- `σ` = Implied volatility (annual, as decimal, e.g., 0.45 = 45 vol)
-- `T` = Time to expiration (in years)
-- `r` = Risk-free rate (annual, as decimal)
-
-**Numerator breakdown:**
-- `ln(S/K)`: How far in/out of the money (log scale)
-- `(r - σ²/2)T`: Drift adjustment accounting for interest and volatility drag
-
-**Denominator:**
-- `σ√T`: Volatility scaled to time horizon
-
----
-
-### Cumulative Normal Distribution N(d)
-
-**Definition:** `N(d)` returns the probability that a standard normal variable is ≤ d.
-
-**Properties:**
-- `N(0) = 0.50` (50% probability)
-- `N(1) = 0.841` (84% probability)
-- `N(2) = 0.977` (98% probability)
-- `N(-1) = 0.159` (16% probability)
-
-**Implementation:**
-- Python: `from scipy.stats import norm; norm.cdf(d2)`
-- Polars: `pl.col("d2").map_batches(lambda s: norm.cdf(s.to_numpy()))`
-
----
-
-### Unit Conversions
-
-#### Time to Years
-```
-T = seconds_remaining / (365.25 × 24 × 60 × 60)
-T = seconds_remaining / 31,557,600
-
-For 15 minutes: T = 900 / 31,557,600 = 0.0000285 years
-For 1 minute: T = 60 / 31,557,600 = 0.0000019 years
-```
-
-#### Implied Volatility
-```
-σ_decimal = implied_vol (already in decimal form from dataset)
-
-Example: implied_vol_bid = 0.45 means 45% annual volatility
-```
-
-#### Risk-Free Rate
-```
-r_decimal = blended_supply_apr / 100
-
-Example: blended_supply_apr = 4.27 → r = 0.0427
+### Monitor Running Jobs
+```bash
+# Monitor feature generation
+bin/monitor_v4_generation.sh
+
+# Monitor backtest progress
+bin/monitor_backtest.sh
 ```
 
 ---
 
-### Simplified Formula for Short Periods
-
-For ultra-short expirations (T < 1 hour), the discount factor is negligible:
-
-```
-e^(-rT) ≈ 1  when T is very small
-
-Therefore: Price ≈ N(d₂)
-```
-
-**Example:**
-- r = 0.05 (5%)
-- T = 900 seconds = 0.0000285 years
-- e^(-0.05 × 0.0000285) = e^(-0.000001425) ≈ 0.999998 ≈ 1
-
-**Implication:** For 15-minute options, the price is essentially the risk-neutral probability N(d₂).
-
----
-
-## Methodology
-
-### 1. Contract Structure
-
-**Schedule:** Fixed hourly schedule matching Polymarket BTC 15-minute markets.
-
-**Contracts per hour:** 4
-- Contract 1: Opens :00:00, closes :15:00
-- Contract 2: Opens :15:00, closes :30:00
-- Contract 3: Opens :30:00, closes :45:00
-- Contract 4: Opens :45:00, closes :60:00
-
-**Example:**
-```
-Contract opens:  2023-10-01 10:00:00 UTC
-Contract closes: 2023-10-01 10:15:00 UTC
-Strike K:        BTC price at 10:00:00 = $27,500
-Outcome:         BTC price at 10:15:00 = $27,650 > $27,500 → Payoff = $1
-```
-
-**Total contracts:** ~4 contracts/hour × 24 hours/day × 730 days ≈ **70,000 contracts**
-
----
-
-### 2. Pricing Workflow (Per Contract)
-
-For each contract, price the binary option **every second** from open to close (900 pricing calculations per contract).
-
-**Step 1: Set Strike (at contract open)**
-```
-K = BTC_spot_price(contract_open_time)
-```
-
-**Step 2: For each second t during contract lifetime:**
-
-**A. Get Spot Price S(t)**
-```
-S = BTC_perpetual_price_1s(t)
-```
-
-**B. Calculate Time Remaining T**
-```
-T = (contract_close_time - t) / 31,557,600
-```
-
-**C. Get Implied Volatility σ(t)**
-
-**Critical constraint:** Only use options that expire **AFTER** the binary contract closes.
-
-```python
-# Filter options data at time t:
-valid_options = options_df.filter(
-    (pl.col("timestamp_seconds") == t) &
-    (pl.col("expiry_timestamp") > contract_close_time)
-)
-
-# Select closest expiry:
-closest_option = valid_options.sort("time_to_expiry_seconds").first()
-
-# Extract IV (three versions):
-σ_bid = closest_option["implied_vol_bid"]
-σ_ask = closest_option["implied_vol_ask"]
-σ_mid = (σ_bid + σ_ask) / 2
-```
-
-**D. Get Risk-Free Rate r**
-```
-date = datetime.fromtimestamp(t).date()
-r = risk_free_rates_df.filter(pl.col("date") == date)["blended_supply_apr"][0] / 100
-```
-
-**E. Calculate Binary Price**
-
-For each of σ_bid, σ_ask, σ_mid:
-
-```python
-# Calculate d2
-d2 = (np.log(S / K) + (r - 0.5 * σ**2) * T) / (σ * np.sqrt(T))
-
-# Calculate N(d2)
-prob = norm.cdf(d2)
-
-# Discount (approximately 1 for short periods)
-discount = np.exp(-r * T)
-
-# Binary price
-price = discount * prob
-```
-
-**F. Store Result**
-```
-result = {
-    "contract_id": contract_id,
-    "timestamp": t,
-    "S": S,
-    "K": K,
-    "T_seconds": contract_close_time - t,
-    "T_years": T,
-    "r": r,
-    "sigma_bid": σ_bid,
-    "sigma_ask": σ_ask,
-    "sigma_mid": σ_mid,
-    "d2_bid": d2_bid,
-    "d2_ask": d2_ask,
-    "d2_mid": d2_mid,
-    "price_bid": price_bid,
-    "price_ask": price_ask,
-    "price_mid": price_mid,
-    "outcome": None  # Set after contract closes
-}
-```
-
-**Step 3: Observe Outcome (at contract close)**
-```
-outcome = 1 if BTC_spot_price(contract_close_time) > K else 0
-
-# Update all records for this contract:
-results.filter(pl.col("contract_id") == contract_id).update(outcome=outcome)
-```
-
----
-
-### 3. Vectorization Strategy (Critical)
-
-**DO NOT** loop over seconds or contracts in Python. Use Polars vectorization.
-
-**Approach:**
-
-**A. Pre-generate contract schedule:**
-```python
-# Generate all contract open/close times for 2023-2025
-contracts = generate_contract_schedule(start_date="2023-10-01", end_date="2025-09-30")
-# columns: contract_id, open_time, close_time
-```
-
-**B. Generate all second timestamps:**
-```python
-# For each contract, create 900 rows (one per second)
-pricing_grid = contracts.explode(
-    pl.int_range(0, 900, eager=True).alias("seconds_offset")
-).with_columns([
-    (pl.col("open_time") + pl.col("seconds_offset")).alias("timestamp")
-])
-# columns: contract_id, open_time, close_time, timestamp
-```
-
-**C. Join spot prices:**
-```python
-pricing_grid = pricing_grid.join(
-    perpetual_1s,
-    on="timestamp",
-    how="left"
-).rename({"price": "S"})
-```
-
-**D. Join risk-free rates:**
-```python
-pricing_grid = pricing_grid.with_columns(
-    pl.col("timestamp").cast(pl.Date).alias("date")
-).join(
-    risk_free_rates,
-    on="date",
-    how="left"
-).with_columns([
-    (pl.col("blended_supply_apr") / 100).alias("r")
-])
-```
-
-**E. Join implied volatilities (complex - requires closest expiry logic):**
-
-This is the most complex join. See `01_pricing/match_options_iv.py` for implementation.
-
-**F. Vectorized pricing calculation:**
-```python
-pricing_grid = pricing_grid.with_columns([
-    # Set strike at contract open
-    pl.col("S").first().over("contract_id").alias("K"),
-
-    # Calculate time remaining
-    ((pl.col("close_time") - pl.col("timestamp"))).alias("T_seconds"),
-    ((pl.col("close_time") - pl.col("timestamp")) / 31_557_600).alias("T_years"),
-
-    # Calculate d2 for bid/ask/mid
-    (
-        (pl.col("S") / pl.col("K")).log() +
-        (pl.col("r") - 0.5 * pl.col("sigma_bid")**2) * pl.col("T_years")
-    ) / (pl.col("sigma_bid") * pl.col("T_years").sqrt()).alias("d2_bid"),
-
-    # ... repeat for ask and mid
-])
-
-# Apply normal CDF (requires mapping function)
-from scipy.stats import norm
-
-pricing_grid = pricing_grid.with_columns([
-    pl.col("d2_bid").map_batches(lambda s: norm.cdf(s.to_numpy())).alias("prob_bid"),
-    pl.col("d2_ask").map_batches(lambda s: norm.cdf(s.to_numpy())).alias("prob_ask"),
-    pl.col("d2_mid").map_batches(lambda s: norm.cdf(s.to_numpy())).alias("prob_mid"),
-])
-
-# Apply discount
-pricing_grid = pricing_grid.with_columns([
-    ((-pl.col("r") * pl.col("T_years")).exp()).alias("discount"),
-    (pl.col("discount") * pl.col("prob_bid")).alias("price_bid"),
-    (pl.col("discount") * pl.col("prob_ask")).alias("price_ask"),
-    (pl.col("discount") * pl.col("prob_mid")).alias("price_mid"),
-])
-```
-
-**G. Join outcomes:**
-```python
-# Get spot price at close for each contract
-outcomes = perpetual_1s.rename({"timestamp": "close_time", "price": "S_close"})
-
-pricing_grid = pricing_grid.join(
-    outcomes,
-    on="close_time",
-    how="left"
-).with_columns([
-    (pl.col("S_close") > pl.col("K")).cast(pl.Int8).alias("outcome")
-])
-```
-
-**H. Write results (streaming):**
-```python
-pricing_grid.sink_parquet(
-    "results/pricing_results.parquet",
-    compression="snappy",
-    streaming=True
-)
-```
-
-**Expected output size:** ~70,000 contracts × 900 seconds = **63 million rows**
-
----
-
-## Implementation Structure
+## 📂 Directory Structure
 
 ```
 research/model/
-├── README.md                           # This file
 │
-├── 00_data_prep/                       # Data preparation scripts
-│   ├── resample_perpetual_1s.py       # Resample trades → 1s VWAP/last
-│   ├── generate_contract_schedule.py  # Generate 15-min contract calendar
-│   └── validate_data_alignment.py     # Validate timestamp coverage
+├── README.md                      # This file
+├── QUICK_REFERENCE.md             # Common commands reference
 │
-├── 01_pricing/                         # Pricing engine
-│   ├── black_scholes_binary.py        # BS binary pricing functions
-│   ├── match_options_iv.py            # Find closest expiry option
-│   └── backtest_engine.py             # Main vectorized backtest
+├── bin/                           # All shell scripts (centralized)
+│   ├── run_all_tests_v4.sh        # Run comprehensive test suite
+│   ├── run_multi_horizon_pipeline_v4.sh  # Full V4 training pipeline
+│   ├── run_tests.sh               # Pricing module unit tests
+│   ├── monitor_v4_generation.sh   # Monitor feature generation
+│   └── monitor_backtest.sh        # Monitor backtest progress
 │
-├── 02_analysis/                        # Analysis scripts
-│   ├── calibration_analysis.py        # Calibration plots & metrics
-│   ├── time_to_expiry_analysis.py     # Accuracy vs time remaining
-│   ├── moneyness_analysis.py          # Accuracy vs S/K
-│   └── regression_analysis.py         # Feature regression (optional)
+├── docs/                          # All documentation
+│   ├── IMPLEMENTATION_PLAN_V4.md  # V4 technical specification
+│   ├── QUICK_START_V4.md          # Getting started guide
+│   ├── STATUS.md                  # Current project status
+│   ├── NEXT_STEPS.md              # Action items
+│   ├── TESTING_V4_README.md       # Testing guide
+│   ├── DIRECTORY_MAP.md           # Legacy directory map
+│   ├── V4_COMPLETION_SUMMARY.md   # V4 completion report
+│   └── V4_IMPLEMENTATION_STATUS.md # V4 implementation status
 │
-├── 03_visualization/                   # Plotting scripts
-│   ├── plot_calibration.py            # Calibration plots
-│   ├── plot_time_series.py            # Example price evolution
-│   └── plot_error_distributions.py    # Error histograms by regime
+├── 00_data_prep/                  # Feature engineering & data preparation
+│   ├── engineer_all_features_v4.py         # Main V4 feature generation
+│   ├── prepare_pipeline_data_v4.py         # Pipeline data preparation
+│   ├── regime_detection_v4.py              # Regime classification
+│   ├── impute_missing_features_v4.py       # Handle missing data
+│   ├── test_01_preflight_v4.py             # Pre-flight validation
+│   ├── test_02_modules_v4.py               # Module unit tests
+│   ├── validate_checkpoint_*.py            # Checkpoint validators
+│   └── stratified_v4/                      # Stratified data splits
 │
-├── notebooks/                          # Jupyter notebooks
-│   ├── 01_data_exploration.ipynb      # EDA on datasets
-│   ├── 02_single_contract_test.ipynb  # Deep dive on one contract
-│   └── 03_full_backtest_results.ipynb # Full results analysis
+├── 01_pricing/                    # Model training & evaluation
+│   ├── train_multi_horizon_v4.py           # Train 12 hybrid models
+│   ├── optimize_hybrid_model_v4.py         # Optuna hyperparameter tuning
+│   ├── evaluate_multi_horizon_v4.py        # Model evaluation
+│   ├── production_backtest_v4.py           # Production backtest
+│   ├── temporal_model_split.py             # Time-based model routing
+│   ├── models_v4/                          # Trained models
+│   ├── models_optuna/                      # Optuna-optimized models
+│   ├── evaluations/                        # Evaluation outputs
+│   ├── tests/                              # Unit & integration tests
+│   ├── config/                             # Configuration files
+│   └── visualization/                      # Plotting utilities
 │
-└── results/                            # Output files
-    ├── pricing_results.parquet         # Full second-by-second data
-    ├── contract_summary.parquet        # One row per contract
-    ├── calibration_metrics.csv         # Summary statistics
-    └── figures/                        # All plots
+├── 02_analysis/                   # Analysis & diagnostics
+│   ├── README.md                           # Analysis guide
+│   ├── FEATURE_COMPARISON_V3_V4.md         # V3 vs V4 feature changes
+│   ├── calibration_analysis.py             # Calibration diagnostics
+│   ├── feature_importance_analysis_v4.csv  # Feature importance results
+│   ├── residual_diagnostics.py             # Residual analysis
+│   ├── pricing/                            # Pricing-specific analysis
+│   │   ├── analyze_calibration_over_time.py
+│   │   ├── compute_feature_importance_v4.py
+│   │   ├── compute_shap_values_v4.py
+│   │   ├── feature_importance/             # Feature importance outputs
+│   │   └── shap_values_v4/                 # SHAP analysis outputs
+│   └── [other analysis scripts]
+│
+├── 03_deep_eda/                   # Deep exploratory analysis
+│   ├── 01_payoff_nonlinearity.py
+│   ├── 02_microstructure.py
+│   ├── 03_error_decomposition.py
+│   ├── 04_outcome_distributions.py
+│   ├── 05_feature_attribution.py
+│   ├── technical_paper.pdf                 # Research paper
+│   └── technical_paper.tex
+│
+├── 04_visualization/              # Professional plotting
+│   └── professional_plots.py
+│
+├── data/                          # All data files
+│   ├── features_v4/                        # V4 engineered features
+│   │   └── intermediate/                   # Intermediate processing
+│   └── consolidated_features_v4_pipeline_ready.parquet  # Ready for training
+│
+├── logs/                          # Unified logs (all scripts)
+│   ├── v4/                                 # V4 pipeline logs
+│   ├── 01_pricing/                         # Pricing module logs
+│   │   ├── v3_archive/                     # Archived V3 logs
+│   │   └── wandb_archive/                  # WandB experiment logs (historical)
+│   ├── wandb_recent/                       # Recent WandB runs
+│   └── production_backtest_v4.log
+│
+├── wandb/                         # Symlink to logs/wandb_recent/ (for compatibility)
+│
+├── results/                       # Unified results (all outputs)
+│   ├── plots/                              # All visualizations
+│   │   └── v4/                             # V4 plots
+│   ├── models_v4/                          # Saved models
+│   ├── multi_horizon/                      # Multi-horizon predictions
+│   ├── multi_horizon_hybrid_v4/            # V4 hybrid outputs
+│   ├── 01_pricing_legacy/                  # Legacy pricing results
+│   └── [evaluation parquet files]
+│
+├── archive/                       # Historical code & data (197GB)
+│   ├── README.md                           # Archive navigation
+│   ├── v3_code/                            # V3 code (archived)
+│   │   ├── README.md                       # V3 to V4 transition notes
+│   │   ├── v3_legacy/                      # Complete V3 pipeline
+│   │   └── shell_scripts/                  # Archived V3 scripts
+│   ├── v3_data/                            # V3 features (173GB)
+│   ├── v3_backup/                          # V3 backup (24GB)
+│   └── docs_historical/                    # Historical documentation
+│
+├── config/                        # Global configuration
+├── checkpoints/                   # Training checkpoints
+├── test_logs/                     # Test execution logs
+├── wandb/                         # WandB experiment tracking
+└── xgb_cache/                     # XGBoost cache
+
 ```
 
 ---
 
-## Analysis Plan
+## 🧠 V4 Architecture Overview
 
-### 1. Calibration Analysis (Primary)
+### Hierarchical Temporal Model (12 Models)
 
-**Goal:** Validate that predicted probabilities match realized frequencies.
+**Design Philosophy**: Time-to-expiry dominates option pricing, regimes add context
 
-**Method:**
-1. Bucket all price predictions into deciles: [0-0.1), [0.1-0.2), ..., [0.9-1.0]
-2. For each bucket, calculate actual win rate (fraction of outcomes = 1)
-3. Plot: x = predicted probability (bucket midpoint), y = actual frequency
-4. Perfect calibration = 45° line
-
-**Metrics:**
-- **Brier Score:** `mean((price - outcome)²)` (lower is better, range [0, 1])
-- **Log Loss:** `mean(-outcome*log(price) - (1-outcome)*log(1-price))`
-- **Calibration Error:** `mean(|predicted_prob - actual_freq|)` across buckets
-
-**Code:** `02_analysis/calibration_analysis.py`
-
-**Output:**
-- `results/figures/calibration_plot_bid.png`
-- `results/figures/calibration_plot_ask.png`
-- `results/figures/calibration_plot_mid.png`
-- `results/calibration_metrics.csv`
-
----
-
-### 2. Time-to-Expiry Analysis
-
-**Goal:** Understand how pricing accuracy changes as contract approaches expiration.
-
-**Method:**
-1. Create time buckets: [900-600s], [600-300s], [300-60s], [<60s]
-2. For each bucket, calculate RMSE and calibration metrics
-3. Plot: x = time bucket, y = RMSE
-
-**Hypothesis:** Model should be more accurate with more time remaining (T → 0 may have edge effects).
-
-**Code:** `02_analysis/time_to_expiry_analysis.py`
-
-**Output:**
-- `results/figures/accuracy_vs_time.png`
-- `results/time_to_expiry_metrics.csv`
-
----
-
-### 3. Moneyness Analysis
-
-**Goal:** Validate pricing accuracy across different moneyness levels.
-
-**Method:**
-1. Create moneyness buckets:
-   - Deep OTM: S/K < 0.98
-   - OTM: 0.98 ≤ S/K < 0.995
-   - ATM: 0.995 ≤ S/K < 1.005
-   - ITM: 1.005 ≤ S/K < 1.02
-   - Deep ITM: S/K ≥ 1.02
-2. Calculate calibration metrics per bucket
-3. Plot calibration curves for each bucket
-
-**Hypothesis:** Model should be accurate across all moneyness levels, but may degrade for deep OTM/ITM where σ estimates are less reliable.
-
-**Code:** `02_analysis/moneyness_analysis.py`
-
-**Output:**
-- `results/figures/calibration_by_moneyness.png`
-- `results/moneyness_metrics.csv`
-
----
-
-### 4. Regression Analysis (Optional)
-
-**Goal:** Identify systematic biases and feature importance.
-
-**Method:**
-1. Create pricing error: `error = outcome - price_mid`
-2. Generate features:
-   - `moneyness = S/K - 1`
-   - `log_moneyness = ln(S/K)`
-   - `sigma_mid`
-   - `T_seconds`
-   - `bid_ask_spread = sigma_ask - sigma_bid`
-   - `vol_regime = sigma_mid > rolling_mean(sigma_mid, 30 days)`
-   - Interactions: `moneyness × T_seconds`, `sigma × T_seconds`
-3. Linear regression: `error ~ β₀ + β₁×features`
-4. Analyze coefficients and significance
-
-**Interpretation:**
-- `β_moneyness > 0`: Model underprices ITM, overprices OTM
-- `β_sigma > 0`: Model underprices in high vol regimes
-- `β_T < 0`: Model overprices contracts near expiration
-
-**Code:** `02_analysis/regression_analysis.py`
-
-**Output:**
-- `results/regression_coefficients.csv`
-- `results/figures/feature_importance.png`
-
----
-
-## Performance Standards
-
-### Vectorization Requirements
-
-**FORBIDDEN:**
-```python
-# ❌ NO Python loops over DataFrame rows
-for i in range(len(df)):
-    price = calculate_price(df[i, "S"], df[i, "K"], ...)
-
-# ❌ NO apply() with row-wise lambdas
-df["price"] = df.apply(lambda row: calculate_price(row["S"], row["K"], ...), axis=1)
-
-# ❌ NO iterrows()
-for idx, row in df.iterrows():
-    ...
+**Structure:**
+```
+3 Time Buckets (primary hierarchy):
+├── Near (≤30 min)
+│   ├── Low volatility, ATM
+│   ├── Low volatility, OTM
+│   ├── High volatility, ATM
+│   └── High volatility, OTM
+│
+├── Medium (30-60 min)
+│   ├── [same 4 regime models]
+│   └── ...
+│
+└── Far (>60 min)
+    ├── [same 4 regime models]
+    └── ...
 ```
 
-**REQUIRED:**
-```python
-# ✅ Vectorized Polars operations
-df = df.with_columns([
-    ((pl.col("S") / pl.col("K")).log()).alias("log_moneyness")
-])
-
-# ✅ Vectorized joins instead of dictionary lookups
-df = df.join(spot_prices, on="timestamp", how="left")
-
-# ✅ Batch mapping for functions without native Polars support
-df = df.with_columns([
-    pl.col("d2").map_batches(lambda s: norm.cdf(s.to_numpy())).alias("N_d2")
-])
-```
-
-### Memory Management
-
-**For outputs >100M rows:**
-```python
-# ✅ Use streaming writes
-df.sink_parquet("results/pricing_results.parquet", streaming=True)
-
-# ❌ DO NOT collect then write
-df.collect().write_parquet("results/pricing_results.parquet")  # OOM risk!
-```
-
-**For intermediate aggregations:**
-```python
-# ✅ Use lazy evaluation
-lazy_df = pl.scan_parquet("results/pricing_results.parquet")
-stats = lazy_df.select([
-    pl.len().alias("count"),
-    pl.col("price_mid").mean().alias("mean_price"),
-]).collect()
-
-# ❌ DO NOT load full dataset
-df = pl.read_parquet("results/pricing_results.parquet")  # 63M rows in memory!
-stats = df.select([pl.len(), pl.mean("price_mid")])
-```
+**Key Improvements vs V3:**
+- Time-first hierarchy (better stability)
+- 152 features (pruned from 237)
+- Regime-aware within time buckets
+- Walk-forward validation (10 windows)
+- Optuna hyperparameter tuning
 
 ---
 
-## Running the Backtest
+## 📊 Data Sources
 
-### 1. Data Preparation
+### Primary Data (Tardis.dev)
+- **Deribit Options**: BTC-PERPETUAL options data (Oct 2023 - Sep 2025)
+  - Trade-by-trade executions
+  - Orderbook snapshots (1-second resolution)
+  - Greeks (delta, gamma, vega, theta)
+  - Implied volatility surface
 
+- **BTC Spot Price**: Coinbase BTC-USD 1-second bars
+  - OHLCV data
+  - Trade volume
+  - Realized volatility
+
+### Derived Features (152 total)
+- **Options Microstructure** (26): Bid-ask spreads, quote depths, trade flow
+- **Volatility Surface** (24): ATM IV, skew, term structure, curvature
+- **Greeks** (18): Delta, gamma, vega weighted by OI and volume
+- **Market Regime** (12): Volatility state, trend, momentum
+- **Time Features** (8): Time to expiry, time of day, day of week
+- **Realized Volatility** (18): Multiple horizons (5min to 4h)
+- **Price Action** (22): Returns, momentum, micro movements
+- **Volume** (12): Spot and options volume patterns
+- **Risk-Free Rate** (2): Blended DeFi lending rates
+- **Polynomial Features** (10): Key interaction terms
+
+---
+
+## 🔬 Methodology
+
+### 1. Feature Engineering (`00_data_prep/`)
 ```bash
-# Resample perpetual trades to 1-second bars
-uv run python research/model/00_data_prep/resample_perpetual_1s.py
+# Generate V4 features
+cd 00_data_prep
+uv run python engineer_all_features_v4.py
 
-# Generate contract schedule
-uv run python research/model/00_data_prep/generate_contract_schedule.py
-
-# Validate data alignment
-uv run python research/model/00_data_prep/validate_data_alignment.py
+# Validate output
+uv run python validate_checkpoint_51.py
 ```
 
-**Outputs:**
-- `research/model/results/btc_perpetual_1s_resampled.parquet`
-- `research/model/results/contract_schedule.parquet`
+**Process:**
+- Load Deribit options data (1.1B rows → 10M ATM options)
+- Calculate IV surface features
+- Engineer microstructure features
+- Detect market regimes
+- Compute realized volatility
+- Impute missing values
+- Output: `data/consolidated_features_v4_pipeline_ready.parquet`
 
----
-
-### 2. Run Backtest
-
+### 2. Model Training (`01_pricing/`)
 ```bash
-# Main backtest engine (this will take time - progress bars included)
-uv run python research/model/01_pricing/backtest_engine.py
+# Train 12 hybrid models
+cd 01_pricing
+uv run python train_multi_horizon_v4.py --model all
+
+# Or use full pipeline
+bin/run_multi_horizon_pipeline_v4.sh
 ```
 
-**Expected runtime:** 30-60 minutes (depending on machine)
+**Training Strategy:**
+- **Walk-Forward Validation**: 10 windows (9-month train, 3-month validation)
+- **LightGBM**: Gradient boosted trees (28 threads on 32-vCPU machine)
+- **Optuna**: 100 trials for priority models, 50 for others
+- **Metrics**: MSE (primary), Brier score, calibration error
 
-**Output:**
-- `research/model/results/pricing_results.parquet` (~63M rows, ~5GB)
+### 3. Evaluation & Analysis (`02_analysis/`)
+```bash
+# Evaluate models
+cd 01_pricing
+uv run python evaluate_multi_horizon_v4.py
+
+# Analyze calibration
+cd ../02_analysis
+uv run python calibration_analysis.py
+
+# Feature importance
+cd pricing
+uv run python compute_feature_importance_v4.py
+```
+
+### 4. Production Backtest (`01_pricing/`)
+```bash
+cd 01_pricing
+uv run python production_backtest_v4.py
+```
+
+**Backtest Metrics:**
+- Calibration plots (predicted vs actual)
+- Brier score decomposition
+- Time-series performance
+- Regime-specific accuracy
 
 ---
 
-### 3. Analysis
+## 🧪 Testing
 
+### Pre-Flight Checks
+```bash
+# Comprehensive test suite (~15 min)
+bin/run_all_tests_v4.sh
+
+# Skip unit tests (faster)
+bin/run_all_tests_v4.sh --skip-unit
+
+# Run specific checkpoint
+bin/run_all_tests_v4.sh --checkpoint 51
+```
+
+**Test Phases:**
+1. **Pre-Flight Validation** (~5 min): Input files, schemas, disk/memory
+2. **Module Unit Tests** (~10 min): Feature engineering, regime detection
+3. **Checkpoint Validators** (on-demand): Data quality at each pipeline stage
+
+### Unit Tests (Pricing Module)
+```bash
+# All tests
+bin/run_tests.sh
+
+# Unit tests only
+bin/run_tests.sh --unit
+
+# With coverage
+bin/run_tests.sh --coverage
+```
+
+---
+
+## 📈 Performance Standards
+
+### Model Quality Targets (V4)
+| Metric | Target | V3 Baseline |
+|--------|--------|-------------|
+| **Brier Score** | <0.15 | 0.18 |
+| **Calibration Error** | <0.03 | 0.05 |
+| **R² (predicted vs actual)** | >0.45 | 0.38 |
+
+### Computational Performance (32 vCPU, 256GB RAM)
+| Task | Runtime | Parallelism |
+|------|---------|-------------|
+| **Feature Engineering** | 2-3 hours | 20 workers |
+| **Baseline Training (12 models)** | 24 hours | 4 parallel trials |
+| **Optuna Optimization** | 60 hours | 28 threads/trial |
+| **Production Backtest** | 4-6 hours | Single-threaded |
+
+---
+
+## 🛠️ Common Tasks
+
+### Feature Engineering
+```bash
+# Generate V4 features
+cd 00_data_prep
+uv run python engineer_all_features_v4.py
+
+# Monitor progress
+bin/monitor_v4_generation.sh
+
+# Validate output
+uv run python validate_checkpoint_51.py
+```
+
+### Training Models
+```bash
+# Train single model
+cd 01_pricing
+uv run python train_multi_horizon_v4.py --model near_low_vol_atm
+
+# Train all models
+uv run python train_multi_horizon_v4.py --model all
+
+# Full pipeline with Optuna
+bin/run_multi_horizon_pipeline_v4.sh
+```
+
+### Analysis
 ```bash
 # Calibration analysis
-uv run python research/model/02_analysis/calibration_analysis.py
+cd 02_analysis
+uv run python calibration_analysis.py
 
-# Time-to-expiry analysis
-uv run python research/model/02_analysis/time_to_expiry_analysis.py
+# Feature importance
+cd pricing
+uv run python compute_feature_importance_v4.py
 
-# Moneyness analysis
-uv run python research/model/02_analysis/moneyness_analysis.py
-
-# (Optional) Regression analysis
-uv run python research/model/02_analysis/regression_analysis.py
+# SHAP values
+uv run python compute_shap_values_v4.py
 ```
 
-**Outputs:** Figures in `results/figures/`, metrics in `results/`
-
----
-
-### 4. Explore Results
-
+### Backtesting
 ```bash
-# Open Jupyter
-jupyter notebook research/model/notebooks/03_full_backtest_results.ipynb
-```
+cd 01_pricing
+uv run python production_backtest_v4.py
 
-Or query directly with Polars:
-```python
-import polars as pl
-
-# Lazy scan results
-df = pl.scan_parquet("research/model/results/pricing_results.parquet")
-
-# Example: Get all contracts where model gave >80% probability but lost
-bad_predictions = df.filter(
-    (pl.col("price_mid") > 0.8) & (pl.col("outcome") == 0)
-).collect()
-
-print(bad_predictions.head())
+# Monitor progress
+bin/monitor_backtest.sh
 ```
 
 ---
 
-## Future Extensions
+## 📚 Documentation Index
 
-**Phase 2 Research (noted in code for later):**
+### Core Documentation
+- **README.md** (this file) - Project overview and directory structure
+- **QUICK_REFERENCE.md** - Common commands cheat sheet
 
-1. **Jump-Diffusion Pricing**
-   - Add discrete jump component to diffusion model
-   - Estimate jump frequency (λ) and jump size distribution
-   - Compare calibration vs pure diffusion
+### Detailed Guides (`docs/`)
+- **IMPLEMENTATION_PLAN_V4.md** - Complete V4 technical specification
+- **QUICK_START_V4.md** - Step-by-step getting started guide
+- **TESTING_V4_README.md** - Comprehensive testing guide
+- **STATUS.md** - Current project status and progress
+- **NEXT_STEPS.md** - Upcoming action items
+- **V4_COMPLETION_SUMMARY.md** - V4 implementation completion report
 
-2. **Event Volatility Decomposition**
-   - Identify scheduled events (FOMC, CPI, etc.)
-   - Decompose IV into base vol + event vol
-   - Price contracts expiring before/after events differently
+### Component Documentation
+- **00_cpu_optimization/README.md** - 32 vCPU parallelism optimization
+- **02_analysis/README.md** - Analysis module guide
+- **02_analysis/FEATURE_COMPARISON_V3_V4.md** - V3 to V4 feature changes
+- **01_pricing/docs/** - Pricing module detailed documentation
 
-3. **Real Polymarket Comparison**
-   - When Polymarket historical data is available
-   - Compare model prices to actual market prices
-   - Identify mispricing opportunities
-
-4. **Trading Strategy**
-   - Define entry/exit rules based on mispricing
-   - Backtest PnL with realistic transaction costs
-   - Optimize position sizing
-
-5. **Model Improvements**
-   - Incorporate realized volatility forecasts
-   - Test GARCH models for volatility
-   - Machine learning for volatility prediction
+### Research Papers
+- **03_deep_eda/technical_paper.pdf** - Full research paper and methodology
 
 ---
 
-## References
+## 🔄 Pipeline Workflows
 
-**Black-Scholes Binary Option Pricing:**
-- Hull, J. C. (2018). *Options, Futures, and Other Derivatives*. Chapter 26: Exotic Options.
+### Full V4 Pipeline (End-to-End)
+```bash
+# 1. Test infrastructure
+bin/run_all_tests_v4.sh
 
-**Volatility Modeling:**
-- Gatheral, J. (2006). *The Volatility Surface: A Practitioner's Guide*.
+# 2. Generate features (2-3 hours)
+cd 00_data_prep
+nohup uv run python engineer_all_features_v4.py > ../logs/v4_feature_generation.log 2>&1 &
 
-**Calibration Testing:**
-- Niculescu-Mizil, A., & Caruana, R. (2005). *Predicting Good Probabilities With Supervised Learning*.
+# Monitor: bin/monitor_v4_generation.sh
+
+# 3. Validate features
+uv run python validate_checkpoint_51.py
+
+# 4. Prepare pipeline data
+uv run python prepare_pipeline_data_v4.py
+uv run python validate_checkpoint_52.py
+
+# 5. Train models (24-48 hours)
+cd ../01_pricing
+nohup bin/run_multi_horizon_pipeline_v4.sh > ../logs/pipeline_v4.log 2>&1 &
+
+# 6. Validate training
+uv run python validate_checkpoint_53.py
+
+# 7. Production backtest
+nohup uv run python production_backtest_v4.py > ../logs/production_backtest_v4.log 2>&1 &
+
+# Monitor: bin/monitor_backtest.sh
+```
+
+### Quick Development Iteration
+```bash
+# Modify features
+cd 00_data_prep
+./check_code.sh engineer_all_features_v4.py --fix
+uv run python engineer_all_features_v4.py
+
+# Train single model for testing
+cd ../01_pricing
+uv run python train_multi_horizon_v4.py --model near_low_vol_atm
+
+# Quick evaluation
+uv run python evaluate_multi_horizon_v4.py
+```
 
 ---
 
-**Document Version:** 1.0
-**Last Updated:** 2025-10-23
-**Author:** Claude Code Research Assistant
+## 🐛 Troubleshooting
+
+### Memory Issues
+- V4 features use ~50GB RAM during generation
+- Training uses ~100GB RAM with 28 threads
+- If OOM: reduce `num_threads` in config or use smaller batches
+
+### Missing Data
+- Run `cd 00_data_prep && uv run python check_data_availability.py`
+- Ensure Tardis data downloaded: `research/tardis/data/processed/`
+
+### Failed Tests
+- Check logs in `test_logs/`
+- Run specific test: `cd 00_data_prep && uv run python test_01_preflight_v4.py`
+- Validate checkpoints after each pipeline stage
+
+### Slow Training
+- Check CPU utilization: `htop`
+- Verify parallel settings in config: `config/multi_horizon_regime_config.yaml`
+- See `00_cpu_optimization/README.md` for tuning guide
+
+---
+
+## 📧 Contact & Support
+
+For questions or issues, see:
+- **Documentation**: All guides in `docs/`
+- **Code Quality**: `./check_code.sh path/to/file.py --fix` (Ruff + Pyright)
+- **Architecture**: `docs/IMPLEMENTATION_PLAN_V4.md`
+
+---
+
+## 📝 Version History
+
+### V4 (Current) - Hierarchical Temporal Model
+- 12 specialized models (3 time buckets × 4 regime models)
+- 152 pruned features
+- Walk-forward validation
+- Optuna hyperparameter tuning
+- **Status**: Production-ready
+
+### V3 (Archived) - Regime-First Model
+- 4 regime-based models
+- 237 features (over-engineered)
+- Single validation split
+- Manual hyperparameter tuning
+- **Status**: Archived in `archive/v3_code/`
+
+---
+
+## 🎯 Current Status
+
+**Version**: V4 (Production)
+**Last Updated**: November 2025
+**Models Trained**: 12 hybrid temporal models
+**Features**: 152 (pruned from 237)
+**Data Period**: October 2023 - September 2025
+
+See `docs/STATUS.md` for detailed current progress and `docs/NEXT_STEPS.md` for upcoming work.
