@@ -50,7 +50,7 @@ import yaml
 from train_multi_horizon_v4 import FEATURE_COLS_V4
 
 # Import from V3 legacy
-_v3_core_path = str(Path(__file__).parent / "v3_legacy" / "core")
+_v3_core_path = str(Path(__file__).parent.parent / "archive" / "v3_code" / "v3_legacy" / "core")
 if _v3_core_path not in sys.path:
     sys.path.insert(0, _v3_core_path)
 
@@ -573,10 +573,10 @@ def main() -> None:
         logger.info(f"\nLoading data: {args.input}")
         data = pl.read_parquet(args.input)
     else:
-        # Use pipeline-ready features
+        # Use selected features (V5 minimalist feature set)
         model_dir = Path(__file__).parent.parent
-        data_file = model_dir / "data" / "consolidated_features_v5_pipeline_ready.parquet"
-        logger.info(f"\nLoading pipeline-ready data: {data_file}")
+        data_file = model_dir / "data" / "consolidated_features_v5_selected.parquet"
+        logger.info(f"\nLoading selected features data: {data_file}")
         data = pl.read_parquet(data_file)
 
     logger.info(f"  Loaded {len(data):,} samples")

@@ -22,27 +22,30 @@ Date: 2025-11-19
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-from typing import Dict
-
-import polars as pl
 
 # Import temporal split functions
 import sys
+from pathlib import Path
+
+import polars as pl
+
 sys.path.append(str(Path(__file__).parent.parent / "01_pricing"))
 try:
-    from temporal_model_split import assign_temporal_regime, get_temporal_thresholds
+    from temporal_model_split import assign_temporal_regime  # type: ignore[import-not-found]
 except ImportError:
     # Fallback if import fails
     def assign_temporal_regime(df: pl.DataFrame) -> pl.DataFrame:
-        return df.with_columns([
-            pl.when(pl.col("time_remaining") < 300)
-              .then(pl.lit("near"))
-              .when(pl.col("time_remaining") < 600)
-              .then(pl.lit("mid"))
-              .otherwise(pl.lit("far"))
-              .alias("temporal_regime")
-        ])
+        return df.with_columns(
+            [
+                pl.when(pl.col("time_remaining") < 300)
+                .then(pl.lit("near"))
+                .when(pl.col("time_remaining") < 600)
+                .then(pl.lit("mid"))
+                .otherwise(pl.lit("far"))
+                .alias("temporal_regime")
+            ]
+        )
+
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +75,21 @@ def detect_regime_simplified(
     """
     logger.info("Detecting 2-way volatility regimes (V5 simplified)...")
 
+    # Convert timestamp to datetime for monthly grouping
+    # Timestamp is stored as Unix epoch (int64), convert to datetime
+    df = df.with_columns([pl.from_epoch(pl.col("timestamp"), time_unit="s").alias("timestamp_dt")])
+
     # Monthly percentile computation for non-stationary thresholds
     df = df.with_columns(
         [
-            pl.col(volatility_col).quantile(0.33).over(pl.col("timestamp").dt.truncate("30d")).alias("vol_low_thresh"),
-            pl.col(volatility_col).quantile(0.67).over(pl.col("timestamp").dt.truncate("30d")).alias("vol_high_thresh"),
+            pl.col(volatility_col)
+            .quantile(0.33)
+            .over(pl.col("timestamp_dt").dt.truncate("30d"))
+            .alias("vol_low_thresh"),
+            pl.col(volatility_col)
+            .quantile(0.67)
+            .over(pl.col("timestamp_dt").dt.truncate("30d"))
+            .alias("vol_high_thresh"),
         ]
     )
 
@@ -90,7 +103,6 @@ def detect_regime_simplified(
             .then(pl.lit("high"))
             .otherwise(pl.lit("medium"))  # Keep medium for now, will map to low
             .alias("volatility_regime"),
-
             # Market regime (simplified: just low_vol or high_vol)
             pl.when(pl.col(volatility_col) <= pl.col("vol_high_thresh"))
             .then(pl.lit("low_vol"))
@@ -149,21 +161,18 @@ def detect_hierarchical_regime_v5(
     df = detect_regime_simplified(df, volatility_col, hysteresis)
 
     # Step 3: Create combined 6-way regime
-    df = df.with_columns([
-        # Combine temporal and market regimes
-        (pl.col("temporal_regime") + "_" + pl.col("market_regime"))
-        .alias("combined_regime")
-    ])
+    df = df.with_columns(
+        [
+            # Combine temporal and market regimes
+            (pl.col("temporal_regime") + "_" + pl.col("market_regime")).alias("combined_regime")
+        ]
+    )
 
     # Note: moneyness_bin is already added by engineer_greeks_v5.py
     # Do not create it here to avoid duplication
 
     # Validate all 6 regimes exist
-    expected_regimes = [
-        f"{t}_{v}"
-        for t in ["near", "mid", "far"]
-        for v in ["low_vol", "high_vol"]
-    ]
+    expected_regimes = [f"{t}_{v}" for t in ["near", "mid", "far"] for v in ["low_vol", "high_vol"]]
 
     # Log regime distribution
     regime_counts = df.group_by("combined_regime").agg(pl.len().alias("count")).sort("combined_regime")
@@ -183,7 +192,7 @@ def detect_hierarchical_regime_v5(
 
 def detect_extreme_conditions(
     df: pl.DataFrame,
-    rv_short_col: str = "rv_60s",
+    rv_short_col: str = "rv_ratio",  # Changed from rv_60s (not in V5 selected features)
     rv_long_col: str = "rv_900s",
     spike_ratio: float = 3.0,
     percentile: float = 0.95,
@@ -207,14 +216,21 @@ def detect_extreme_conditions(
     """
     logger.info("Detecting extreme market conditions...")
 
+    # Use timestamp_dt if it exists (created by detect_regime_simplified), otherwise create it
+    if "timestamp_dt" not in df.columns:
+        df = df.with_columns([pl.from_epoch(pl.col("timestamp"), time_unit="s").alias("timestamp_dt")])
+
+    # Check if rv_ratio already exists (it does in V5 selected features)
+    # If not, compute it from rv_short_col and rv_long_col
+    if "rv_ratio" not in df.columns:
+        df = df.with_columns([(pl.col(rv_short_col) / (pl.col(rv_long_col) + 1e-10)).alias("rv_ratio")])
+
+    # Compute rolling percentile for sustained high volatility
     df = df.with_columns(
         [
-            # Compute RV ratio for spike detection
-            (pl.col(rv_short_col) / (pl.col(rv_long_col) + 1e-10)).alias("rv_ratio"),
-            # Compute rolling percentile for sustained high volatility
             pl.col(rv_long_col)
             .quantile(percentile)
-            .over(pl.col("timestamp").dt.truncate("30d"))
+            .over(pl.col("timestamp_dt").dt.truncate("30d"))
             .alias(f"rv_{int(percentile * 100)}th_percentile"),
         ]
     )
@@ -329,28 +345,42 @@ def analyze_regime_transitions(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def main():
-    """Example usage of V5 regime detection."""
+    """
+    V5 Regime Detection Pipeline Step.
+
+    Converts 12 V4 regimes → 6 V5 regimes in consolidated_features_v5_selected.parquet.
+
+    CRITICAL: This function OVERWRITES the input file with updated regime columns.
+    This is necessary for the V5 architecture to work correctly.
+    """
     # Get project root (search up from script location)
     script_dir = Path(__file__).parent.resolve()  # research/model/00_data_prep
     model_dir = script_dir.parent  # research/model
     project_root = model_dir.parent  # /home/ubuntu/Polymarket
 
     # Paths (all absolute)
-    input_path = model_dir / "data" / "consolidated_features_v5_pipeline_ready.parquet"
-    output_path = model_dir / "results" / "regime_history_v5.parquet"
+    input_path = model_dir / "data" / "consolidated_features_v5_selected.parquet"
+    # Save regime history for analysis
+    regime_history_path = model_dir / "results" / "regime_history_v5.parquet"
 
     # Log resolved paths
     logger.info(f"Project root: {project_root}")
     logger.info(f"Input: {input_path}")
-    logger.info(f"Output: {output_path}")
+    logger.info(f"Regime history: {regime_history_path}")
 
     if not input_path.exists():
         logger.error(f"Input file not found: {input_path}")
-        logger.info("Run engineer_greeks_v5.py first to generate V5 features")
+        logger.info("Run select_features_v5.py first to generate selected features")
         return
 
     logger.info(f"Loading data from {input_path}")
     df = pl.read_parquet(input_path)
+
+    # Log existing regime structure
+    if "combined_regime" in df.columns:
+        old_regimes = df["combined_regime"].unique().sort().to_list()
+        logger.info(f"Existing regimes (V4): {old_regimes}")
+        logger.info(f"Number of existing regimes: {len(old_regimes)}")
 
     # Apply V5 regime detection (6 combined regimes)
     df = detect_hierarchical_regime_v5(df)
@@ -359,8 +389,22 @@ def main():
     # Analyze transitions
     analyze_regime_transitions(df)
 
-    # Save regime history
-    save_regime_history(df, output_path)
+    # Validate new regime structure
+    new_regimes = df["combined_regime"].unique().sort().to_list()
+    logger.info(f"New regimes (V5): {new_regimes}")
+    logger.info(f"Number of new regimes: {len(new_regimes)}")
+
+    if len(new_regimes) != 6:
+        logger.warning(f"Expected 6 regimes, got {len(new_regimes)}")
+
+    # CRITICAL: Overwrite input file with updated regimes
+    logger.info(f"Overwriting {input_path} with V5 regime structure...")
+    df.write_parquet(input_path, compression="snappy", statistics=True)
+    logger.info(f"✓ Updated {input_path} with 6 V5 regimes")
+
+    # Save regime history for analysis (separate file)
+    regime_history_path.parent.mkdir(parents=True, exist_ok=True)
+    save_regime_history(df, regime_history_path)
 
     logger.info("V5 regime detection complete")
 

@@ -1,36 +1,42 @@
 #!/usr/bin/env python3
 """
-Multi-Horizon + Regime Hybrid LightGBM Training Script (V4)
+Multi-Horizon + Regime Hybrid LightGBM Training Script (V5)
 ============================================================
 
-Train 8 specialized LightGBM models based on hierarchical regime structure:
-- 2 temporal windows: near (0-300s), mid (300-900s)
-- 4 volatility regimes: low_vol_atm, low_vol_otm, high_vol_atm, high_vol_otm
-- Total: 8 hybrid models (far bucket excluded due to insufficient data)
+Train 6 specialized LightGBM models with Greek features:
+- 3 temporal windows: near (0-5min), mid (5-10min), far (10-15min)
+- 2 volatility regimes: low_vol, high_vol
+- Total: 6 hybrid models (3 time buckets × 2 regimes)
 
-Key Improvements from V3:
+Key Changes from V4:
+- Added Greek features (30 new features: delta, gamma, vega, theta, etc.)
+- Simplified regime structure (removed ATM/OTM split)
+- Reduced from 12 models to 6 models
+- 43 total features (13 selected V4 features + 30 Greeks)
+
+Key Features:
 - Uses pre-prepared data with regime columns (no join needed)
 - Two-level stratification (temporal + volatility regime)
-- 13-fold walk-forward validation with expanding windows (10→22 months)
+- Walk-forward validation with expanding windows
 - Information Coefficient (IC) tracking for signal quality
 - Residual learning architecture (outcome - Black-Scholes baseline)
 
 Usage:
-  # Train all 12 models (always uses walk-forward validation)
-  uv run python train_multi_horizon_v4.py
+  # Train all 6 models (always uses walk-forward validation)
+  uv run python train_multi_horizon_v5.py
 
   # Train specific model
-  uv run python train_multi_horizon_v4.py --model near_low_vol_atm
-  uv run python train_multi_horizon_v4.py --model far_low_vol_atm
+  uv run python train_multi_horizon_v5.py --model near_low_vol
+  uv run python train_multi_horizon_v5.py --model mid_high_vol
 
   # With custom config
-  uv run python train_multi_horizon_v5.py --config config/multi_horizon_regime_config_v5.yaml
+  uv run python train_multi_horizon_v5.py --config ../config/multi_horizon_regime_config_v5.yaml
 
 Note: Walk-forward validation is MANDATORY for production use.
       This ensures zero data leakage for time series forecasting.
 
 Author: BT Research Team
-Date: 2025-11-13
+Date: 2025-11-20
 """
 
 from __future__ import annotations
@@ -50,7 +56,7 @@ import yaml
 
 # Import from V3 legacy (these functions work with any parquet data)
 # Add V3 core directory to path for imports
-_v3_core_path = str(Path(__file__).parent / "v3_legacy" / "core")
+_v3_core_path = str(Path(__file__).parent.parent / "archive" / "v3_code" / "v3_legacy" / "core")
 if _v3_core_path not in sys.path:
     sys.path.insert(0, _v3_core_path)
 
@@ -290,13 +296,29 @@ def stratify_data_by_hybrid(
     # Determine output filename
     output_file = output_dir / f"{model_name}_data.parquet"
 
-    # Check if already exists
+    # Check if already exists AND is not stale
     if output_file.exists():
-        logger.info(f"  ✓ Already exists: {output_file}")
-        # Get row count
-        row_count = pl.scan_parquet(output_file).select(pl.len()).collect().item()
-        logger.info(f"  Rows: {row_count:,}")
-        return output_file
+        # Check staleness: regenerate if stratified file is older than source file
+        source_mtime = input_file.stat().st_mtime
+        output_mtime = output_file.stat().st_mtime
+
+        if output_mtime < source_mtime:
+            logger.warning("  ⚠ Stale cache detected (source updated after stratification)")
+            logger.warning(f"    Source: {input_file.stat().st_mtime_ns // 1_000_000_000}")
+            logger.warning(f"    Cached: {output_file.stat().st_mtime_ns // 1_000_000_000}")
+            logger.warning(f"  Regenerating {output_file}...")
+            output_file.unlink()  # Delete stale file
+        else:
+            logger.info(f"  ✓ Already exists: {output_file}")
+            # Get row count and validate
+            row_count = pl.scan_parquet(output_file).select(pl.len()).collect().item()
+
+            if row_count == 0:
+                logger.warning("  ⚠ Cached file is EMPTY (0 rows), regenerating...")
+                output_file.unlink()  # Delete empty file
+            else:
+                logger.info(f"  Rows: {row_count:,}")
+                return output_file
 
     logger.info(f"  Filtering combined_regime == '{model_name}'")
 
@@ -307,11 +329,25 @@ def stratify_data_by_hybrid(
         & (pl.col("time_remaining") < time_max)
     )
 
-    # Stream to output (memory-efficient)
-    df.sink_parquet(output_file, compression="snappy", statistics=True, streaming=True)
+    # Stream to output (memory-efficient - sink_parquet always streams for LazyFrame)
+    df.sink_parquet(
+        path=str(output_file),
+        compression="snappy",
+        statistics=True,
+    )
 
-    # Get row count
+    # Get row count and validate
     row_count = pl.scan_parquet(output_file).select(pl.len()).collect().item()
+
+    if row_count == 0:
+        error_msg = (
+            f"Stratification produced EMPTY file for {model_name}!\n"
+            f"  Source: {input_file}\n"
+            f"  Filter: combined_regime == '{model_name}' AND time_remaining in [{time_min}, {time_max})\n"
+            f"  Check if source data contains this regime or if time_remaining range is valid."
+        )
+        logger.error(error_msg)
+        raise ValueError(error_msg)
 
     logger.info(f"  ✓ Created: {output_file}")
     logger.info(f"  Rows: {row_count:,}")
@@ -386,6 +422,17 @@ def train_model_walk_forward(
 
     min_date = date_stats["min_date"][0]
     max_date = date_stats["max_date"][0]
+
+    # Validate date range (defensive check for empty datasets)
+    if min_date is None or max_date is None:
+        error_msg = (
+            f"Dataset has NO VALID DATES! min_date={min_date}, max_date={max_date}\n"
+            f"  Data file: {data_file}\n"
+            f"  This usually means the stratified file is empty (0 rows).\n"
+            f"  Check stratification logic or delete cached stratified files."
+        )
+        logger.error(error_msg)
+        raise ValueError(error_msg)
 
     # Calculate holdout test period (last N months)
     from dateutil.relativedelta import relativedelta
@@ -502,6 +549,15 @@ def train_model_walk_forward(
                 lgb.early_stopping(hyperparameters.get("early_stopping_rounds", 50)),
                 lgb.log_evaluation(100),  # Less verbose
             ]
+
+            # Add W&B callback for per-window training curves
+            if wandb_run is not None:
+                try:
+                    from wandb.integration.lightgbm import wandb_callback
+
+                    callbacks.append(wandb_callback(log_params=False))  # Don't re-log params each window
+                except ImportError:
+                    pass
 
             model = lgb.train(
                 hyperparameters,
@@ -718,6 +774,20 @@ def train_model_walk_forward(
         final_model.save_model(str(model_file))
         logger.info(f"✓ Saved final model to {model_file}")
 
+        # Log model artifacts and feature importance to W&B
+        if wandb_run is not None:
+            try:
+                from wandb.integration.lightgbm import log_summary
+
+                log_summary(
+                    final_model,
+                    feature_importance=True,  # Creates feature importance plot
+                    save_model_checkpoint=True,  # Uploads model to W&B Artifacts
+                )
+                logger.info("✓ Logged model artifacts to W&B")
+            except Exception as e:
+                logger.warning(f"Failed to log model summary to W&B: {e}")
+
         # Save config
         config_file = output_dir / f"config_{model_name}.yaml"
 
@@ -852,27 +922,21 @@ def train_model_walk_forward(
 def main() -> None:
     """Main execution function."""
     # Parse arguments
-    parser = argparse.ArgumentParser(description="Train V4 multi-horizon + regime hybrid LightGBM models")
+    parser = argparse.ArgumentParser(description="Train V5 multi-horizon + regime hybrid LightGBM models")
     parser.add_argument(
         "--model",
         type=str,
         choices=[
-            "near_low_vol_atm",
-            "near_low_vol_otm",
-            "near_high_vol_atm",
-            "near_high_vol_otm",
-            "mid_low_vol_atm",
-            "mid_low_vol_otm",
-            "mid_high_vol_atm",
-            "mid_high_vol_otm",
-            "far_low_vol_atm",
-            "far_low_vol_otm",
-            "far_high_vol_atm",
-            "far_high_vol_otm",
+            "near_low_vol",
+            "near_high_vol",
+            "mid_low_vol",
+            "mid_high_vol",
+            "far_low_vol",
+            "far_high_vol",
             "all",
         ],
         default="all",
-        help="Which model to train (default: all 12 models)",
+        help="Which model to train (default: all 6 models)",
     )
     parser.add_argument(
         "--config",
@@ -883,7 +947,7 @@ def main() -> None:
     args = parser.parse_args()
 
     logger.info("\n" + "=" * 80)
-    logger.info("V4 MULTI-HORIZON + REGIME HYBRID TRAINING")
+    logger.info("V5 MULTI-HORIZON + REGIME HYBRID TRAINING (WITH GREEKS)")
     logger.info("=" * 80)
 
     # Load configuration
@@ -913,11 +977,11 @@ def main() -> None:
     output_dir = model_dir / Path(config["training"]["output_dir"])
     models_dir = model_dir / Path(config["models"]["output_dir"])
 
-    # Get pipeline-ready features file (V4)
-    pipeline_ready_file = model_dir / "data" / "consolidated_features_v5_pipeline_ready.parquet"
+    # Get selected features file (V5 minimalist feature set)
+    pipeline_ready_file = model_dir / "data" / "consolidated_features_v5_selected.parquet"
 
     if not pipeline_ready_file.exists():
-        msg = f"Pipeline-ready features file not found: {pipeline_ready_file}"
+        msg = f"Selected features file not found: {pipeline_ready_file}\nRun select_features_v5.py first"
         raise FileNotFoundError(msg)
 
     logger.info(f"\nLoading pipeline-ready features from: {pipeline_ready_file}")
@@ -935,20 +999,15 @@ def main() -> None:
         if len(missing_features) > 10:
             logger.warning(f"    ... and {len(missing_features) - 10} more")
 
-    # Define 12 hybrid models (3 temporal buckets × 4 volatility regimes)
+    # Define 6 hybrid models (3 temporal buckets × 2 volatility regimes)
+    # V5 simplified: removed ATM/OTM split
     hybrid_models = [
-        ("near_low_vol_atm", 0, 300),
-        ("near_low_vol_otm", 0, 300),
-        ("near_high_vol_atm", 0, 300),
-        ("near_high_vol_otm", 0, 300),
-        ("mid_low_vol_atm", 300, 600),
-        ("mid_low_vol_otm", 300, 600),
-        ("mid_high_vol_atm", 300, 600),
-        ("mid_high_vol_otm", 300, 600),
-        ("far_low_vol_atm", 600, 900),
-        ("far_low_vol_otm", 600, 900),
-        ("far_high_vol_atm", 600, 900),
-        ("far_high_vol_otm", 600, 900),
+        ("near_low_vol", 0, 300),
+        ("near_high_vol", 0, 300),
+        ("mid_low_vol", 300, 600),
+        ("mid_high_vol", 300, 600),
+        ("far_low_vol", 600, 900),
+        ("far_high_vol", 600, 900),
     ]
 
     # Determine which models to train
@@ -1045,13 +1104,13 @@ def main() -> None:
             f"(Baseline Brier = {metrics['baseline_brier']:.6f})"
         )
 
-    logger.info("\nNote: Brier improvement will be computed in evaluation phase (evaluate_multi_horizon_v4.py).")
+    logger.info("\nNote: Brier improvement will be computed in evaluation phase (evaluate_multi_horizon_v5.py).")
 
     # Finish W&B
     if wandb_run is not None:
         wandb_run.finish()
 
-    logger.info("\n✓ V4 multi-horizon + regime hybrid training complete!")
+    logger.info("\n✓ V5 multi-horizon + regime hybrid training complete!")
     logger.info(f"Models saved to: {models_dir}")
     logger.info(f"Data saved to: {output_dir}")
 

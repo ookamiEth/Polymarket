@@ -56,7 +56,7 @@ import yaml
 from train_multi_horizon_v4 import FEATURE_COLS_V4
 
 # Import from V3 legacy
-_v3_core_path = str(Path(__file__).parent / "v3_legacy" / "core")
+_v3_core_path = str(Path(__file__).parent.parent / "archive" / "v3_code" / "v3_legacy" / "core")
 if _v3_core_path not in sys.path:
     sys.path.insert(0, _v3_core_path)
 
@@ -536,12 +536,14 @@ def optimize_model(
     from train_multi_horizon_v4 import train_model_walk_forward
 
     try:
-        # Get pipeline-ready data file
+        # Get selected features data file (V5 minimalist feature set)
         model_dir = Path(__file__).parent.parent
-        pipeline_ready_file = model_dir / "data" / "consolidated_features_v5_pipeline_ready.parquet"
+        pipeline_ready_file = model_dir / "data" / "consolidated_features_v5_selected.parquet"
 
         if not pipeline_ready_file.exists():
-            raise FileNotFoundError(f"Pipeline-ready file not found: {pipeline_ready_file}")
+            raise FileNotFoundError(
+                f"Selected features file not found: {pipeline_ready_file}\nRun select_features_v5.py first"
+            )
 
         # Train model on full walk-forward validation using optimized hyperparameters
         final_model, metrics = train_model_walk_forward(
