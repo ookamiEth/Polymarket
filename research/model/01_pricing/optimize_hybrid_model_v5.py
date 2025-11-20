@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
 """
-Multi-Horizon + Regime Hybrid Model Optimization (V4)
+Multi-Horizon + Regime Hybrid Model Optimization (V5)
 =======================================================
 
 Per-model Bayesian hyperparameter optimization using Optuna with walk-forward validation:
-- Optimize 8-12 hybrid models individually
-- Regime-specific search spaces (ATM vs OTM, low vol vs high vol)
-- Walk-forward objective: Mean validation MSE across 13 folds
-- Priority-based trial counts (100/50/25 trials)
+- Optimize 6 hybrid models individually (3 time buckets × 2 volatility regimes)
+- Regime-specific search spaces (low vol vs high vol)
+- Walk-forward objective: Mean validation MSE across ~10 folds
+- Equal priority: 50 trials per model
 
-This is Phase 2 (optional) of the V4 implementation.
+This is Phase 2 (optional) of the V5 implementation.
 
 Usage:
-  # Optimize specific model (high priority: 100 trials)
-  uv run python optimize_hybrid_model_v4.py --model near_low_vol_atm --n_trials 100
+  # Optimize specific model (50 trials)
+  uv run python optimize_hybrid_model_v5.py --model near_low_vol --n_trials 50
 
-  # Optimize medium priority model (50 trials)
-  uv run python optimize_hybrid_model_v4.py --model mid_high_vol_atm --n_trials 50
+  # Optimize with parallel jobs
+  uv run python optimize_hybrid_model_v5.py --model mid_high_vol --n_trials 50 --n_jobs 4
 
   # Resume from existing study
-  uv run python optimize_hybrid_model_v4.py --model near_low_vol_atm --resume
+  uv run python optimize_hybrid_model_v5.py --model near_low_vol --resume
 
 Author: BT Research Team
-Date: 2025-11-14
+Date: 2025-11-20
 """
 
 from __future__ import annotations
@@ -52,8 +52,8 @@ except ImportError:
 import polars as pl
 import yaml
 
-# Import from V4 training module
-from train_multi_horizon_v4 import FEATURE_COLS_V4
+# Import from V5 training module
+from train_multi_horizon_v5 import FEATURE_COLS_V5
 
 # Import from V3 legacy
 _v3_core_path = str(Path(__file__).parent.parent / "archive" / "v3_code" / "v3_legacy" / "core")
@@ -193,8 +193,8 @@ def generate_walk_forward_windows(config: dict[str, Any], data_file: Path) -> li
     return windows
 
 
-class V4OptunaObjective:
-    """Optuna objective function for V4 hybrid model with walk-forward validation."""
+class V5OptunaObjective:
+    """Optuna objective function for V5 hybrid model with walk-forward validation."""
 
     def __init__(
         self,
@@ -278,7 +278,7 @@ class V4OptunaObjective:
         import tempfile
 
         temp_base = Path(tempfile.gettempdir())
-        output_dir = temp_base / f"optuna_v4_{self.model_name}"
+        output_dir = temp_base / f"optuna_v5_{self.model_name}"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         for window_idx, (train_start, train_end, val_start, val_end) in enumerate(self.windows):
@@ -407,13 +407,13 @@ def optimize_model(
     data_file = data_dir / f"{model_name}_data.parquet"
 
     if not data_file.exists():
-        raise FileNotFoundError(f"Stratified data not found: {data_file}. Run train_multi_horizon_v4.py first.")
+        raise FileNotFoundError(f"Stratified data not found: {data_file}. Run train_multi_horizon_v5.py first.")
 
     logger.info(f"\nData file: {data_file}")
 
     # Get features
     schema = pl.scan_parquet(data_file).collect_schema()
-    features = [col for col in FEATURE_COLS_V4 if col in schema.names()]
+    features = [col for col in FEATURE_COLS_V5 if col in schema.names()]
     logger.info(f"Features: {len(features)}")
 
     # Generate walk-forward windows
@@ -423,7 +423,7 @@ def optimize_model(
     fixed_params = config["training"]["base_params"].copy()
 
     # Create Optuna study
-    study_name = f"v4_{model_name}"
+    study_name = f"v5_{model_name}"
     storage_file = output_dir / f"optuna_study_{model_name}.db"
     storage = f"sqlite:///{storage_file}"
 
@@ -437,11 +437,11 @@ def optimize_model(
             study_name=study_name,
             storage=storage,
             direction="minimize",  # Minimize validation MSE
-            load_if_exists=False,
+            load_if_exists=True,  # Allow resuming existing studies
         )
 
     # Create objective
-    objective = V4OptunaObjective(
+    objective = V5OptunaObjective(
         model_name=model_name,
         search_space=search_space,
         data_file=data_file,
@@ -533,7 +533,7 @@ def optimize_model(
     logger.info(f"{'=' * 80}")
 
     # Import training utilities
-    from train_multi_horizon_v4 import train_model_walk_forward
+    from train_multi_horizon_v5 import train_model_walk_forward
 
     try:
         # Get selected features data file (V5 minimalist feature set)
@@ -577,7 +577,7 @@ def optimize_model(
         logger.error("  Optimized hyperparameters were saved, but model training failed")
         logger.error("  You can manually train the model by running:")
         logger.error(f"    cd {model_dir}")
-        logger.error(f"    uv run python train_multi_horizon_v4.py --model {model_name} \\")
+        logger.error(f"    uv run python train_multi_horizon_v5.py --model {model_name} \\")
         logger.error("      --config ../config/multi_horizon_regime_config_v5.yaml")
         import traceback
 
@@ -586,7 +586,7 @@ def optimize_model(
     # Clean up temporary directory
     import shutil
 
-    temp_base_dir = Path(f"/tmp/optuna_v4_{model_name}")
+    temp_base_dir = Path(f"/tmp/optuna_v5_{model_name}")
     if temp_base_dir.exists():
         try:
             shutil.rmtree(temp_base_dir)
@@ -607,26 +607,20 @@ def optimize_model(
 def main() -> None:
     """Main execution function."""
     # Parse arguments
-    parser = argparse.ArgumentParser(description="V4 Multi-horizon + regime hybrid model optimization")
+    parser = argparse.ArgumentParser(description="V5 Multi-horizon + regime hybrid model optimization")
     parser.add_argument(
         "--model",
         type=str,
         required=True,
         choices=[
-            "near_low_vol_atm",
-            "near_low_vol_otm",
-            "near_high_vol_atm",
-            "near_high_vol_otm",
-            "mid_low_vol_atm",
-            "mid_low_vol_otm",
-            "mid_high_vol_atm",
-            "mid_high_vol_otm",
-            "far_low_vol_atm",
-            "far_low_vol_otm",
-            "far_high_vol_atm",
-            "far_high_vol_otm",
+            "near_low_vol",
+            "near_high_vol",
+            "mid_low_vol",
+            "mid_high_vol",
+            "far_low_vol",
+            "far_high_vol",
         ],
-        help="Model to optimize",
+        help="Which V5 model to optimize (6 models: 3 time buckets × 2 volatility regimes)",
     )
     parser.add_argument(
         "--config",
@@ -660,7 +654,7 @@ def main() -> None:
     args = parser.parse_args()
 
     logger.info("=" * 80)
-    logger.info("V4 MULTI-HORIZON + REGIME HYBRID MODEL OPTIMIZATION")
+    logger.info("V5 MULTI-HORIZON + REGIME HYBRID MODEL OPTIMIZATION")
     logger.info("=" * 80)
 
     # Load configuration

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Multi-Horizon + Regime Hybrid Model Evaluation (V4)
+Multi-Horizon + Regime Hybrid Model Evaluation (V5)
 ====================================================
 
-Comprehensive evaluation of 8-12 hybrid models (temporal × regime):
+Comprehensive evaluation of 6 hybrid models (temporal × regime):
 - Overall performance metrics (Brier score, IC, calibration)
 - Hierarchical breakdown: Overall → Bucket → Regime → Model
 - Per-model performance analysis
@@ -16,19 +16,19 @@ Generates:
 
 Usage:
   # Evaluate on holdout period (true out-of-sample)
-  uv run python evaluate_multi_horizon_v4.py --holdout-only
+  uv run python evaluate_multi_horizon_v5.py --holdout-only
 
   # Evaluate all models
-  uv run python evaluate_multi_horizon_v4.py \
+  uv run python evaluate_multi_horizon_v5.py \
       --config ../config/multi_horizon_regime_config_v5.yaml \
-      --models_dir ../results/multi_horizon_hybrid_v4/models \
-      --output_dir ../results/multi_horizon_hybrid_v4/evaluations
+      --models_dir ../results/multi_horizon_hybrid_v5/models \
+      --output_dir ../results/multi_horizon_hybrid_v5/evaluations
 
   # Evaluate specific data file
-  uv run python evaluate_multi_horizon_v4.py --input custom_test_data.parquet
+  uv run python evaluate_multi_horizon_v5.py --input custom_test_data.parquet
 
 Author: BT Research Team
-Date: 2025-11-14
+Date: 2025-11-20
 """
 
 from __future__ import annotations
@@ -46,8 +46,8 @@ import numpy as np
 import polars as pl
 import yaml
 
-# Import from V4 training module
-from train_multi_horizon_v4 import FEATURE_COLS_V4
+# Import from V5 training module
+from train_multi_horizon_v5 import FEATURE_COLS_V5
 
 # Import from V3 legacy
 _v3_core_path = str(Path(__file__).parent.parent / "archive" / "v3_code" / "v3_legacy" / "core")
@@ -106,7 +106,7 @@ def load_hybrid_models(models_dir: Path, config: dict[str, Any]) -> dict[str, lg
             continue
 
     if len(models) == 0:
-        raise ValueError(f"No models loaded from {models_dir}. Run train_multi_horizon_v4.py first.")
+        raise ValueError(f"No models loaded from {models_dir}. Run train_multi_horizon_v5.py first.")
 
     logger.info(f"\n✓ Loaded {len(models)} hybrid models")
     return models
@@ -517,7 +517,7 @@ def generate_hierarchical_report(
 def main() -> None:
     """Main execution function."""
     # Parse arguments
-    parser = argparse.ArgumentParser(description="V4 Multi-horizon + regime hybrid model evaluation")
+    parser = argparse.ArgumentParser(description="V5 Multi-horizon + regime hybrid model evaluation")
     parser.add_argument(
         "--config",
         type=Path,
@@ -556,7 +556,7 @@ def main() -> None:
     args = parser.parse_args()
 
     logger.info("=" * 80)
-    logger.info("V4 MULTI-HORIZON + REGIME HYBRID MODEL EVALUATION")
+    logger.info("V5 MULTI-HORIZON + REGIME HYBRID MODEL EVALUATION")
     logger.info("=" * 80)
 
     monitor = MemoryMonitor()
@@ -634,7 +634,7 @@ def main() -> None:
 
     # Get features
     schema = data.collect_schema()
-    features = [col for col in FEATURE_COLS_V4 if col in schema.names()]
+    features = [col for col in FEATURE_COLS_V5 if col in schema.names()]
     logger.info(f"  Using {len(features)} features")
 
     monitor.check_memory("After loading data")

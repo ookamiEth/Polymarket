@@ -9,10 +9,10 @@ Train 6 specialized LightGBM models with Greek features:
 - Total: 6 hybrid models (3 time buckets × 2 regimes)
 
 Key Changes from V4:
-- Added Greek features (30 new features: delta, gamma, vega, theta, etc.)
+- Added Greek features (29 new features: delta, gamma, vega, theta, etc.)
 - Simplified regime structure (removed ATM/OTM split)
 - Reduced from 12 models to 6 models
-- 43 total features (13 selected V4 features + 30 Greeks)
+- 43 total features (9 moneyness + 4 volatility + 29 Greeks + 1 moneyness_bin)
 
 Key Features:
 - Uses pre-prepared data with regime columns (no join needed)
@@ -244,6 +244,71 @@ FEATURE_COLS_V4 = [
     "weighted_mid_price_5",
     "weighted_mid_velocity_normalized",
 ]
+
+# V5 Feature columns (43 actual model features from consolidated_features_v5_selected.parquet)
+# Breakdown: 9 moneyness + 4 volatility + 29 Greeks + 1 categorical = 43
+FEATURE_COLS_V5 = [
+    # Moneyness features (9)
+    "moneyness",
+    "log_moneyness",
+    "moneyness_squared",
+    "moneyness_cubed",
+    "moneyness_distance",
+    "moneyness_percentile",
+    "standardized_moneyness",
+    "moneyness_x_vol",
+    "moneyness_x_time",
+    # Volatility features (4)
+    "rv_900s",
+    "rv_ratio",
+    "vol_asymmetry_ratio_300",
+    "realized_skewness_300",
+    # Greek features (29 including risk-free rate)
+    # Risk-free rate
+    "r",
+    # Core Greeks (10)
+    "delta",
+    "gamma",
+    "vega",
+    "theta",
+    "vanna",
+    "volga",
+    "charm",
+    "d1",
+    "d2",
+    "phi_d2",
+    # Transformed Greeks (11)
+    "log_abs_delta",
+    "log_abs_gamma",
+    "log_abs_vega",
+    "sqrt_abs_gamma",
+    "sqrt_abs_vega",
+    "delta_squared",
+    "theta_per_day",
+    "vega_time_weighted",
+    "inverse_gamma",
+    "delta_sign",
+    "theta_sign",
+    # Derived Greek ratios and interactions (7)
+    "gamma_delta_ratio",
+    "vega_delta_ratio",
+    "vanna_vega_ratio",
+    "delta_vega_product",
+    "gamma_vega_product",
+    "greek_stability",
+    "convexity_measure",
+    # Categorical (1)
+    "moneyness_bin",
+]
+
+# Regime metadata columns (exist in data file but NOT used as model features):
+# These are used for filtering/routing data to models, not as training features.
+# - rv_95th_percentile: Used to calculate vol_high_thresh
+# - vol_low_thresh: Regime threshold (low_vol cutoff)
+# - vol_high_thresh: Regime threshold (high_vol cutoff)
+# - is_extreme_condition: Flag for extreme market conditions
+# - position_scale: Position sizing metadata
+# - timestamp_dt: Datetime conversion of timestamp (not a feature)
 
 
 def load_config(config_path: Path) -> dict[str, Any]:
@@ -988,11 +1053,11 @@ def main() -> None:
 
     # Get features from pipeline-ready file schema
     schema = pl.scan_parquet(pipeline_ready_file).collect_schema()
-    features = [col for col in FEATURE_COLS_V4 if col in schema.names()]
-    logger.info(f"Using {len(features)} features (out of {len(FEATURE_COLS_V4)} in FEATURE_COLS_V4)")
+    features = [col for col in FEATURE_COLS_V5 if col in schema.names()]
+    logger.info(f"Using {len(features)} features (out of {len(FEATURE_COLS_V5)} in FEATURE_COLS_V5)")
 
-    if len(features) < len(FEATURE_COLS_V4):
-        missing_features = set(FEATURE_COLS_V4) - set(features)
+    if len(features) < len(FEATURE_COLS_V5):
+        missing_features = set(FEATURE_COLS_V5) - set(features)
         logger.warning(f"⚠️  {len(missing_features)} features not found in pipeline-ready file:")
         for feat in list(missing_features)[:10]:  # Show first 10
             logger.warning(f"    - {feat}")
