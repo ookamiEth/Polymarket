@@ -12,7 +12,7 @@ Key Changes from V4:
 - Added Greek features (29 new features: delta, gamma, vega, theta, etc.)
 - Simplified regime structure (removed ATM/OTM split)
 - Reduced from 12 models to 6 models
-- 43 total features (9 moneyness + 4 volatility + 29 Greeks + 1 moneyness_bin)
+- 42 total features (9 moneyness + 4 volatility + 29 Greeks)
 
 Key Features:
 - Uses pre-prepared data with regime columns (no join needed)
@@ -298,7 +298,7 @@ FEATURE_COLS_V5 = [
     "greek_stability",
     "convexity_measure",
     # Categorical (1)
-    "moneyness_bin",
+    # "moneyness_bin",  # REMOVED: Categorical feature causes "could not convert string to float" error
 ]
 
 # Regime metadata columns (exist in data file but NOT used as model features):
